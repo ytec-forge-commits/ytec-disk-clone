@@ -494,7 +494,7 @@ fetch_manual_update_manifest_with_winhttp(
 
   const wchar_t* accept_types[]{L"application/json", nullptr};
   UniqueInternetHandle request(WinHttpOpenRequest(
-      connection.get(), L"GET", L"/ytb/tsumugi-drive/update-v1.json",
+      connection.get(), L"GET", L"/forge/updates/tsumugi-drive/update-v1.json",
       nullptr, WINHTTP_NO_REFERER, accept_types, WINHTTP_FLAG_SECURE));
   if (!request) {
     return clonecore::Result<ManualUpdateTransportResponse>::failure(

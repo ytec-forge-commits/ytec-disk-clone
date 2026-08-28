@@ -13,9 +13,9 @@
 namespace ytec::windowsapp {
 
 inline constexpr std::wstring_view kManualUpdateManifestUrl{
-    L"https://ytec.cloudfree.jp/ytb/tsumugi-drive/update-v1.json"};
+    L"https://ytec.cloudfree.jp/forge/updates/tsumugi-drive/update-v1.json"};
 inline constexpr std::wstring_view kManualUpdateReleasePageUrl{
-    L"https://ytec.cloudfree.jp/ytb/tsumugi-drive/"};
+    L"https://ytec.cloudfree.jp/forge/projects/tsumugi-drive/"};
 inline constexpr std::size_t kMaximumManualUpdateManifestBytes{16U * 1024U};
 
 struct ManualUpdateManifest final {

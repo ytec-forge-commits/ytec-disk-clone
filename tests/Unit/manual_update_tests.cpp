@@ -40,7 +40,7 @@ std::string valid_manifest(std::string_view version = "1.0.0") {
              "\"productId\":\"ytec-tsumugi-drive\","
              "\"latestVersion\":\""} +
          std::string(version) +
-         "\",\"releasePageUrl\":\"https://ytec.cloudfree.jp/ytb/"
+         "\",\"releasePageUrl\":\"https://ytec.cloudfree.jp/forge/projects/"
          "tsumugi-drive/\","
          "\"publishedUtc\":\"2026-08-11T12:34:56Z\","
          "\"packageSha256\":\""

@@ -3459,7 +3459,7 @@ void start_manual_update_check(AppState& state) {
           "{\"schemaVersion\":1,"
           "\"productId\":\"ytec-tsumugi-drive\","
           "\"latestVersion\":\"" YTEC_PRODUCT_VERSION "\","
-          "\"releasePageUrl\":\"https://ytec.cloudfree.jp/ytb/"
+          "\"releasePageUrl\":\"https://ytec.cloudfree.jp/forge/projects/"
           "tsumugi-drive/\","
           "\"publishedUtc\":\"2026-08-11T00:00:00Z\","
           "\"packageSha256\":\""
