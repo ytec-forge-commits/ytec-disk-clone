@@ -177,7 +177,7 @@ if ($rootSbomPackages.Count -ne 1 -or
     $rootSbomPackages[0].licenseDeclared -cne 'Apache-2.0' -or
     $rootSbomPackages[0].licenseConcluded -cne 'Apache-2.0' -or
     $rootSbomPackages[0].downloadLocation -cne
-        'https://github.com/ytec-commits/ytec-disk-clone' -or
+        'https://github.com/ytec-forge-commits/ytec-disk-clone' -or
     $rootSbomPackages[0].copyrightText -cne 'Copyright 2026 Y-TEC') {
     throw 'SBOMの製品packageがApache-2.0公開台帳と一致しません。'
 }

@@ -1,8 +1,8 @@
 # Maintainers and Project Decisions
 
-Y-TEC Tsumugi Drive is stewarded in the `@ytec-commits` organization by the
-Y-TEC maintainers. GitHub CODEOWNERS currently uses the maintainer login
-`@ytecnagano-commits`; its public display name is Y-TEC.
+Y-TEC Tsumugi Drive is stewarded in the `@ytec-forge-commits` organization by
+the Y-TEC maintainers. GitHub CODEOWNERS currently uses the maintainer login
+`@ytec-commits`; its public display name is ワイテッくん / Y-TEC kun.
 
 ## Maintainer responsibilities
 

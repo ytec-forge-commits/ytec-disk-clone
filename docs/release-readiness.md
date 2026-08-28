@@ -136,7 +136,7 @@ error 1168修正版の再試験候補は
 - [ ] 変更範囲と既存差分を監査
 - [ ] 意図した変更だけをcommit
 - [ ] Apache-2.0、NOTICE、第三者通知、SBOM、公開文書の整合を確認
-- [ ] 公開GitHub `ytec-commits/ytec-disk-clone`の正しいremote／branchへpush
+- [ ] 公開GitHub `ytec-forge-commits/ytec-disk-clone`の正しいremote／branchへpush
 - [ ] push先URL、commit、実行済み確認を記録
 
 この節は代表実機試験より前のゲートである。GitHub Releasesへ製品ZIPを置かない。

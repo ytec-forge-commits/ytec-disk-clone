@@ -130,7 +130,7 @@ Windows／PE救出画像は実媒体検証が済むまで512バイト論理セ�
 5. 4Kn、物理ディスク、実USB、実機起動と復元後bootを代表実機で受け入れる。
 6. 正式版PDF／Web／利用規約／プライバシー／法務／版番号を監査する。
 7. ユーザー確認後、意図した差分だけをcommitし、公開GitHub
-   `ytec-commits/ytec-disk-clone`へpushする。開発版ソース公開と正式バイナリ公開を区別する。
+   `ytec-forge-commits/ytec-disk-clone`へpushする。開発版ソース公開と正式バイナリ公開を区別する。
 
 ## 公開停止条件
 

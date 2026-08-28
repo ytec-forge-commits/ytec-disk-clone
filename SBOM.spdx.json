@@ -3,7 +3,7 @@
     "dataLicense":  "CC0-1.0",
     "SPDXID":  "SPDXRef-DOCUMENT",
     "name":  "ytec-disk-clone-0.2.0-dev",
-    "documentNamespace":  "https://github.com/ytec-commits/ytec-disk-clone/sbom/0.2.0-dev",
+    "documentNamespace":  "https://github.com/ytec-forge-commits/ytec-disk-clone/sbom/0.2.0-dev",
     "creationInfo":  {
                          "created":  "2026-08-20T00:00:00Z",
                          "creators":  [
@@ -16,7 +16,7 @@
                          "name":  "ytec-disk-clone",
                          "SPDXID":  "SPDXRef-Package-ytec-disk-clone",
                          "versionInfo":  "0.2.0-dev",
-                         "downloadLocation":  "https://github.com/ytec-commits/ytec-disk-clone",
+                         "downloadLocation":  "https://github.com/ytec-forge-commits/ytec-disk-clone",
                          "filesAnalyzed":  false,
                          "licenseConcluded":  "Apache-2.0",
                          "licenseDeclared":  "Apache-2.0",

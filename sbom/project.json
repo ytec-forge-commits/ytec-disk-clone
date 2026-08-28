@@ -1,9 +1,9 @@
 {
   "name": "ytec-disk-clone",
   "version": "0.2.0-dev",
-  "downloadLocation": "https://github.com/ytec-commits/ytec-disk-clone",
+  "downloadLocation": "https://github.com/ytec-forge-commits/ytec-disk-clone",
   "license": "Apache-2.0",
   "copyright": "Copyright 2026 Y-TEC",
-  "documentNamespace": "https://github.com/ytec-commits/ytec-disk-clone/sbom/0.2.0-dev",
+  "documentNamespace": "https://github.com/ytec-forge-commits/ytec-disk-clone/sbom/0.2.0-dev",
   "createdUtc": "2026-08-20T00:00:00Z"
 }

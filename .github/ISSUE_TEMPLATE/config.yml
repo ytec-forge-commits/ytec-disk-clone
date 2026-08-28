@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/ytec-commits/ytec-disk-clone/security
+    url: https://github.com/ytec-forge-commits/ytec-disk-clone/security
     about: Use Private Vulnerability Reporting; do not post vulnerability details in a public Issue.
   - name: Support boundary
-    url: https://github.com/ytec-commits/ytec-disk-clone/blob/main/SUPPORT.md
+    url: https://github.com/ytec-forge-commits/ytec-disk-clone/blob/main/SUPPORT.md
     about: Check supported requests and the data that must not be posted publicly.

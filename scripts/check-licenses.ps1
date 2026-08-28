@@ -47,7 +47,7 @@ if (Test-Path -LiteralPath $projectLicensePath -PathType Leaf) {
 
 if ($project.license -cne 'Apache-2.0' -or
     $project.downloadLocation -cne
-        'https://github.com/ytec-commits/ytec-disk-clone' -or
+        'https://github.com/ytec-forge-commits/ytec-disk-clone' -or
     $project.copyright -cne 'Copyright 2026 Y-TEC') {
     $failures += '製品SBOM台帳のライセンス、公開元、著作権が不正です。'
 }
@@ -70,7 +70,7 @@ if (Test-Path -LiteralPath $sbomPath -PathType Leaf) {
         $rootPackages[0].licenseDeclared -cne 'Apache-2.0' -or
         $rootPackages[0].licenseConcluded -cne 'Apache-2.0' -or
         $rootPackages[0].downloadLocation -cne
-            'https://github.com/ytec-commits/ytec-disk-clone' -or
+            'https://github.com/ytec-forge-commits/ytec-disk-clone' -or
         $rootPackages[0].copyrightText -cne 'Copyright 2026 Y-TEC') {
         $failures += 'SBOMの製品packageがApache-2.0公開台帳と一致しません。'
     }
