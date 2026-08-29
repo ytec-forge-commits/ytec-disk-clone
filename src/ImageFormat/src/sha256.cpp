@@ -159,10 +159,13 @@ class CngSha256 final {
   }
 
  private:
+  // BCryptDestroyHash may still access the caller-owned hash object buffer.
+  // Members are destroyed in reverse declaration order, so keep hash_ last:
+  // hash handle -> backing buffer -> algorithm provider.
   AlgorithmHandle algorithm_;
-  HashHandle hash_;
   ULONG object_length_{};
   std::vector<UCHAR> object_;
+  HashHandle hash_;
 };
 
 }  // namespace

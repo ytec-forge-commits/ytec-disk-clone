@@ -1,0 +1,34 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @YTEC_RC_FILE_VERSION_COMMAS@
+ PRODUCTVERSION @YTEC_RC_FILE_VERSION_COMMAS@
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Y-TEC\0"
+            VALUE "FileDescription", "@YTEC_RC_FILE_DESCRIPTION@\0"
+            VALUE "FileVersion", "@YTEC_PRODUCT_FILE_VERSION@\0"
+            VALUE "InternalName", "@YTEC_RC_INTERNAL_NAME@\0"
+            VALUE "LegalCopyright", "Copyright 2026 Y-TEC\0"
+            VALUE "OriginalFilename", "@YTEC_RC_ORIGINAL_FILENAME@\0"
+            VALUE "ProductName", "Y-TEC Tsumugi Drive\0"
+            VALUE "ProductVersion", "@YTEC_PRODUCT_VERSION@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

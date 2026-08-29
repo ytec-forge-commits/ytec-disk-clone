@@ -220,6 +220,124 @@ foreach ($pattern in $winPeAutomaticBootRepairTestRequiredPatterns.Keys) {
     }
 }
 
+# BCD-003 keeps missing ESP/BIOS-system creation in one audited Microsoft VDS
+# adapter behind a pure immutable review and a second uppercase-OK transaction.
+# The product must re-enter the normal BCD review only after exact final-layout
+# readback.  Read-only inventory may classify a pre-format failure, but no raw
+# device write API is permitted in this adapter.
+$systemPartitionCreationPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'BootRepair\src\system_partition_creation.cpp'))
+$systemPartitionCreationWindowsPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'BootRepair\src\system_partition_creation_windows.cpp'))
+$systemPartitionCreationTestPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests\Unit\system_partition_creation_tests.cpp'))
+$systemPartitionCreationText = Get-Content `
+    -LiteralPath $systemPartitionCreationPath -Raw
+$systemPartitionCreationWindowsText = Get-Content `
+    -LiteralPath $systemPartitionCreationWindowsPath -Raw
+$systemPartitionCreationTestText = Get-Content `
+    -LiteralPath $systemPartitionCreationTestPath -Raw
+
+$vdsSystemPartitionInterfacePatterns = @(
+    '\bIVdsVolumeShrink\b'
+    '\bIVdsAdvancedDisk3?\b'
+    '\bVDS_ASYNCOUT_SHRINKVOLUME\b'
+    '\bVDS_ASYNCOUT_CREATEPARTITION\b'
+)
+foreach ($pattern in $vdsSystemPartitionInterfacePatterns) {
+    $matches = $sourceFiles | Select-String -Pattern $pattern -CaseSensitive
+    foreach ($match in $matches) {
+        if (-not [IO.Path]::GetFullPath($match.Path).Equals(
+                $systemPartitionCreationWindowsPath,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $match.Path.Substring($repoRoot.Length).TrimStart('\')
+            $failures += "$relative`:$($match.LineNumber) contains a BCD-003 VDS interface outside the audited adapter"
+        }
+    }
+}
+$systemPartitionCreationRequiredPatterns = [ordered]@{
+    'confirmation\.typed_token\s*!=\s*L"OK"' = 'separate uppercase OK confirmation gate'
+    '\brevalidate_system_partition_creation_review\s*\(' = 'fresh complete pre-mutation review binding'
+    '\bexpected_after_shrink\s*\(' = 'exact shrink readback gate'
+    '\bexpected_completed_plan\s*\(' = 'exact ESP or Active final-layout gate'
+    '\bexpected_raw_disk_layout\s*\(' = 'complete raw inventory cleanup binding'
+    '\bafter_failed_shrink\b' = 'uncertain shrink result classification'
+    '\battempt_rollback\s*\(' = 'explicit exact rollback state machine'
+    'SystemPartitionCreationOutcome::rollback_incomplete' = 'rollback-incomplete distinction'
+    'kGptEspBytes\s*=\s*260ULL\s*\*\s*kMiB' = 'fixed 260 MiB GPT ESP plan'
+    'kMbrSystemBytes\s*=\s*100ULL\s*\*\s*kMiB' = 'fixed 100 MiB BIOS system plan'
+    '\bmbr_primary_only\b' = 'logical and extended MBR rejection'
+    'kReclaimabilityMargin' = 'maximum-shrink safety margin'
+    'forbidden_volume_role_or_encryption' = 'system role and encryption fail-closed gate'
+}
+foreach ($pattern in $systemPartitionCreationRequiredPatterns.Keys) {
+    if ($systemPartitionCreationText -notmatch $pattern) {
+        $failures += "System partition creation core must retain $($systemPartitionCreationRequiredPatterns[$pattern])"
+    }
+}
+$systemPartitionCreationWindowsRequiredPatterns = [ordered]@{
+    '\bQueryMaxReclaimableBytes\s*\(' = 'Microsoft VDS read-only shrinkability query'
+    'VDS_VF_SYSTEM_VOLUME' = 'current system-volume rejection'
+    'VDS_VF_BOOT_VOLUME' = 'current boot-volume rejection'
+    'VDS_VF_FVE_ENABLED' = 'BitLocker/FVE rejection'
+    '\brevalidate_vds_disk_binding_exact\s*\(' = 'object-bound VDS disk mutation revalidation'
+    '\brevalidate_vds_windows_volume_exact\s*\(' = 'object-bound VDS Volume GUID mutation revalidation'
+    '\bcleanup_possible_created_partition_exact\s*\(' = 'double-inventory pre-format cleanup gate'
+    '\bvalidate_created_vds_partition_exact\s*\(' = 'object-bound created partition cleanup gate'
+    '\bShrink\s*\(' = 'single audited exact NTFS shrink seam'
+    '\bCreatePartition\s*\(' = 'single audited system-partition creation adapter'
+    '\bFormatEx\s*\(' = 'Microsoft VDS exact format seam'
+    '\bDeletePartition\s*\(' = 'exact created-partition rollback seam'
+    '\bExtend\s*\(' = 'exact Windows extent rollback seam'
+    'VDS_PST_GPT' = 'GPT ESP creation branch'
+    'VDS_PST_MBR' = 'MBR Active creation branch'
+}
+foreach ($pattern in $systemPartitionCreationWindowsRequiredPatterns.Keys) {
+    if ($systemPartitionCreationWindowsText -notmatch $pattern) {
+        $failures += "System partition creation VDS adapter must retain $($systemPartitionCreationWindowsRequiredPatterns[$pattern])"
+    }
+}
+$systemPartitionCreationWindowsForbiddenPatterns = [ordered]@{
+    '\bWriteFile\s*\(' = 'raw or file write outside VDS'
+    '\bDeviceIoControl\s*\(' = 'raw storage mutation outside VDS'
+    '\bCreateProcessW\s*\(' = 'external disk-management process'
+}
+foreach ($pattern in $systemPartitionCreationWindowsForbiddenPatterns.Keys) {
+    if ($systemPartitionCreationWindowsText -match $pattern) {
+        $failures += "System partition creation VDS adapter contains forbidden $($systemPartitionCreationWindowsForbiddenPatterns[$pattern])"
+    }
+}
+$systemPartitionCreationTestRequiredPatterns = [ordered]@{
+    '\bpure_review_binds_exact_safe_geometry\s*\(' = 'GPT ESP safe geometry coverage'
+    '\bmbr_bios_active_creation_uses_its_own_exact_transaction\s*\(' = 'MBR Active successful transaction coverage'
+    '\bunsafe_or_insufficient_volume_fails_closed\s*\(' = 'unsafe volume and capacity failure coverage'
+    '\bexact_uppercase_ok_is_mandatory\s*\(' = 'lowercase no-call coverage'
+    '\bfailed_shrink_is_classified_by_exact_readback\s*\(' = 'uncertain shrink no-write and rollback coverage'
+    '\braw_layout_cleanup_binding_requires_every_partition\s*\(' = 'raw cleanup full-layout coverage'
+    '\bpost_shrink_failure_rolls_back_exact\s*\(' = 'post-shrink rollback coverage'
+    '\bunsafe_post_shrink_volume_state_rolls_back_before_creation\s*\(' = 'post-shrink NTFS health fail-closed coverage'
+    '\bchanged_final_layout_is_deleted_and_rolled_back\s*\(' = 'unexpected final geometry rollback coverage'
+    '\bpre_mutation_drift_never_calls_shrink\s*\(' = 'pre-mutation drift no-write coverage'
+}
+foreach ($pattern in $systemPartitionCreationTestRequiredPatterns.Keys) {
+    if ($systemPartitionCreationTestText -notmatch $pattern) {
+        $failures += "System partition creation tests must retain $($systemPartitionCreationTestRequiredPatterns[$pattern])"
+    }
+}
+$systemPartitionCreationProductRequiredPatterns = [ordered]@{
+    '\bprompt_system_partition_creation_windows_choice\s*\(' = 'dedicated destructive-stage target choice'
+    '\breview_system_partition_creation\s*\(' = 'pure system-partition review product routing'
+    '\bexecute_system_partition_creation\s*\(' = 'reviewed creation transaction product routing'
+    '\bcompleted_creation_plan\b' = 'verified completed-layout handoff'
+    '\bstart_boot_review\s*\(' = 'normal BCD review continuation'
+    'rollback未確認のため、後続の起動修復を開始しません。' = 'rollback-incomplete product fail-closed disclosure'
+}
+foreach ($pattern in $systemPartitionCreationProductRequiredPatterns.Keys) {
+    if ($winPeAutomaticBootRepairGuiText -notmatch $pattern) {
+        $failures += "WinPE BCD-003 product route must retain $($systemPartitionCreationProductRequiredPatterns[$pattern])"
+    }
+}
+
 # BCD-006 shared WinRE registration transaction: review and execution bind the
 # exact image file object and expected REAgentC path kind.  Only the signed
 # current System32 tool may run, every mutation is guarded, and any failed
@@ -684,6 +802,22 @@ $auditedWindowsShrinkRestorePlatformPatterns = @(
     '\bFSCTL_EXTEND_VOLUME\b'
     '\bIOCTL_VOLUME_OFFLINE\b'
 )
+$auditedWindowsFileSystemRecreateTargetPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'MigrationEngine\src\windows_file_system_recreate_target_io.cpp'))
+$auditedWindowsFileSystemRecreateTargetPatterns = @(
+    '\bWriteFile\s*\('
+    '\bGENERIC_WRITE\b'
+    '\bSetEndOfFile\s*\('
+    '\bSetFileInformationByHandle\s*\('
+    '\bFSCTL_LOCK_VOLUME\b'
+    '\bFSCTL_DISMOUNT_VOLUME\b'
+    '\bIOCTL_VOLUME_OFFLINE\b'
+)
+$auditedWindowsOnlineDirectCloneSourcePath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'WindowsApp\src\online_direct_clone.cpp'))
+$auditedWindowsOnlineDirectCloneSourcePatterns = @(
+    '\bFSCTL_LOCK_VOLUME\b'
+)
 $auditedWindowsDirectShrinkClonePlatformPath = [IO.Path]::GetFullPath(
     (Join-Path $sourceRoot 'WindowsApp\src\windows_direct_shrink_clone_platform.cpp'))
 $windowsOnlineDirectShrinkClonePath = [IO.Path]::GetFullPath(
@@ -694,6 +828,10 @@ $windowsOnlineDirectShrinkCloneTestPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot 'tests\Unit\windows_online_direct_shrink_clone_tests.cpp'))
 $windowsDirectShrinkProductUiPath = [IO.Path]::GetFullPath(
     (Join-Path $sourceRoot 'WindowsApp\src\main.cpp'))
+$cloneBootFinalizationPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'BootRepair\src\clone_boot_finalization.cpp'))
+$cloneBootFinalizationTestPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests\Unit\clone_boot_finalization_tests.cpp'))
 $auditedWindowsDirectShrinkClonePlatformPatterns = @(
     '\bGENERIC_WRITE\b'
     '\bSetFileInformationByHandle\s*\('
@@ -855,6 +993,23 @@ foreach ($pattern in $forbiddenSourcePatterns.Keys) {
                 [StringComparison]::OrdinalIgnoreCase)
         if ($isAuditedWindowsShrinkRestorePlatform -and
             $auditedWindowsShrinkRestorePlatformPatterns -contains $pattern) {
+            continue
+        }
+        $isAuditedWindowsFileSystemRecreateTarget =
+            [IO.Path]::GetFullPath($match.Path).Equals(
+                $auditedWindowsFileSystemRecreateTargetPath,
+                [StringComparison]::OrdinalIgnoreCase)
+        if ($isAuditedWindowsFileSystemRecreateTarget -and
+            $auditedWindowsFileSystemRecreateTargetPatterns -contains $pattern) {
+            continue
+        }
+
+        $isAuditedWindowsOnlineDirectCloneSource =
+            [IO.Path]::GetFullPath($match.Path).Equals(
+                $auditedWindowsOnlineDirectCloneSourcePath,
+                [StringComparison]::OrdinalIgnoreCase)
+        if ($isAuditedWindowsOnlineDirectCloneSource -and
+            $auditedWindowsOnlineDirectCloneSourcePatterns -contains $pattern) {
             continue
         }
         $isAuditedWindowsDirectShrinkClonePlatform =
@@ -1517,6 +1672,245 @@ if ($windowsShrinkRestoreWriteFileCount -ne 1 -or
     $failures += 'Windows shrink restore platform writer tokens must remain fixed at 1 WriteFile, 4 GENERIC_WRITE, 1 SetEndOfFile, 1 handle disposition/DELETE, and one each lock/dismount/extend/offline control'
 }
 
+# FS-RECREATE-001: the FAT32/exFAT target adapter is a deliberately narrow
+# whole-disk transaction.  A physical target is freshly reidentified and kept
+# offline for metadata mutation; only one exact construction Volume GUID may
+# be online for handle-relative no-replace population and full opened-handle
+# readback.  Final metadata publication is commit-last and never rolls back
+# after the publication latch.  Product reachability remains false until an
+# outer Windows/WinPE reviewed whole-disk UI route actually supplies the plan.
+$windowsFileSystemRecreateControllerPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'MigrationEngine\src\windows_file_system_recreate.cpp'))
+$windowsFileSystemRecreateHeaderPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'MigrationEngine\include\ytec\migrationengine\windows_file_system_recreate.h'))
+$windowsFileSystemRecreateTestPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests\Unit\windows_file_system_recreate_tests.cpp'))
+$migrationEngineCmakePath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'MigrationEngine\CMakeLists.txt'))
+$windowsFileSystemRecreateTargetText = Get-Content `
+    -LiteralPath $auditedWindowsFileSystemRecreateTargetPath `
+    -Raw
+$windowsFileSystemRecreateControllerText = Get-Content `
+    -LiteralPath $windowsFileSystemRecreateControllerPath `
+    -Raw
+$windowsFileSystemRecreateHeaderText = Get-Content `
+    -LiteralPath $windowsFileSystemRecreateHeaderPath `
+    -Raw
+$windowsFileSystemRecreateTestText = Get-Content `
+    -LiteralPath $windowsFileSystemRecreateTestPath `
+    -Raw
+$migrationEngineCmakeText = Get-Content `
+    -LiteralPath $migrationEngineCmakePath `
+    -Raw
+$windowsFileSystemRecreateTargetRequiredPatterns = [ordered]@{
+    '\breidentify_physical_target\s*\(' = 'fresh stable target reidentification'
+    '\bvalidate_tsumugi_physical_restore_target\s*\(' = 'system, removable, read-only, sector, and rescue target class gate'
+    '\bhash_tsumugi_physical_restore_target_layout_v1\s*\(' = 'fresh physical layout hash observation'
+    '\bopen_verified_physical_target_with_windows_apis\s*\(' = 'verified offline exact physical target writer'
+    '\bIOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS\b' = 'exact single-disk construction Volume extent'
+    '\bvalidate_exact_binding\s*\(' = 'repeated Volume GUID extent revalidation'
+    '\bIVdsVolumeMF2\b' = 'official Microsoft native formatter'
+    '\bFormatEx\s*\(' = 'fixed non-shell format submission'
+    '\bVDS_ASYNCOUT_FORMAT\b' = 'exact asynchronous format completion evidence'
+    '\bempty_label\b' = 'fixed empty target volume label'
+    '\bGetVolumeInformationByHandleW\s*\(' = 'opened-root filesystem and label readback'
+    '\bGetDiskFreeSpaceW\s*\(' = 'actual allocation geometry readback'
+    '\bkFileCreate\b' = 'handle-relative no-replace object creation'
+    '\bkFileOpenReparsePoint\b' = 'reparse non-following namespace creation'
+    '\bkFileWriteThrough\b' = 'write-through retained child handles'
+    '\bFILE_ID_INFO\b' = 'opened-handle file identity'
+    '\bFileIdInfo\b' = 'volume serial and file ID query'
+    'standard\.NumberOfLinks\s*!=\s*1U' = 'single hard-link gate'
+    '\bopen_windows_file_system_recreate_source_session_read_only\s*\(' = 'shared full opened-handle target enumeration'
+    '\bFlushFileBuffers\s*\(' = 'retained file and exact Volume flush evidence'
+    '\bFSCTL_LOCK_VOLUME\b' = 'exact construction Volume lock'
+    '\bFSCTL_DISMOUNT_VOLUME\b' = 'construction Volume dismount'
+    '\bIOCTL_VOLUME_OFFLINE\b' = 'construction Volume offline transition'
+}
+foreach ($pattern in $windowsFileSystemRecreateTargetRequiredPatterns.Keys) {
+    if ($windowsFileSystemRecreateTargetText -notmatch $pattern) {
+        $failures += "Windows filesystem-recreate target adapter must retain $($windowsFileSystemRecreateTargetRequiredPatterns[$pattern])"
+    }
+}
+$windowsFileSystemRecreateTargetForbiddenPatterns = [ordered]@{
+    '\bDeleteFileW\s*\(' = 'path-only deletion'
+    '\bRemoveDirectoryW\s*\(' = 'path-only directory deletion'
+    '\bMoveFile(?:Ex)?W\s*\(' = 'path-only move'
+    '\bReplaceFileW\s*\(' = 'path-only replacement'
+    '\bCREATE_ALWAYS\b' = 'overwriting file creation'
+    '\bOPEN_ALWAYS\b' = 'existing file reuse'
+    '\bTRUNCATE_EXISTING\b' = 'existing file truncation'
+    '\bIOCTL_VOLUME_ONLINE\b' = 'direct volume online without physical target reidentification'
+    '\bIOCTL_DISK_SET_[A-Z0-9_]+\b' = 'private disk layout setter bypass'
+    '\bIOCTL_DISK_CREATE_DISK\b' = 'private disk initialization bypass'
+    '\bIOCTL_DISK_DELETE_DRIVE_LAYOUT\b' = 'private layout deletion bypass'
+    '\bShellExecute(?:Ex)?W?\s*\(' = 'shell execution'
+    '\bCreateProcessW\s*\(' = 'process execution'
+    '\bdiskpart(?:\.exe)?\b' = 'DiskPart execution'
+    '\bpowershell(?:\.exe)?\b' = 'PowerShell execution'
+}
+foreach ($pattern in $windowsFileSystemRecreateTargetForbiddenPatterns.Keys) {
+    if ($windowsFileSystemRecreateTargetText -match $pattern) {
+        $failures += "Windows filesystem-recreate target adapter contains forbidden $($windowsFileSystemRecreateTargetForbiddenPatterns[$pattern])"
+    }
+}
+$windowsFileSystemRecreateControllerRequiredPatterns = [ordered]@{
+    'logical_sector_size\s*!=\s*512U' = 'current reviewed 512-byte target gate'
+    'expected_source_disk\.logical_sector_size\s*!=\s*4096U' = 'source logical-sector gate limited to 512-byte or 4096-byte media'
+    'target_partitions\.size\(\)\s*!=\s*1U' = 'complete one-partition whole-disk restriction'
+    '\bTsumugiShrinkRestoreLayoutTransactionV1\b' = 'transactional construction and final metadata writer'
+    '\bpublish_construction\s*\(' = 'temporary construction layout publication'
+    '\bretire_construction\s*\(' = 'temporary construction layout retirement'
+    '\bclose_namespace_dismount_and_offline\s*\(' = 'namespace release before final metadata'
+    'offline_proven_before_publication_\s*=\s*true' = 'fresh offline proof before publication'
+    'state_\s*=\s*WindowsFileSystemRecreateTargetLifecycleState::[\s\r\n]*publication_attempted' = 'one-way publication state transition'
+    '\bpartial_publication\s*\(' = 'typed post-publication failure classification'
+    'incomplete_use_prohibited\s*=\s*true' = 'partial target use prohibition'
+    'const WindowsFileSystemRecreateExecutionPlan plan_' = 'immutable execution plan binding'
+    'const WindowsFileSystemRecreateProductionTargetRequest request_' = 'immutable reviewed whole-disk request binding'
+}
+foreach ($pattern in $windowsFileSystemRecreateControllerRequiredPatterns.Keys) {
+    if ($windowsFileSystemRecreateControllerText -notmatch $pattern) {
+        $failures += "Windows filesystem-recreate controller must retain $($windowsFileSystemRecreateControllerRequiredPatterns[$pattern])"
+    }
+}
+$windowsFileSystemRecreateHeaderRequiredPatterns = [ordered]@{
+    'kWindowsFileSystemRecreateProductionTargetAdapterConnected\s*=\s*false' = 'honest disconnected product reachability flag'
+    '\bconstruction_volume_online_exclusive\b' = 'typed limited online isolation state'
+    '\bpartial_publication_use_prohibited\b' = 'typed partial publication terminal state'
+    '\bmake_windows_file_system_recreate_target_platform\s*\(' = 'production Win32 factory declaration'
+}
+foreach ($pattern in $windowsFileSystemRecreateHeaderRequiredPatterns.Keys) {
+    if ($windowsFileSystemRecreateHeaderText -notmatch $pattern) {
+        $failures += "Windows filesystem-recreate contract must retain $($windowsFileSystemRecreateHeaderRequiredPatterns[$pattern])"
+    }
+}
+$windowsFileSystemRecreateTestRequiredPatterns = [ordered]@{
+    '\btest_4kn_source_to_512_target_uses_file_level_recreation\s*\(' = '4Kn-source to 512-target file-only execution coverage'
+    '\btest_production_state_machine_commits_only_after_offline_retirement\s*\(' = 'commit-last typed lifecycle coverage'
+    '\btest_production_partial_publication_never_rolls_back\s*\(' = 'one-way publication failure coverage'
+    '\btest_production_exfat_uses_same_typed_lifecycle\s*\(' = 'exFAT target lifecycle coverage'
+    '\btest_partial_publication_does_not_borrow_stale_offline_proof\s*\(' = 'fresh post-failure offline evidence coverage'
+    '\btest_production_factory_rejects_unreviewed_layout_before_io\s*\(' = 'zero-I/O invalid reviewed-layout coverage'
+    '\btest_source_factory_rejects_nonstandard_logical_sector_before_io\s*\(' = 'zero-I/O non-512/4096 source-sector rejection coverage'
+    '\btest_win32_production_factory_constructs_without_target_io\s*\(' = 'real factory allocation-only coverage'
+}
+foreach ($pattern in $windowsFileSystemRecreateTestRequiredPatterns.Keys) {
+    if ($windowsFileSystemRecreateTestText -notmatch $pattern) {
+        $failures += "Windows filesystem-recreate tests must retain $($windowsFileSystemRecreateTestRequiredPatterns[$pattern])"
+    }
+}
+foreach ($pattern in @(
+        'src/windows_file_system_recreate_target_io\.cpp',
+        '\bOle32\b',
+        '\bUuid\b')) {
+    if ($migrationEngineCmakeText -notmatch $pattern) {
+        $failures += "MigrationEngine CMake must retain production filesystem-recreate target dependency $pattern"
+    }
+}
+$windowsFileSystemRecreateWriteFileCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bWriteFile\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateGenericWriteCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bGENERIC_WRITE\b',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateSetEndCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bSetEndOfFile\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateSetInfoCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bSetFileInformationByHandle\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateLockCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bFSCTL_LOCK_VOLUME\b',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateDismountCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bFSCTL_DISMOUNT_VOLUME\b',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsFileSystemRecreateOfflineCount = ([regex]::Matches(
+        $windowsFileSystemRecreateTargetText,
+        '\bIOCTL_VOLUME_OFFLINE\b',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+if ($windowsFileSystemRecreateWriteFileCount -ne 1 -or
+    $windowsFileSystemRecreateGenericWriteCount -ne 2 -or
+    $windowsFileSystemRecreateSetEndCount -ne 1 -or
+    $windowsFileSystemRecreateSetInfoCount -ne 1 -or
+    $windowsFileSystemRecreateLockCount -ne 1 -or
+    $windowsFileSystemRecreateDismountCount -ne 1 -or
+    $windowsFileSystemRecreateOfflineCount -ne 1) {
+    $failures += 'Windows filesystem-recreate target writer tokens must remain fixed at 1 WriteFile, 2 GENERIC_WRITE, 1 SetEndOfFile, 1 SetFileInformationByHandle, and one each lock/dismount/offline control'
+}
+
+# Online FAT32/exFAT exact copy is a source-only consistency adapter. It may
+# obtain one retained exclusive Volume lock, but it must never dismount,
+# offline, or write that source. The exact single extent and filesystem are
+# reidentified through the retained read handle before target mutation.
+$windowsOnlineDirectCloneSourceText = Get-Content `
+    -LiteralPath $auditedWindowsOnlineDirectCloneSourcePath `
+    -Raw
+$windowsOnlineDirectCloneTestPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests\Unit\windows_online_direct_clone_tests.cpp'))
+$windowsOnlineDirectCloneTestText = Get-Content `
+    -LiteralPath $windowsOnlineDirectCloneTestPath `
+    -Raw
+$windowsOnlineDirectCloneLockRequiredPatterns = [ordered]@{
+    '\bIOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS\b' = 'single physical extent query'
+    'NumberOfDiskExtents\s*!=\s*1U' = 'multi-extent fail-closed gate'
+    '\bGENERIC_READ\b' = 'read-only source handle access'
+    '\bGetVolumeInformationByHandleW\s*\(' = 'locked-handle filesystem reidentification'
+    '\bclassify_basic_data_file_system\s*\(' = 'locked boot-sector signature reidentification'
+    'declared_volume_bytes\s*!=\s*request\.length' = 'complete locked partition coverage'
+    'build_online_direct_source_layout\s*\(\s*final_observation\.value\(\)\.source,\s*\*composite\.value\(\)' = 'post-lock layout recheck through the retained consistency routes'
+    '\bsource_consistency_verified\s*=\s*true' = 'typed consistency completion evidence'
+}
+foreach ($pattern in $windowsOnlineDirectCloneLockRequiredPatterns.Keys) {
+    if ($windowsOnlineDirectCloneSourceText -notmatch $pattern) {
+        $failures += "Windows online FAT/exFAT source adapter must retain $($windowsOnlineDirectCloneLockRequiredPatterns[$pattern])"
+    }
+}
+$windowsOnlineDirectCloneLockForbiddenPatterns = [ordered]@{
+    '\bGENERIC_WRITE\b' = 'source write access'
+    '\bWriteFile\s*\(' = 'source write call'
+    '\bFSCTL_DISMOUNT_VOLUME\b' = 'source volume dismount'
+    '\bIOCTL_VOLUME_OFFLINE\b' = 'source volume offline transition'
+    '\bIOCTL_VOLUME_ONLINE\b' = 'source volume online transition'
+}
+foreach ($pattern in $windowsOnlineDirectCloneLockForbiddenPatterns.Keys) {
+    if ($windowsOnlineDirectCloneSourceText -match $pattern) {
+        $failures += "Windows online FAT/exFAT source adapter contains forbidden $($windowsOnlineDirectCloneLockForbiddenPatterns[$pattern])"
+    }
+}
+$windowsOnlineDirectCloneLockCount = ([regex]::Matches(
+        $windowsOnlineDirectCloneSourceText,
+        '\bFSCTL_LOCK_VOLUME\b',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsOnlineDirectCloneExtentQueryCount = ([regex]::Matches(
+        $windowsOnlineDirectCloneSourceText,
+        '\bquery_exact_volume_extent\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+if ($windowsOnlineDirectCloneLockCount -ne 1 -or
+    $windowsOnlineDirectCloneExtentQueryCount -ne 3) {
+    $failures += "Windows online FAT/exFAT source adapter must retain exactly 1 lock and 2 calls plus 1 definition of exact-extent query (found lock=$windowsOnlineDirectCloneLockCount extent=$windowsOnlineDirectCloneExtentQueryCount)"
+}
+$windowsOnlineDirectCloneLockTestRequiredPatterns = [ordered]@{
+    '\btest_exfat_data_disk_clones_without_vss_under_retained_lock\s*\(' = 'retained-lock success and lifetime coverage'
+    '\btest_fat32_data_disk_clones_without_vss_under_retained_lock\s*\(' = 'FAT32 retained-lock success and lifetime coverage'
+    '\btest_exfat_lock_failure_stops_before_target_mutation\s*\(' = 'lock failure zero-target-mutation coverage'
+    '\btest_online_fat32_and_exfat_require_exact_locked_volume_extent\s*\(' = 'partition-slack fail-closed coverage'
+    'MemoryReader retained Volume lock' = 'test double rejects physical partition reads after lock acquisition'
+    'locked\s*<\s*offline' = 'lock-before-target-offline ordering assertion'
+}
+foreach ($pattern in $windowsOnlineDirectCloneLockTestRequiredPatterns.Keys) {
+    if ($windowsOnlineDirectCloneTestText -notmatch $pattern) {
+        $failures += "Windows online FAT/exFAT source tests must retain $($windowsOnlineDirectCloneLockTestRequiredPatterns[$pattern])"
+    }
+}
+
 $windowsDirectShrinkClonePlatformText = Get-Content `
     -LiteralPath $auditedWindowsDirectShrinkClonePlatformPath `
     -Raw
@@ -1536,7 +1930,8 @@ $windowsDirectShrinkClonePlatformRequiredPatterns = [ordered]@{
     '\bmake_windows_tsumugi_shrink_restore_platform_io\s*\(' = 'shared reidentified target writer, VDS format, DISM apply, and filesystem readback boundary'
     '\bopen_offline_target\s*\(' = 'verified offline target writer acquisition'
     '\bvalidate_stable_identity\s*\(' = 'locked-target stable identity recheck'
-    '\binvalidate_partition_metadata\s*\(' = 'incomplete target metadata withholding'
+    '\binvalidate_initial_partition_metadata\s*\(' = 'pre-checkpoint broad target metadata withholding'
+    '\binvalidate_exact_gpt_metadata\s*\(' = 'post-checkpoint exact GPT-only invalidation'
     '\bpublish_gpt_plan\s*\(' = 'ordered GPT metadata publication'
     '\bverify_gpt_plan\s*\(' = 'complete GPT readback verification'
     '\bexecute_dism_capture\s*\(' = 'signed System32 DISM snapshot capture'
@@ -1551,8 +1946,16 @@ $windowsDirectShrinkClonePlatformRequiredPatterns = [ordered]@{
     '\bCreateDirectoryW\s*\(' = 'non-overwriting target-owned directory creation'
     'ERROR_FILE_NOT_FOUND' = 'WIM nonexistence proof before DISM capture'
     '\bcheckpoint_record\s*\(' = 'fixed target-owned durable checkpoint record'
+    'YTEC-WINDOWS-DIRECT-SHRINK-STAGING-V2' = 'checkpoint offset and record size bound into staging identity'
+    'YTEC-DSC-CHK-V2' = 'current fixed-gap checkpoint serialization domain'
+    '\bprepare_final_extents_keep_incomplete_and_verify\s*\(' = 'nonboot hidden-final extent preparation before boot and final publication'
     '\brevalidate_before_final_commit\s*\(' = 'post-VSS-cleanup identity, staging, and checkpoint revalidation'
     '\bbuild_hidden_final_gpt\s*\(' = 'non-visible final extents before filesystem extension'
+    '\bbuild_final_mbr\s*\(' = 'reviewed primary-only MBR extents and fresh target signature'
+    '\bbuild_hidden_final_mbr_sector\s*\(' = 'inactive zero-bootstrap MBR construction publication'
+    '\bverify_native_construction_mbr\s*\(' = 'native exact inactive MBR extent and type revalidation'
+    '\brevalidate_mbr_source_and_signature\s*\(' = 'fresh raw source sector and all-connected signature collision recheck'
+    'BcdBootFirmware::bios' = 'explicit signed BCDBoot legacy BIOS route'
     '\bgpt_type_windows_recovery\s*\(' = 'Windows recovery GPT role preservation'
     '\bkRecoveryGptAttributes\b' = 'recovery required and no-drive-letter attributes'
     '\bexecute_winre_registration_transaction\s*\(' = 'shared reviewed WinRE registration transaction'
@@ -1561,9 +1964,27 @@ $windowsDirectShrinkClonePlatformRequiredPatterns = [ordered]@{
     'WinReRegisteredPathKind::recovery_windows_re' = 'expected Recovery WindowsRE registration path kind'
     '\bTemporarySystemVolumeMount::acquire\s*\(' = 'exact Windows and Recovery Volume GUID temporary mounts'
     '\bfinalize_winre_with_windows_apis\b' = 'production WinRE transaction adapter'
+    '\.expected_partition_style\s*=\s*plan_\.partition_style\(\)' = 'WinRE revalidation remains bound to final GPT or MBR style'
+    '\.expected_mbr_disk_signature\s*=\s*legacy_bios' = 'WinRE MBR revalidation remains bound to the fresh target signature'
+    '\brevalidate_direct_construction_boot_target\s*\(' = 'native construction GPT and exact boot-volume revalidation'
+    '\befi_boot_ownership_allows_microsoft_rebuild\s*\(' = 'safe-only direct construction EFI ownership policy'
+    '\bexecute_bcdboot_with_windows_apis\s*\(' = 'signed explicit-system-root construction BCDBoot boundary'
     '\bextend_ntfs_volume_to_exact_extent_and_verify\s*\(' = 'shared exact NTFS extension boundary'
+    '\bvalidate_mbr_to_gpt_source_bindings\s*\(' = 'target-only MBR source style, snapshot, and complete mapping validation'
+    '\bvalidate_mbr_preserve_source_bindings\s*\(' = 'MBR preserve primary type, mapping, Active, and role validation'
+    '\bsupported_initial_target_partition_table\s*\(' = 'raw, GPT, or basic-primary-only MBR target pre-I/O validation'
+    '\bsource_partition_snapshot_hash\s*\(\s*\)' = 'immutable raw MBR partition snapshot binding'
+    '\bsource_reidentified\s*=\s*true' = 'post-VSS source stable-identity evidence'
+    '\bsource_layout_unchanged\s*=\s*true' = 'post-VSS source layout readback evidence'
     '\bhidden_final_layout_published_and_read_back\s*=\s*true' = 'hidden final GPT readback evidence'
     '\bprimary_layout_committed_last\s*=\s*true' = 'final primary GPT commit-last evidence'
+    '\bfinal_mbr_sector0_read_back_verified\s*=\s*is_mbr_mode\(\)' = 'final MBR sector0 readback evidence'
+    '\bfinal_mbr_active_partition_count\b' = 'exact final MBR Active count evidence'
+    '\bcheckpoint_retirement_pending\s*=\s*!checkpoint_retired' = 'non-destructive cleanup-pending completion evidence'
+    'ShrinkSurplusAllocation::selected_data_partition' = 'reviewed selected NTFS surplus production route'
+    '\btargeted_surplus_source_table_index_\b' = 'exact reviewed source-table growth owner evidence'
+    '\btargeted_surplus_exact_size_verified_\b' = 'targeted NTFS exact size evidence'
+    '\btargeted_surplus_readback_verified_\b' = 'targeted NTFS namespace readback evidence'
     'typed_token\s*!=\s*L"OK"' = 'uppercase OK destructive confirmation'
 }
 foreach ($pattern in $windowsDirectShrinkClonePlatformRequiredPatterns.Keys) {
@@ -1573,9 +1994,27 @@ foreach ($pattern in $windowsDirectShrinkClonePlatformRequiredPatterns.Keys) {
 }
 $windowsOnlineDirectShrinkCloneRequiredPatterns = [ordered]@{
     '\bplan_windows_direct_shrink_clone_with_windows_apis\s*\(' = 'read-only product planning entry point'
+    '\binspect_windows_direct_shrink_partition_capacity_with_windows_apis\s*\(' = 'read-only partition review inspection entry point'
+    '\bplan_windows_direct_shrink_clone_after_partition_review_with_windows_apis\s*\(' = 'freshly reanalyzed reviewed planning entry point'
+    '\bhash_windows_direct_shrink_source_analysis_v1\s*\(' = 'complete canonical source analysis digest'
+    '\brequire_exact_partition_capacity_binding\s*\(' = 'stable identity plus exact layout and analysis revalidation'
+    '\bhas_valid_targeted_surplus_evidence\s*\(' = 'selected NTFS owner, size, and readback final evidence gate'
     '\bopen_verified_read_only_physical_disk_with_windows_apis\s*\(' = 'read-only stable source handle acquisition'
     '\banalyze_gpt_shrink_source_with_windows_apis\s*\(' = 'reviewed GPT NTFS and role analysis'
-    'reviewed_style\s*!=\s*diskmodel::PartitionStyle::gpt' = 'pre-open MBR preserve and MBR-to-GPT rejection'
+    '\banalyze_mbr_shrink_source_with_windows_apis\s*\(' = 'reviewed read-only MBR NTFS and role analysis'
+    '\bbuild_product_plan_with_fresh_mbr_binding\s*\(' = 'fresh read-only MBR signature selection before immutable planning'
+    '\bobserve_windows_direct_shrink_mbr_safety_with_windows_apis\s*\(' = 'raw source MBR and all-connected signature observation'
+    '\bmake_windows_mbr_signature_generator\s*\(' = 'CNG fresh nonzero target MBR signature generation'
+    'DirectClonePartitionStyleChoice::mbr_to_gpt' = 'explicit target-only MBR-to-GPT style choice'
+    '\bsource_partition_snapshot_hash_\b' = 'immutable raw source partition-table digest'
+    '\bsource_partition_mappings_\b' = 'complete source-to-target partition disposition mapping'
+    '\bsource_reidentified\b' = 'post-VSS source reidentification proof'
+    '\bsource_layout_unchanged\b' = 'post-VSS source layout immutability proof'
+    '\bvalidate_checkpoint_exactly_unchanged\s*\(' = 'complete checkpoint evidence equality after extent preparation and final revalidation'
+    '\bprecomputed_retired_completion_hash\b' = 'retired canonical completion hash computed before final publication'
+    '\bprecomputed_pending_completion_hash\b' = 'cleanup-pending canonical completion hash computed before final publication'
+    '\bselected_completion_hash\b' = 'allocation-free post-publication completion digest selection'
+    '\bhas_valid_windows_direct_shrink_precomputed_completion_evidence\s*\(' = 'fixed-size selected outcome evidence validation'
     '\bbuild_windows_direct_shrink_clone_plan_from_analysis\s*\(' = 'pure analyzed product-plan conversion seam'
     '\bmake_windows_direct_shrink_clone_dependencies\s*\(' = 'product dependency factory'
     'reidentify_physical_clone_selection\s*\([\s\S]{0,160}?false\s*\)' = 'smaller-target selection reidentification'
@@ -1599,6 +2038,9 @@ $windowsOnlineDirectShrinkCloneForbiddenPatterns = [ordered]@{
     '\bSetFileInformationByHandle\s*\(' = 'private mutation bypass'
     '\bDeviceIoControl\s*\(' = 'private disk or volume control bypass'
     '\bCreateProcessW\s*\(' = 'unreviewed process execution'
+    '\bmbr2gpt(?:\.exe)?\b' = 'Microsoft full-OS MBR2GPT execution or coupling'
+    '/allowFullOS' = 'source-mutating full-OS MBR2GPT mode'
+    '\bMountedDevices\b' = 'host registry mutation coupling'
 }
 foreach ($pattern in $windowsOnlineDirectShrinkCloneForbiddenPatterns.Keys) {
     if ($windowsOnlineDirectShrinkCloneText -match $pattern) {
@@ -1607,10 +2049,19 @@ foreach ($pattern in $windowsOnlineDirectShrinkCloneForbiddenPatterns.Keys) {
 }
 $windowsOnlineDirectShrinkCloneTestRequiredPatterns = [ordered]@{
     '\btest_product_analysis_builds_representative_gpt_windows_plan\s*\(' = 'representative Windows 10/11 GPT product-plan coverage'
+    '\btest_product_analysis_builds_target_only_mbr_to_gpt_plan\s*\(' = 'representative target-only MBR-to-GPT product-plan coverage'
+    '\btest_product_analysis_builds_mbr_preserve_with_raw_binding\s*\(' = 'representative MBR preserve immutable raw-sector and signature binding coverage'
+    '\btest_mbr_active_windows_maps_without_separate_bios_payload\s*\(' = 'active-Windows MBR mapping coverage'
+    '\btest_mbr_to_gpt_rejects_unknown_type_snapshot_and_unsafe_selection\s*\(' = 'MBR unknown type, unbound snapshot, and unsafe selection rejection coverage'
+    '\btest_source_layout_drift_after_snapshot_cleanup_blocks_final_commit\s*\(' = 'post-VSS source layout drift containment coverage'
     '\btest_product_analysis_fails_closed_before_execution\s*\(' = 'product pre-I/O layout, capacity, and MBR failure coverage'
     '\btest_target_owned_archive_capacity_failure_cleans_up_without_commit\s*\(' = 'target-owned WIM capacity failure cleanup coverage'
-    'MBR preserve and MBR-to-GPT must be rejected before opening a physical source' = 'explicit incomplete MBR route boundary'
+    '\btest_source_analysis_hash_binds_complete_review_payload\s*\(' = 'complete review analysis digest mutation coverage'
+    'MBR preserve without a fresh raw/source/signature binding must be rejected by the pure planner before VSS or target I/O' = 'missing MBR raw/signature binding pre-I/O rejection'
+    '\btest_mbr_signature_rechecks_fail_closed_before_publication\s*\(' = 'planned signature collision and post-VSS collision containment coverage'
     'zero used-byte counters are advisory and must not discard an analyzed NTFS archive' = 'advisory used-byte counter never drops NTFS content coverage'
+    'a zero selected completion hash must fail the allocation-free post-publication check' = 'zero precomputed completion hash rejection coverage'
+    'a selected completion hash from the opposite retirement outcome must fail closed' = 'opposite checkpoint outcome hash rejection coverage'
 }
 foreach ($pattern in $windowsOnlineDirectShrinkCloneTestRequiredPatterns.Keys) {
     if ($windowsOnlineDirectShrinkCloneTestText -notmatch $pattern) {
@@ -1620,17 +2071,41 @@ foreach ($pattern in $windowsOnlineDirectShrinkCloneTestRequiredPatterns.Keys) {
 $windowsDirectShrinkProductUiRequiredPatterns = [ordered]@{
     '#include\s+"ytec/windowsapp/online_direct_shrink_clone\.h"' = 'direct shrink product header wiring'
     '\bstart_windows_direct_shrink_clone_flow\s*\(' = 'dedicated shrink-mode product route'
-    '\bplan_windows_direct_shrink_clone_with_windows_apis\s*\(' = 'read-only product planner before confirmation'
-    'ShrinkSurplusAllocation::automatic_proportional' = 'reviewed automatic surplus policy'
+    '\bplan_windows_direct_shrink_clone_after_partition_review_with_windows_apis\s*\(' = 'fresh reanalysis immediately before immutable planning'
+    '\breview_clone_partition_capacity_settings\s*\(' = 'clone-only partition and capacity review route'
+    '\bshow_clone_partition_capacity_review_dialog\s*\(' = 'scrollable modal review UI'
+    '\bcomplete_windows_clone_partition_capacity_review\s*\(' = 'pure exact-binding choice completion'
+    'パーティション・容量設定…' = 'dedicated clone settings action'
+    '\bWC_LISTVIEWW\b' = 'native scrollable partition ListView'
+    '\bLVS_EX_CHECKBOXES\b' = 'default-visible partition selection checkboxes'
+    '\bLVN_ITEMCHANGING\b' = 'mouse required-row uncheck veto'
+    '\bLVN_KEYDOWN\b' = 'keyboard required-row gate'
+    '\bVK_SPACE\b' = 'Space required-row uncheck gate'
+    '\bLVIF_PARAM\b' = 'source-table identity recovered from ListView lParam'
+    '\.lParam\s*=\s*static_cast<LPARAM>\([\s\S]{0,80}?source_table_index' = 'ListView lParam stores source_table_index'
+    '\bCB_SETITEMDATA\b' = 'surplus policy and NTFS target item-data binding'
+    '\bDialogBoxIndirectParamW\b' = 'modal keyboard navigation and owner interlock'
+    '\bSetFocus\(state->partition_list\)' = 'predictable initial keyboard focus'
+    '\bpartition_capacity_visible\b' = 'clone shrink-only settings visibility interlock'
+    'ShrinkSurplusAllocation::automatic_proportional' = 'automatic recommended surplus option'
+    'ShrinkSurplusAllocation::selected_data_partition' = 'selected NTFS surplus option'
+    'ShrinkSurplusAllocation::leave_unallocated' = 'leave-unallocated surplus option'
     '一時WIMがコピー先の専用領域に収まらない場合は安全に中止' = 'pre-execution bounded-staging disclosure'
     'IDD_CLONE_CONFIRMATION' = 'shared uppercase OK confirmation dialog'
     '\bexecute_windows_direct_shrink_clone_with_windows_apis\s*\(' = 'audited product executor wiring'
-    '\bactive_clone_is_shrink\b' = 'running-mode UI state retention'
+    '\bactive_clone_mode\b' = 'explicit running transfer-mode UI state retention'
+    'WindowsPartitionStyleChoice::mbr_to_gpt' = 'clone-only MBR-to-GPT style selection'
+    '\.partition_style_choice\s*=' = 'reviewed style choice passed into the immutable product plan'
+    'MBR2GPT\.exeと/allowFullOSは使用せず' = 'source-no-write target-only reconstruction disclosure'
+    'MBR形式とLegacy BIOS構成を維持' = 'MBR preserve and Legacy BIOS first confirmation disclosure'
+    'BCDBoot /f BIOS' = 'exact target-only BIOS boot reconstruction second confirmation disclosure'
+    'Active付きsector0は最後まで公開せず' = 'progress keeps bootable MBR withheld until final publication'
     '\bWindowsDirectShrinkCloneExecutionReport\b' = 'dedicated completion evidence inspection'
-    'primary_layout_committed_last' = 'final GPT commit-last UI proof gate'
+    'source_reidentified' = 'completion requires final source reidentification'
+    'source_layout_unchanged' = 'completion requires final source layout immutability'
     '\btake_completion_power_operation_binding\s*\(' = 'operation-bound SAFE-007 completion proof'
     '\bmake_direct_shrink_clone_completion_power_proof\s*\(' = 'direct shrink mandatory completion proof'
-    'offer_completion_power_action\s*\([\s\S]{0,100}?L"縮小移行クローン"' = 'verified direct shrink completion action prompt'
+    'mbr_to_gpt\s*\?\s*L"MBR→GPT縮小移行クローン"[\s\S]{0,260}?mbr_preserve[\s\S]{0,260}?L"縮小移行クローン"' = 'verified style-specific direct shrink completion action prompt'
     '実機での起動成功を確認した表示ではありません' = 'real-boot evidence boundary disclosure'
 }
 foreach ($pattern in $windowsDirectShrinkProductUiRequiredPatterns.Keys) {
@@ -1649,7 +2124,11 @@ foreach ($pattern in $windowsDirectShrinkProductUiForbiddenPatterns.Keys) {
 }
 $windowsDirectShrinkUiPlannerCount = ([regex]::Matches(
         $windowsDirectShrinkProductUiText,
-        '\bplan_windows_direct_shrink_clone_with_windows_apis\s*\(',
+        '\bplan_windows_direct_shrink_clone_after_partition_review_with_windows_apis\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
+$windowsDirectShrinkUiInspectionCount = ([regex]::Matches(
+        $windowsDirectShrinkProductUiText,
+        '\binspect_windows_direct_shrink_partition_capacity_with_windows_apis\s*\(',
         [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
 $windowsDirectShrinkUiExecutorCount = ([regex]::Matches(
         $windowsDirectShrinkProductUiText,
@@ -1660,15 +2139,33 @@ $windowsDirectShrinkUiCompletionProofCount = ([regex]::Matches(
         '\bmake_direct_shrink_clone_completion_power_proof\s*\(',
         [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
 if ($windowsDirectShrinkUiPlannerCount -ne 1 -or
+    $windowsDirectShrinkUiInspectionCount -ne 2 -or
     $windowsDirectShrinkUiExecutorCount -ne 1 -or
     $windowsDirectShrinkUiCompletionProofCount -ne 1) {
-    $failures += 'Windows direct shrink product UI must retain exactly one read-only planner, audited executor, and mandatory completion proof call'
+    $failures += 'Windows direct shrink product UI must retain exactly two review inspections, one fresh reviewed planner, audited executor, and mandatory completion proof call'
 }
 $windowsDirectShrinkClonePlatformTestRequiredPatterns = [ordered]@{
     '\btest_gpt_system_leave_unallocated_finalizes_boot_and_winre\s*\(' = 'representative GPT system leave-unallocated coverage'
     '\btest_gpt_system_automatic_extends_every_planned_ntfs_before_visibility\s*\(' = 'representative GPT system automatic-extension coverage'
+    '\btest_selected_data_extension_verifies_exact_owner_size_and_readback\s*\(' = 'selected NTFS owner, exact-size, and readback coverage'
+    '\btest_data_only_gpt_preserves_one_selected_microsoft_reserved_partition\s*\(' = 'data-only GPT selected MSR production coverage'
     '\btest_system_boot_or_winre_failure_aborts_before_commit_ready\s*\(' = 'BCDBoot and WinRE failure injection coverage'
     '\btest_automatic_extension_failure_invalidates_and_keeps_offline\s*\(' = 'NTFS extension failure injection coverage'
+    '\btest_factory_accepts_explicit_mbr_to_gpt_and_four_primary_layout\s*\(' = 'four-primary target-only MBR-to-GPT factory coverage'
+    '\btest_factory_accepts_reviewed_mbr_preserve_before_any_io\s*\(' = 'reviewed MBR preserve pure factory coverage'
+    '\btest_mbr_data_only_uses_hidden_then_sector0_last\s*\(' = 'data-only hidden MBR to inactive sector0-last coverage'
+    '\btest_mbr_system_uses_exact_legacy_bios_target_and_one_active\s*\(' = 'exact BIOS BCDBoot and exactly-one-Active final MBR coverage'
+    '\btest_mbr_publication_failures_preserve_latch_contract\s*\(' = 'pre-latch failure and post-latch cleanup-pending MBR coverage'
+    '\btest_mbr_to_gpt_active_windows_source_completes_without_mbr2gpt\s*\(' = 'active-Windows target-only reconstruction coverage'
+    '\btest_mbr_to_gpt_source_identity_or_layout_drift_withholds_final_gpt\s*\(' = 'source identity and layout drift containment coverage'
+    '\btest_mbr_to_gpt_format_boot_winre_and_commit_failures_stay_incomplete\s*\(' = 'target-only format, boot, WinRE, and final-commit failure coverage'
+    '\btest_gpt_phases_reuse_fresh_guids_and_withhold_boot_until_final\s*\(' = 'stable GUID and nonboot construction-to-final publication coverage'
+    '\btest_abort_after_hidden_final_preserves_checkpoint_and_invalidates_only_gpt\s*\(' = 'hidden-final abort preserves fixed checkpoint coverage'
+    '\btest_data_only_prepare_latches_synthetic_boot_completion\s*\(' = 'data-only commit-order state coverage'
+    '\btest_prepare_rejects_nonserialized_checkpoint_evidence_drift\s*\(' = 'complete checkpoint evidence drift rejection coverage'
+    '\btest_final_publication_failure_keeps_checkpoint_and_nonboot_target\s*\(' = 'failed final publication remains checkpointed and nonboot coverage'
+    '\btest_checkpoint_retirement_failure_reports_cleanup_pending_and_keeps_final\s*\(' = 'post-publication checkpoint cleanup-pending coverage'
+    '\btest_boot_finalization_rejects_missing_nonboot_or_ownership_proof\s*\(' = 'construction GPT and EFI ownership proof rejection coverage'
 }
 foreach ($pattern in $windowsDirectShrinkClonePlatformTestRequiredPatterns.Keys) {
     if ($windowsDirectShrinkClonePlatformTestText -notmatch $pattern) {
@@ -1686,6 +2183,9 @@ $windowsDirectShrinkClonePlatformForbiddenPatterns = [ordered]@{
     '\bShellExecute(?:Ex)?W?\s*\(' = 'shell execution'
     '\bCreateProcessW\s*\(' = 'unreviewed process launch'
     '\bWinExec\s*\(' = 'legacy process launch'
+    '\bmbr2gpt(?:\.exe)?\b' = 'Microsoft full-OS MBR2GPT execution or coupling'
+    '/allowFullOS' = 'source-mutating full-OS MBR2GPT mode'
+    '\bMountedDevices\b' = 'host registry mutation coupling'
     '\bIOCTL_DISK_SET_[A-Z0-9_]+\b' = 'private disk layout setter'
     '\bIOCTL_DISK_CREATE_DISK\b' = 'private disk creation ioctl'
     '\bIOCTL_DISK_DELETE_DRIVE_LAYOUT\b' = 'private disk layout deletion ioctl'
@@ -1713,6 +2213,48 @@ if ($windowsDirectShrinkGenericWriteCount -ne 1 -or
     $windowsDirectShrinkDispositionCount -ne 1 -or
     $windowsDirectShrinkDeleteAccessCount -ne 3) {
     $failures += 'Windows direct shrink clone platform writer tokens must remain fixed at 1 GENERIC_WRITE, 1 handle disposition helper, and 3 DELETE accesses (seal, exact cleanup, partial cleanup); all raw target writes stay behind ITargetDiskWriter'
+}
+
+$cloneBootFinalizationText = Get-Content `
+    -LiteralPath $cloneBootFinalizationPath `
+    -Raw
+$cloneBootFinalizationTestText = Get-Content `
+    -LiteralPath $cloneBootFinalizationTestPath `
+    -Raw
+$cloneBootFinalizationRequiredPatterns = [ordered]@{
+    '\binspect_clone_efi_ownership\s*\(' = 'read-only exact ESP ownership preflight'
+    'EfiBootOwnershipState::\s*\r?\n?\s*microsoft_only_or_empty' = 'safe-only cloned ESP ownership policy'
+    '\befi_boot_ownership_allows_microsoft_rebuild\s*\(' = 'Microsoft-only rebuild eligibility proof'
+    '\.system_volume_identity_root\s*=' = 'exact ESP Volume GUID identity binding'
+    '\.require_efi_ownership_recheck\s*=' = 'immediate pre-mutation ownership recheck'
+    'BootRepairThirdPartyEfiPolicy::not_applicable' = 'no implicit third-party EFI authorization'
+    '\.update_current_pc_nvram\s*=\s*false' = 'explicit NVRAM non-mutation contract'
+    '!repaired\.value\(\)\.efi_ownership_revalidated' = 'standalone ownership revalidation evidence gate'
+    '!repaired\.value\(\)\.nvram_unchanged' = 'standalone NVRAM non-mutation evidence gate'
+    'repaired\.value\(\)\.temporary_mount_released' = 'inner service must not release outer-owned mounts'
+    '\.temporary_mounts_released\s*=\s*true' = 'outer temporary mount release evidence'
+}
+foreach ($pattern in $cloneBootFinalizationRequiredPatterns.Keys) {
+    if ($cloneBootFinalizationText -notmatch $pattern) {
+        $failures += "Clone boot finalization must retain $($cloneBootFinalizationRequiredPatterns[$pattern])"
+    }
+}
+if ($cloneBootFinalizationText -match
+        '\.update_current_pc_nvram\s*=\s*true') {
+    $failures += 'Clone boot finalization must never enable current-PC NVRAM mutation'
+}
+$cloneBootFinalizationTestRequiredPatterns = [ordered]@{
+    '\btest_ambiguous_efi_is_rejected_before_mounting\s*\(' = 'ambiguous EFI pre-mutation rejection coverage'
+    '\btest_untrusted_efi_is_rejected_before_mounting\s*\(' = 'untrusted EFI pre-mutation rejection coverage'
+    '\btest_wrong_esp_identity_is_rejected_before_mounting\s*\(' = 'foreign ESP identity rejection coverage'
+    '\btest_efi_ownership_drift_is_rejected_and_mounts_are_released\s*\(' = 'ownership drift and mount cleanup coverage'
+    '\btest_bios_carries_not_applicable_efi_policy\s*\(' = 'BIOS not-applicable ownership coverage'
+    '\btest_unverified_boot_report_is_rejected\s*\(' = 'signed/fresh/ownership/NVRAM evidence rejection coverage'
+}
+foreach ($pattern in $cloneBootFinalizationTestRequiredPatterns.Keys) {
+    if ($cloneBootFinalizationTestText -notmatch $pattern) {
+        $failures += "Clone boot finalization tests must retain $($cloneBootFinalizationTestRequiredPatterns[$pattern])"
+    }
 }
 
 $logWriterText = Get-Content -LiteralPath $auditedLogFileWriterPath -Raw
@@ -1869,6 +2411,12 @@ $windowsResumeSlotRequiredPatterns = [ordered]@{
     '\bmake_resume_slot_binding\s*\(' = 'complete discard binding revalidation'
     '\bFILE_DISPOSITION_INFO\b' = 'handle-bound guarded deletion'
     '\bpartial_identity_hash\s*\(' = 'owned partial opened File ID binding'
+    '\bowned_object_identity_hash\s*\(' = 'role-tagged partial/journal opened File ID binding'
+    'binding\.owned_object_file_bindings\.size\(\)' = 'exact reviewed multi-object discard cardinality'
+    '\brename_open_handle_no_replace\s*\(' = 'opened image-partial no-overwrite publish helper'
+    'rename->ReplaceIfExists\s*=\s*FALSE' = 'completed image no-overwrite publication'
+    '\bcommit_persistent_pe_exact_image_create\s*\(' = 'capability-8 publish, full verification, and retirement coordinator'
+    'FILE_SHARE_READ,\s*\r?\n\s*nullptr,\s*\r?\n\s*OPEN_EXISTING,\s*\r?\n\s*FILE_FLAG_OPEN_REPARSE_POINT\s*\|\s*FILE_FLAG_SEQUENTIAL_SCAN' = 'published image read lock denying write and delete sharing'
     '\bidentity_from_open_handle\b' = 'caller opened-handle backing proof'
     '\bseparated_from_source\b' = 'caller source/data backing separation proof'
 }
@@ -1936,9 +2484,9 @@ if ($windowsResumeSlotWriteFileCount -ne 1 -or
     $windowsResumeSlotGenericWriteCount -ne 1 -or
     $windowsResumeSlotMoveCount -ne 1 -or
     $windowsResumeSlotReplaceCount -ne 1 -or
-    $windowsResumeSlotDispositionCount -ne 1 -or
-    $windowsResumeSlotDeleteAccessCount -ne 4) {
-    $failures += 'OperationCore Windows resume slot adapter writer tokens must remain fixed at 1 WriteFile, 1 GENERIC_WRITE, 1 MoveFileExW, 1 ReplaceFileW, 1 handle disposition call, and 4 DELETE accesses'
+    $windowsResumeSlotDispositionCount -ne 2 -or
+    $windowsResumeSlotDeleteAccessCount -ne 9) {
+    $failures += 'OperationCore Windows resume slot adapter writer tokens must remain fixed at 1 WriteFile, 1 GENERIC_WRITE, 1 MoveFileExW, 1 ReplaceFileW, 2 handle information calls (guarded disposition plus no-replace image publish), and 9 DELETE accesses (slot stage/create cleanup, generic checkpoint/legacy/multi-object discard, and capability-8 checkpoint/image/journal exact-open retirement)'
 }
 
 $supportZipWriterText = Get-Content `
@@ -2144,6 +2692,7 @@ $tsumugiStreamRequiredPatterns = [ordered]@{
     '\bReplaceIfExists\s*=\s*FALSE' = 'handle rename without implicit overwrite'
     '\bsame_file_id\s*\(' = 'stable file identity before owned cleanup and commit'
     '\bFILE_FLAG_OPEN_REPARSE_POINT\b' = 'reparse-safe existing image observation'
+    'GENERIC_READ\s*\|\s*GENERIC_WRITE,\s*\r?\n\s*FILE_SHARE_READ' = 'bound resume reopen with content write access but no delete access or write/delete sharing'
     'callbacks_started_after_complete_verification' = 'restore callbacks after complete validation only'
 }
 foreach ($pattern in $tsumugiStreamRequiredPatterns.Keys) {
@@ -2176,12 +2725,12 @@ $tsumugiStreamDeleteAccessCount = ([regex]::Matches(
         '\bDELETE\b',
         [Text.RegularExpressions.RegexOptions]::CultureInvariant)).Count
 if ($tsumugiStreamWriteCount -ne 1 -or
-    $tsumugiStreamGenericWriteCount -ne 1 -or
+    $tsumugiStreamGenericWriteCount -ne 2 -or
     $tsumugiStreamDeleteCount -ne 2 -or
     $tsumugiStreamSetLengthCount -ne 1 -or
     $tsumugiStreamDispositionCount -ne 2 -or
     $tsumugiStreamDeleteAccessCount -ne 2) {
-    $failures += 'Tsumugi stream writer must retain exactly one WriteFile, GENERIC_WRITE, and SetEndOfFile; two DeleteFileW, SetFileInformationByHandle, and DELETE accesses'
+    $failures += 'Tsumugi stream writer must retain exactly one WriteFile and SetEndOfFile; two GENERIC_WRITE accesses (CREATE_NEW owned partial and exact bound resume reopen); and two DeleteFileW, SetFileInformationByHandle, and DELETE accesses'
 }
 
 $tsumugiRescueStagingText = Get-Content `
@@ -2551,6 +3100,14 @@ $winPeResumeStorageHeaderPath = [IO.Path]::GetFullPath(
     (Join-Path $sourceRoot 'WinPEApp\include\ytec\winpeapp\direct_image_restore_resume_storage.h'))
 $winPeResumeGuiPath = [IO.Path]::GetFullPath(
     (Join-Path $sourceRoot 'WinPEApp\src\gui_main.cpp'))
+$winPeImageCreateResumeHeaderPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'WinPEApp\include\ytec\winpeapp\direct_image_create_resume.h'))
+$winPeImageCreateResumeControllerPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'WinPEApp\src\direct_image_create_resume.cpp'))
+$winPeImageCreateControllerPath = [IO.Path]::GetFullPath(
+    (Join-Path $sourceRoot 'WinPEApp\src\direct_image_create.cpp'))
+$winPeImageCreateTestPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests\Unit\winpe_direct_image_create_tests.cpp'))
 $tsumugiResumeTestPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot 'tests\Unit\tsumugi_physical_restore_resume_tests.cpp'))
 $winPeResumeTestPath = [IO.Path]::GetFullPath(
@@ -2572,6 +3129,13 @@ $winPeResumeStorageHeaderText = Get-Content `
     -Raw
 $winPeResumeGuiText = Get-Content `
     -LiteralPath $winPeResumeGuiPath `
+    -Raw
+$winPeImageCreateResumeText =
+    (Get-Content -LiteralPath $winPeImageCreateResumeHeaderPath -Raw) + "`n" +
+    (Get-Content -LiteralPath $winPeImageCreateResumeControllerPath -Raw) + "`n" +
+    (Get-Content -LiteralPath $winPeImageCreateControllerPath -Raw)
+$winPeImageCreateTestText = Get-Content `
+    -LiteralPath $winPeImageCreateTestPath `
     -Raw
 $tsumugiResumeTestText = Get-Content `
     -LiteralPath $tsumugiResumeTestPath `
@@ -2667,6 +3231,50 @@ $winPeResumeGuiRequiredPatterns = [ordered]@{
 foreach ($pattern in $winPeResumeGuiRequiredPatterns.Keys) {
     if ($winPeResumeGuiText -notmatch $pattern) {
         $failures += "WinPE persistent resume GUI must retain $($winPeResumeGuiRequiredPatterns[$pattern])"
+    }
+}
+
+$winPeImageCreateResumeRequiredPatterns = [ordered]@{
+    'kMaximumContinuityCharacters\s*=\s*512U' = 'bounded canonical non-secret continuity metadata'
+    '\bparse_direct_image_create_resume_continuity_v1\s*\(' = 'strict continuity parser'
+    '\bprepare_resumable_tsumugi_file_v1\s*\(' = 'private journal-backed resumable stream'
+    '\bslot\.create\s*\(' = 'schema-v3 slot publication before first owned-object byte'
+    '\bslot\.replace\s*\(' = 'verified-boundary atomic checkpoint replacement'
+    '\.prove_existing_before_resume\s*=' = 'existing prefix full source and journal reproof hook'
+    '\bcommit_persistent_pe_exact_image_create\s*\(' = 'no-overwrite publish, full verification, and exact retirement'
+    'continuity\.created_utc\s*=\s*request\.created_utc' = 'first-run timestamp continuity'
+    'effective\.created_utc\s*=\s*continuity\.created_utc' = 'resume reuses the initial timestamp'
+    'request\.rescue_mode\s*\|\|\s*request\.replace_existing' = 'persistent path remains exact and create-new only'
+}
+foreach ($pattern in $winPeImageCreateResumeRequiredPatterns.Keys) {
+    if ($winPeImageCreateResumeText -notmatch $pattern) {
+        $failures += "WinPE persistent exact image-create controller must retain $($winPeImageCreateResumeRequiredPatterns[$pattern])"
+    }
+}
+
+$winPeImageCreateResumeGuiRequiredPatterns = [ordered]@{
+    '\binspect_image_create_resume_on_startup\s*\(' = 'capability-8 startup routing before restore delegation'
+    '\bformat_direct_image_create_resume_startup_review_v1\s*\(' = 'source, output, progress, capability startup summary'
+    '\bdiscard_direct_image_create_resume_v1\s*\(' = 'staged-only exact-bound two-object discard'
+    '\bexecute_direct_image_create_resume_with_windows_apis_v1\s*\(' = 'product exact start/resume executor'
+    'DirectImageCreateResumeAction::resume_existing' = 'reviewed binding resume action'
+    'DirectImageCreateResumeAction::start_new' = 'new schema-v3 exact action'
+    'パスワードと鍵はcheckpointへ保存していません' = 'password re-entry and non-persistence disclosure'
+    'PersistentPeExactImageCreateObjectState::retirement_pending' = 'post-publish retirement recovery routing'
+}
+foreach ($pattern in $winPeImageCreateResumeGuiRequiredPatterns.Keys) {
+    if ($winPeResumeGuiText -notmatch $pattern) {
+        $failures += "WinPE persistent exact image-create GUI must retain $($winPeImageCreateResumeGuiRequiredPatterns[$pattern])"
+    }
+}
+
+$winPeImageCreateResumeTestRequiredPatterns = [ordered]@{
+    '\bresume_continuity_roundtrips_without_secret_material\s*\(' = 'encrypted and unencrypted canonical continuity roundtrip'
+    '\bresume_continuity_rejects_noncanonical_unknown_and_oversized_input\s*\(' = 'unknown version, noncanonical, secret-shaped, and oversize rejection'
+}
+foreach ($pattern in $winPeImageCreateResumeTestRequiredPatterns.Keys) {
+    if ($winPeImageCreateTestText -notmatch $pattern) {
+        $failures += "WinPE persistent exact image-create tests must retain $($winPeImageCreateResumeTestRequiredPatterns[$pattern])"
     }
 }
 foreach ($pattern in $winPeResumeControllerRequiredPatterns.Keys) {
@@ -2870,7 +3478,18 @@ $completionPowerUiRequiredPatterns = [ordered]@{
     '\bsnapshots_deleted\b' = 'snapshot cleanup gate'
     '\btarget_left_offline\b' = 'offline target completion gate'
     '\bmake_direct_shrink_clone_completion_power_proof\s*\(' = 'direct shrink clone mandatory verification proof'
+    '\bhas_valid_windows_direct_shrink_precomputed_completion_evidence\s*\(' = 'allocation-free canonical completion outcome binding gate'
     '\bprimary_layout_committed_last\b' = 'direct shrink final GPT commit-last gate'
+    '\bsource_reidentified\b' = 'direct shrink final source re-identification gate'
+    '\bsource_layout_unchanged\b' = 'direct shrink final source layout immutability gate'
+    '\bconstruction_layout_non_bootable\b' = 'direct shrink pre-publication non-bootable GPT gate'
+    '\bcheckpoint_retained_through_extensions_and_boot\b' = 'direct shrink durable incomplete marker gate'
+    '\bboot_completed_before_final_layout_publication\b' = 'direct shrink boot-before-visible-GPT gate'
+    '\bfinal_layout_published_before_checkpoint_retirement\b' = 'direct shrink publish-before-cleanup gate'
+    '\bcheckpoint_retirement_pending\b' = 'verified final layout with honest cleanup-pending evidence'
+    '\bfinal_partition_style\b' = 'direct shrink final GPT or MBR style gate'
+    '\bsource_mbr_bootstrap_unchanged\b' = 'direct shrink source MBR bootstrap immutability gate'
+    '\bfinal_mbr_sector0_read_back_verified\b' = 'direct shrink final MBR sector0 readback gate'
     '\bevery_payload_captured_and_applied_inside_snapshot_callback\b' = 'direct shrink callback-bound payload gate'
     '\bbackup_completed\b' = 'VSS BackupComplete gate'
     '\bselected_tsumugi_creation_verification_passed\b' =
@@ -2913,6 +3532,14 @@ $completionPowerUiTestRequiredPatterns = [ordered]@{
     '\bselection_and_reconfirmation_reach_only_the_mock_seam\s*\(' = 'two-stage confirmation mock coverage'
     '\bonly_restart_and_shutdown_skip_the_continuing_ui_refresh\s*\(' = 'sleep-resume UI refresh coverage'
     '\bdirect_shrink_completion_requires_full_mandatory_evidence\s*\(' = 'direct shrink commit, offline, lifecycle, release, and binding proof coverage'
+    'A verified final layout with only checkpoint cleanup pending must remain eligible' = 'checkpoint-cleanup pending success coverage'
+    'Conflicting retired and cleanup-pending evidence must fail closed' = 'exclusive checkpoint outcome coverage'
+    'A zero precomputed completion hash must fail the power prompt closed' = 'zero canonical completion hash rejection coverage'
+    'A completion hash for the opposite checkpoint outcome must fail the power prompt closed' = 'opposite cleanup outcome hash rejection coverage'
+    'pre-publication construction layout was non-bootable' = 'non-boot construction negative coverage'
+    'finish boot preparation before final GPT publication' = 'boot-before-publication negative coverage'
+    'A verified MBR/Legacy BIOS sector0-last report must be eligible' = 'positive MBR completion power proof coverage'
+    'MBR completion without unchanged source bootstrap must fail closed' = 'negative MBR completion power proof coverage'
 }
 foreach ($pattern in $completionPowerUiTestRequiredPatterns.Keys) {
     if ($completionPowerUiTestText -notmatch $pattern) {
@@ -3065,8 +3692,8 @@ $firstRunGuidanceMainRequiredPatterns = [ordered]@{
     'nDefaultButton\s*=\s*IDOK' = 'keyboard default OK action'
     '\brestore_error_dialog_focus\s*\(' = 'focus restoration'
     'show_first_run_guidance_dialog\s*\(\s*\*state,\s*false\s*\)' = 'diagnostics redisplay'
-    '\bcalculate_first_run_guidance_diagnostic_button_layout\s*\(' = 'compact two-button layout'
-    'UpdateWindow\(window\);\s*show_first_run_guidance_if_needed\(state\);' = 'non-blocking main-window-first startup order'
+    '\bcalculate_diagnostics_action_layout\s*\(' = 'non-overlapping four-action diagnostics layout'
+    'UpdateWindow\(window\);\s*show_startup_resume_slot_review\(state\);\s*show_first_run_guidance_if_needed\(state\);' = 'main-window-first resume review then first-run startup order'
 }
 foreach ($pattern in $firstRunGuidanceMainRequiredPatterns.Keys) {
     if ($firstRunGuidanceMainText -notmatch $pattern) {
@@ -3297,6 +3924,204 @@ foreach ($pattern in $winPeDirectShrinkRestoreTestRequiredPatterns.Keys) {
     }
 }
 
+# EXE-008: every currently exposed WinPE destructive product route freshly
+# observes the one fixed resume slot after final confirmation. The admission
+# plan is observation-only: it is never a persistent capability, checkpoint,
+# resume target, or execution permission. A valid persistent restore may use
+# only the exact complete binding through open_bound().
+$winPeResumeAdmissionHeader = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WinPEApp\include\ytec\winpeapp\resume_slot_admission.h')
+$winPeResumeAdmissionSource = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WinPEApp\src\resume_slot_admission.cpp')
+$winPeResumeAdmissionTests = Get-Content -Raw -LiteralPath (
+    Join-Path $repoRoot 'tests\Unit\winpe_resume_slot_admission_tests.cpp')
+$winPeResumeAdmissionGui = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WinPEApp\src\gui_main.cpp')
+
+$winPeResumeAdmissionRequiredPatterns = [ordered]@{
+    '\bguard_new_operation_start\s*\(' = 'OperationCore global start-new gate'
+    '\bopen_bound\s*\(reviewed_binding\)' = 'exact complete resume binding preflight'
+    'kMaximumAdmissionTextFields\s*=\s*16U' = 'bounded immutable text field count'
+    'kMaximumAdmissionDigests\s*=\s*16U' = 'bounded immutable digest count'
+    'kMaximumAdmissionFieldCharacters\s*=\s*32U\s*\*\s*1024U' = 'bounded per-field UTF-16 length'
+    'kMaximumAdmissionCanonicalBytes\s*=\s*256U\s*\*\s*1024U' = 'bounded total canonical bytes'
+    'catch\s*\(const std::bad_alloc&\)' = 'allocation failure converted to Result'
+}
+foreach ($pattern in $winPeResumeAdmissionRequiredPatterns.Keys) {
+    if ($winPeResumeAdmissionSource -notmatch $pattern) {
+        $failures += "WinPE global resume admission helper must retain $($winPeResumeAdmissionRequiredPatterns[$pattern])"
+    }
+}
+if (($winPeResumeAdmissionHeader + $winPeResumeAdmissionSource) -match
+        'ResumeCapability::|\.create\s*\(|\.replace\s*\(|\.discard\s*\(') {
+    $failures += 'WinPE admission-only helper must not create/replace/discard a slot or declare a persistent resume capability'
+}
+
+$winPeResumeAdmissionTestRequiredPatterns = [ordered]@{
+    '\badmission_canonicalization_rejects_empty_huge_and_overflow_shapes\s*\(' = 'empty, huge, and overflow-shaped field coverage'
+    '\bactive_unknown_and_orphaned_slot_state_block_every_new_operation\s*\(' = 'active/unknown/orphan unchanged fail-closed coverage'
+    '\bactive_slot_also_blocks_starting_the_same_operation_as_new\s*\(' = 'same-operation start-new rejection coverage'
+    '\bresume_requires_the_exact_complete_binding_and_never_mutates_preflight\s*\(' = 'exact open_bound and mismatch coverage'
+    '\bstartup_review_rejects_every_non_restore_persistent_capability\s*\(' = 'restore-only startup presentation coverage'
+}
+foreach ($pattern in $winPeResumeAdmissionTestRequiredPatterns.Keys) {
+    if ($winPeResumeAdmissionTests -notmatch $pattern) {
+        $failures += "WinPE global resume admission tests must retain $($winPeResumeAdmissionTestRequiredPatterns[$pattern])"
+    }
+}
+
+$newAdmissionGateCount = [regex]::Matches(
+    $winPeResumeAdmissionGui,
+    '\bguard_new_product_operation_start\s*\(').Count
+if ($newAdmissionGateCount -ne 6) {
+    $failures += "WinPE GUI must retain one new-operation gate definition plus exactly five current route calls (found $newAdmissionGateCount). If a legitimate destructive route is added or removed, wire it through the same fresh gate and intentionally update this audit."
+}
+$boundResumeGateCount = [regex]::Matches(
+    $winPeResumeAdmissionGui,
+    '\bguard_bound_product_restore_resume\s*\(').Count
+if ($boundResumeGateCount -ne 2) {
+    $failures += "WinPE GUI must retain one exact-bound resume gate definition plus one restore-resume call (found $boundResumeGateCount). If the reviewed resume route changes, preserve open_bound-only admission and intentionally update this audit."
+}
+
+$winPeResumeAdmissionRouteRegions = [ordered]@{
+    'clone' = @('void start_clone_execute(', 'void request_clone_cancellation(', 1, 0)
+    'image create' = @('void start_image_execute(', 'void request_image_cancellation(', 1, 0)
+    'image restore' = @('void start_restore_execute(', 'void request_restore_cancellation(', 1, 1)
+    'boot/system repair' = @('void start_boot_execute(', 'void cancel_boot_review(', 2, 0)
+}
+foreach ($route in $winPeResumeAdmissionRouteRegions.Keys) {
+    $definition = $winPeResumeAdmissionRouteRegions[$route]
+    $startIndex = $winPeResumeAdmissionGui.IndexOf(
+        [string]$definition[0], [StringComparison]::Ordinal)
+    $endIndex = if ($startIndex -ge 0) {
+        $winPeResumeAdmissionGui.IndexOf(
+            [string]$definition[1],
+            $startIndex + ([string]$definition[0]).Length,
+            [StringComparison]::Ordinal)
+    } else {
+        -1
+    }
+    if ($startIndex -lt 0 -or $endIndex -le $startIndex) {
+        $failures += "WinPE GUI global resume admission audit cannot isolate the $route route"
+        continue
+    }
+    $region = $winPeResumeAdmissionGui.Substring(
+        $startIndex, $endIndex - $startIndex)
+    $newCount = [regex]::Matches(
+        $region, '\bguard_new_product_operation_start\s*\(').Count
+    $boundCount = [regex]::Matches(
+        $region, '\bguard_bound_product_restore_resume\s*\(').Count
+    if ($newCount -ne [int]$definition[2] -or
+        $boundCount -ne [int]$definition[3]) {
+        $failures += "WinPE $route route must retain $($definition[2]) fresh start-new gate(s) and $($definition[3]) exact-bound resume gate(s); found $newCount and $boundCount. Update this audit only together with a reviewed route change."
+    }
+}
+
+# EXE-008 Windows product: all currently exposed target/output writers pass a
+# fresh observation of the same fixed slot immediately before their reviewed
+# executor. Windows has no reviewed persistent-resume controller, so startup
+# may only retain the slot or discard its exactly rebound app-owned objects.
+$windowsResumeProductHeader = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WindowsApp\include\ytec\windowsapp\resume_slot_product.h')
+$windowsResumeProductSource = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WindowsApp\src\resume_slot_product.cpp')
+$windowsResumeProductTests = Get-Content -Raw -LiteralPath (
+    Join-Path $repoRoot 'tests\Unit\windows_resume_slot_product_tests.cpp')
+$windowsResumeProductUi = Get-Content -Raw -LiteralPath (
+    Join-Path $sourceRoot 'WindowsApp\src\main.cpp')
+
+$windowsResumeProductRequiredPatterns = [ordered]@{
+    '\bguard_new_operation_start\s*\(' = 'OperationCore global start-new gate'
+    '\bslot\.discard\s*\(reviewed_binding\)' = 'fresh exact-bound owned discard'
+    'kMaximumAdmissionTextFields\s*=\s*16U' = 'bounded immutable text field count'
+    'kMaximumAdmissionDigests\s*=\s*16U' = 'bounded immutable digest count'
+    'kMaximumAdmissionFieldCharacters\s*=\s*32U\s*\*\s*1024U' = 'bounded per-field UTF-16 length'
+    'kMaximumAdmissionCanonicalBytes\s*=\s*256U\s*\*\s*1024U' = 'bounded total canonical bytes'
+    '\bchecked_add_bounded\s*\(' = 'checked canonical-size addition'
+    '\bchecked_multiply\s*\(' = 'checked UTF-16 byte multiplication'
+    'catch\s*\(const std::bad_alloc&\)' = 'allocation failure converted to Result'
+    'catch\s*\(const std::length_error&\)' = 'length failure converted to Result'
+    '\brequire_path_absent\s*\(' = 'read-only absent child proof'
+    'active\.checkpoint\.new' = 'fixed stage-object absence proof'
+    '\.resume_action_available\s*=\s*false' = 'no fake Windows resume action'
+}
+foreach ($pattern in $windowsResumeProductRequiredPatterns.Keys) {
+    if ($windowsResumeProductSource -notmatch $pattern) {
+        $failures += "Windows global resume product helper must retain $($windowsResumeProductRequiredPatterns[$pattern])"
+    }
+}
+
+$windowsAdmissionStart = $windowsResumeProductSource.IndexOf(
+    'make_windows_resume_slot_admission_plan(',
+    [StringComparison]::Ordinal)
+$windowsAdmissionEnd = $windowsResumeProductSource.IndexOf(
+    'make_windows_resume_slot_admission_operation_id_with_windows_apis(',
+    [StringComparison]::Ordinal)
+if ($windowsAdmissionStart -lt 0 -or
+    $windowsAdmissionEnd -le $windowsAdmissionStart) {
+    $failures += 'Windows admission-only helper region cannot be isolated'
+} else {
+    $windowsAdmissionRegion = $windowsResumeProductSource.Substring(
+        $windowsAdmissionStart,
+        $windowsAdmissionEnd - $windowsAdmissionStart)
+    if ($windowsAdmissionRegion -match
+            'ResumeCapability::|\.create\s*\(|\.replace\s*\(|\.discard\s*\(') {
+        $failures += 'Windows admission-only plan must not declare a persistent capability or create/replace/discard a slot'
+    }
+}
+
+$windowsResumeProductTestRequiredPatterns = [ordered]@{
+    '\badmission_plan_is_bounded_and_binds_real_output\s*\(' = 'output binding plus field/digest/canonical bound coverage'
+    '\bglobal_admission_freshly_blocks_active_unknown_corrupt_and_orphan_state\s*\(' = 'active, unknown, corrupt, and orphan unchanged fail-closed coverage'
+    '\bstartup_view_never_offers_fake_resume_and_discard_is_exact_bound\s*\(' = 'no fake resume and stale/exact discard coverage'
+}
+foreach ($pattern in $windowsResumeProductTestRequiredPatterns.Keys) {
+    if ($windowsResumeProductTests -notmatch $pattern) {
+        $failures += "Windows global resume product tests must retain $($windowsResumeProductTestRequiredPatterns[$pattern])"
+    }
+}
+
+$windowsResumeStartupRequiredPatterns = [ordered]@{
+    '\bshow_startup_resume_slot_review\s*\(' = 'startup active-slot review entry point'
+    'view\.resume_action_available\s*\|\|' = 'resume-action contract rejection'
+    '所有対象の破棄確認へ' = 'first explicit discard review'
+    '\.token\s*=\s*L"破棄"' = 'second typed discard confirmation'
+    '\bdiscard_current_windows_resume_slot\s*\(' = 'fresh exact-binding discard wrapper'
+    'user_confirmed=2stage' = 'two-stage confirmation evidence log'
+}
+foreach ($pattern in $windowsResumeStartupRequiredPatterns.Keys) {
+    if ($windowsResumeProductUi -notmatch $pattern) {
+        $failures += "Windows resume startup UI must retain $($windowsResumeStartupRequiredPatterns[$pattern])"
+    }
+}
+
+$windowsResumeGuardCount = [regex]::Matches(
+    $windowsResumeProductUi,
+    '\bguard_current_windows_operation_start\s*\(').Count
+if ($windowsResumeGuardCount -ne 7) {
+    $failures += "Windows product must retain exactly seven fresh resume-slot guards for nine current writer executors (found $windowsResumeGuardCount)"
+}
+$windowsResumeRoutePatterns = [ordered]@{
+    'rescue media' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_rescue_media_creation_with_windows_apis\s*\('
+    'raw rescue clone' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_windows_data_rescue_clone\s*\('
+    'shrink clone' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_windows_direct_shrink_clone_with_windows_apis\s*\('
+    'exact clone' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_online_direct_clone_operation_with_windows_apis\s*\('
+    'shrink restore' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_windows_online_shrink_restore_operation_with_windows_apis\s*\('
+    'exact restore' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,480}?\bexecute_online_image_restore_operation_with_windows_apis\s*\('
+    'rescue image create' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,960}?\bexecute_windows_data_rescue_image_create_with_windows_apis\s*\('
+    'shrink image create' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,1280}?\bexecute_windows_online_shrink_image_create_with_windows_apis\s*\('
+    'exact image create' = '\bguard_current_windows_operation_start\s*\([\s\S]{0,1440}?\bexecute_online_image_create_with_windows_apis\s*\('
+}
+foreach ($route in $windowsResumeRoutePatterns.Keys) {
+    $count = [regex]::Matches(
+        $windowsResumeProductUi,
+        $windowsResumeRoutePatterns[$route],
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant).Count
+    if ($count -ne 1) {
+        $failures += "Windows $route writer must retain exactly one fresh resume-slot guard immediately before execution (found $count)"
+    }
+}
+
 # Reservation-job product and compatibility implementations were removed for
 # specification v2.0. User-owned historical JSON is deliberately neither
 # searched nor converted; this audit only proves the executable source paths do
@@ -3336,6 +4161,65 @@ foreach ($token in $legacyJobProductTokens) {
         $relative = $match.Path.Substring($repoRoot.Length).TrimStart('\')
         $failures += "$relative`:$($match.LineNumber) contains removed reservation-job token $token"
     }
+}
+
+# Product WinPE CLI is deliberately read-only. Destructive operations remain
+# available only from the product GUI after its in-session review and exact OK
+# entry; a service-injection parameter or fixed command-line confirmation would
+# recreate a bypass even when the GUI itself stayed safe.
+$winPeCliRunnerPath = Join-Path $sourceRoot 'WinPEApp\src\app_runner.cpp'
+$winPeCliHeaderPath = Join-Path $sourceRoot `
+    'WinPEApp\include\ytec\winpeapp\app_runner.h'
+$winPeCliMainPath = Join-Path $sourceRoot 'WinPEApp\src\main.cpp'
+$winPeCliTestsPath = Join-Path $repoRoot `
+    'tests\Unit\winpe_direct_app_tests.cpp'
+$winPeMediaBuilderPath = Join-Path $repoRoot `
+    'scripts\New-WinPEAppValidationMedia.ps1'
+$winPeCliRunnerText = Get-Content -Raw -LiteralPath $winPeCliRunnerPath
+$winPeCliHeaderText = Get-Content -Raw -LiteralPath $winPeCliHeaderPath
+$winPeCliMainText = Get-Content -Raw -LiteralPath $winPeCliMainPath
+$winPeCliTestsText = Get-Content -Raw -LiteralPath $winPeCliTestsPath
+$winPeMediaBuilderText = Get-Content -Raw -LiteralPath $winPeMediaBuilderPath
+
+$destructiveWinPeCliTokens = @(
+    '--clone-execute'
+    '--acknowledge-target-erasure'
+    '--boot-repair-execute'
+    '--acknowledge-boot-files-change'
+)
+foreach ($token in $destructiveWinPeCliTokens) {
+    foreach ($product in @(
+            [ordered]@{ path = $winPeCliRunnerPath; text = $winPeCliRunnerText },
+            [ordered]@{ path = $winPeCliHeaderPath; text = $winPeCliHeaderText },
+            [ordered]@{ path = $winPeCliMainPath; text = $winPeCliMainText },
+            [ordered]@{ path = $winPeMediaBuilderPath; text = $winPeMediaBuilderText })) {
+        if ($product.text.Contains($token)) {
+            $relative = $product.path.Substring($repoRoot.Length).TrimStart('\')
+            $failures += "$relative contains forbidden destructive product CLI token $token"
+        }
+    }
+}
+if ($winPeCliRunnerText -notmatch
+        'arguments\.front\(\)\s*!=\s*L"--clone-preflight"' -or
+    $winPeCliRunnerText -notmatch
+        'このCLIは列挙とクローン事前確認だけを行い、ディスクへ書き込みません') {
+    $failures += 'WinPE product CLI must retain the read-only clone-preflight-only parser and disclosure'
+}
+if (($winPeCliHeaderText + $winPeCliRunnerText) -match
+        'run_winpe_app[\s\S]{0,320}ICloneExecutionService\s*\*' -or
+    $winPeCliMainText -match '\bmake_windows_clone_execution_service\s*\(') {
+    $failures += 'WinPE product CLI must not accept or construct a destructive clone execution service'
+}
+foreach ($requiredTest in @(
+        'destructive_cli_arguments_stop_before_all_io',
+        'output\.str\(\)\.find\("--clone-execute"\)',
+        'provider\.call_count\s*==\s*0U')) {
+    if ($winPeCliTestsText -notmatch $requiredTest) {
+        $failures += "WinPE read-only CLI regression coverage is missing $requiredTest"
+    }
+}
+if ($winPeMediaBuilderText -match 'StandaloneBootRepair') {
+    $failures += 'Product WinPE media builder must not retain the retired destructive CLI boot-repair scenario'
 }
 
 $excludedRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'out'))

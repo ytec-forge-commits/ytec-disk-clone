@@ -90,6 +90,8 @@ struct WindowsOnlineShrinkImageCreateDependencies final {
   WindowsShrinkImagePrepareExecutor prepare_image;
   vssrequester::TsumugiWorkflowBackendFactory backend_factory;
   WindowsShrinkDestinationValidator revalidate_destination;
+  vssrequester::WindowsVssDiffAreaOperationMonitorFactory
+      make_diff_area_monitor;
 };
 
 struct WindowsOnlineShrinkImageCreateReport final {

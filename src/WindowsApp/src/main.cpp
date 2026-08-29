@@ -11,6 +11,7 @@
 #include "ytec/uisupport/private_fonts.h"
 #include "ytec/vssrequester/windows_backend.h"
 #include "ytec/windowsapp/adk_management.h"
+#include "ytec/windowsapp/adk_product_ui.h"
 #include "ytec/windowsapp/completion_power_ui.h"
 #include "ytec/windowsapp/first_run_guidance.h"
 #include "ytec/windowsapp/layout.h"
@@ -26,10 +27,12 @@
 #include "ytec/windowsapp/online_image_restore_operation.h"
 #include "ytec/windowsapp/online_shrink_image_product.h"
 #include "ytec/windowsapp/online_shrink_image_restore.h"
+#include "ytec/windowsapp/post_migration_check.h"
 #include "ytec/windowsapp/progress.h"
 #include "ytec/windowsapp/restore_preflight.h"
 #include "ytec/windowsapp/rescue_media_inspection.h"
 #include "ytec/windowsapp/rescue_media_ui.h"
+#include "ytec/windowsapp/resume_slot_product.h"
 #include "ytec/windowsapp/selection.h"
 #include "ytec/windowsapp/startup_data_policy.h"
 #include "ytec/windowsapp/support_zip.h"
@@ -62,6 +65,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -99,6 +103,8 @@ constexpr UINT kRescueUsbInspectionCompleteMessage = WM_APP + 14U;
 constexpr UINT kSupportZipPlanCompleteMessage = WM_APP + 15U;
 constexpr UINT kSupportZipCreationCompleteMessage = WM_APP + 16U;
 constexpr UINT kAdkManagementCompleteMessage = WM_APP + 17U;
+constexpr UINT kAdkConsentPreparationCompleteMessage = WM_APP + 18U;
+constexpr UINT kPostMigrationCheckCompleteMessage = WM_APP + 19U;
 constexpr UINT_PTR kUiRefreshTimerId = 1U;
 constexpr UINT_PTR kCloneCompletionFallbackTimerId = 2U;
 
@@ -121,6 +127,9 @@ constexpr int kFirstRunGuidanceActionId = 214;
 constexpr int kImageVerificationModeComboId = 215;
 constexpr int kMediaUsbModeComboId = 216;
 constexpr int kMediaUsbFileSystemComboId = 217;
+constexpr int kClonePartitionStyleComboId = 218;
+constexpr int kClonePartitionCapacityActionId = 219;
+constexpr int kPostMigrationCheckActionId = 220;
 constexpr int kAdkOfficialDownloadInstallId = 3101;
 constexpr int kAdkOfflineLayoutInstallId = 3102;
 constexpr int kAdkCreateOfflineLayoutId = 3103;
@@ -133,6 +142,10 @@ constexpr int kCompletionPowerShutdownId = 3304;
 constexpr int kSupportZipReviewSummaryId = 3401;
 constexpr int kSupportZipReviewEntriesId = 3402;
 constexpr int kSupportZipReviewPrivacyId = 3403;
+constexpr int kClonePartitionCapacityListId = 3501;
+constexpr int kClonePartitionCapacityPolicyId = 3502;
+constexpr int kClonePartitionCapacityTargetId = 3503;
+constexpr int kClonePartitionCapacityStatusId = 3504;
 constexpr std::size_t kMaximumErrorDialogDetailCharacters = 240U;
 static_assert(
     kMaximumErrorDialogDetailCharacters <=
@@ -269,8 +282,14 @@ struct ClonePayload final {
       rescue_report;
   std::optional<ytec::clonecore::Error> error;
   std::uint32_t target_disk_number{};
-  bool rescue_mode{};
-  bool shrink_mode{};
+  ytec::windowsapp::WindowsTransferModeChoice mode{
+      ytec::windowsapp::WindowsTransferModeChoice::exact};
+  ytec::windowsapp::WindowsPartitionStyleChoice partition_style{
+      ytec::windowsapp::WindowsPartitionStyleChoice::preserve};
+  ytec::migrationcore::MigrationPartitionStyle source_partition_style{
+      ytec::migrationcore::MigrationPartitionStyle::gpt};
+  ytec::migrationcore::MigrationPartitionStyle target_partition_style{
+      ytec::migrationcore::MigrationPartitionStyle::gpt};
   std::uint64_t completion_power_operation_binding{};
   ytec::clonecore::SleepPreventionReleaseState sleep_prevention_release{
       ytec::clonecore::SleepPreventionReleaseState::unknown};
@@ -330,6 +349,11 @@ struct ManualUpdatePayload final {
   std::optional<ytec::clonecore::Error> error;
 };
 
+struct PostMigrationCheckPayload final {
+  std::optional<ytec::windowsapp::PostMigrationCheckReport> report;
+  std::optional<ytec::clonecore::Error> error;
+};
+
 struct SupportZipPlanPayload final {
   std::optional<ytec::windowsapp::SupportZipPlan> plan;
   std::optional<ytec::clonecore::Error> error;
@@ -341,7 +365,17 @@ struct SupportZipCreationPayload final {
 };
 
 struct AdkManagementPayload final {
+  ytec::windowsapp::AdkManagementAction action{
+      ytec::windowsapp::AdkManagementAction::official_download_install};
   std::optional<ytec::windowsapp::AdkManagementReport> report;
+  std::optional<ytec::clonecore::Error> error;
+};
+
+struct AdkConsentPreparationPayload final {
+  ytec::windowsapp::AdkManagementAction action{
+      ytec::windowsapp::AdkManagementAction::official_download_install};
+  std::filesystem::path selected_path;
+  std::optional<ytec::windowsapp::AdkVerifiedEulaDocument> document;
   std::optional<ytec::clonecore::Error> error;
 };
 
@@ -353,6 +387,15 @@ struct ProductLogSession final {
   std::uint64_t retention_deleted_bytes{};
 };
 
+struct ClonePartitionCapacityChoiceState final {
+  ytec::windowsapp::WindowsClonePartitionCapacityDecision decision;
+  ytec::clonecore::StableDiskIdentity expected_target;
+  ytec::imageformat::Sha256Digest expected_target_layout_hash{};
+  ytec::windowsapp::WindowsPartitionStyleChoice partition_style_choice{
+      ytec::windowsapp::WindowsPartitionStyleChoice::preserve};
+  std::string analysis_created_utc;
+};
+
 struct AppState final {
   HWND window{};
   std::array<HWND, 6> navigation{};
@@ -360,6 +403,7 @@ struct AppState final {
   HWND source_combo{};
   HWND target_combo{};
   HWND transfer_mode_combo{};
+  HWND clone_partition_style_combo{};
   HWND image_verification_mode_combo{};
   HWND restore_source_partition_combo{};
   HWND restore_target_partition_combo{};
@@ -372,7 +416,9 @@ struct AppState final {
   HWND media_browse{};
   HWND primary_action{};
   HWND pause_action{};
+  HWND clone_partition_capacity_action{};
   HWND manual_update_action{};
+  HWND post_migration_check_action{};
   HWND first_run_guidance_action{};
   HFONT body_font{};
   HFONT small_font{};
@@ -401,8 +447,20 @@ struct AppState final {
   std::thread clone_thread;
   std::shared_ptr<ytec::clonecore::ManualPauseController>
       clone_pause_controller;
-  bool active_clone_is_rescue{};
-  bool active_clone_is_shrink{};
+  ytec::windowsapp::WindowsTransferModeChoice clone_transfer_mode{
+      ytec::windowsapp::WindowsTransferModeChoice::exact};
+  ytec::windowsapp::WindowsTransferModeChoice image_transfer_mode{
+      ytec::windowsapp::WindowsTransferModeChoice::exact};
+  ytec::windowsapp::WindowsPartitionStyleChoice clone_partition_style{
+      ytec::windowsapp::WindowsPartitionStyleChoice::preserve};
+  std::optional<ytec::windowsapp::WindowsTransferModeChoice>
+      active_clone_mode;
+  std::optional<ytec::windowsapp::WindowsPartitionStyleChoice>
+      active_clone_partition_style;
+  bool transfer_mode_combo_ready{};
+  bool clone_partition_style_combo_ready{};
+  std::optional<ClonePartitionCapacityChoiceState>
+      clone_partition_capacity_choice;
   std::atomic_bool backup_running{false};
   std::atomic_bool backup_cancel_requested{false};
   std::optional<ytec::clonecore::DiskOperationProgress> backup_progress;
@@ -450,6 +508,11 @@ struct AppState final {
       manual_update_report;
   std::wstring manual_update_error;
   std::thread manual_update_thread;
+  std::atomic_bool post_migration_check_running{false};
+  std::optional<ytec::windowsapp::PostMigrationCheckReport>
+      post_migration_check_report;
+  std::wstring post_migration_check_error;
+  std::thread post_migration_check_thread;
   std::atomic_bool support_zip_planning{false};
   std::atomic_bool support_zip_creation_running{false};
   std::optional<ytec::windowsapp::SupportZipCreationReport>
@@ -901,6 +964,82 @@ std::wstring format_bytes(const std::uint64_t bytes) {
   return ytec::windowsapp::format_bytes(bytes);
 }
 
+ytec::vssrequester::VssDiffAreaReviewCallback
+make_vss_diff_area_review_callback(const HWND owner) {
+  return [owner](
+      const ytec::vssrequester::VssDiffAreaPollEvidence& evidence)
+      -> ytec::clonecore::Result<
+          ytec::vssrequester::VssDiffAreaReviewDecision> {
+    if (evidence.sequence == 0U || evidence.samples.empty()) {
+      return ytec::clonecore::Result<
+          ytec::vssrequester::VssDiffAreaReviewDecision>::failure({
+          .code = ytec::clonecore::ErrorCode::invalid_data,
+          .native_code = ERROR_INVALID_DATA,
+          .operation = L"VSS差分領域review表示",
+          .message = L"表示対象の監視証拠がありません",
+      });
+    }
+    std::wstring message =
+        L"VSS Snapshotの差分領域または保存先の空き容量が危険しきい値へ達しました。\n\n";
+    const std::size_t displayed =
+        (std::min)(evidence.samples.size(), std::size_t{4U});
+    for (std::size_t index = 0U; index < displayed; ++index) {
+      const auto& sample = evidence.samples[index];
+      message += L"Snapshot " + std::to_wstring(index + 1U) +
+          L": 使用 " + format_bytes(sample.observation.used_bytes) +
+          L" / 上限 " + format_bytes(sample.observation.maximum_bytes) +
+          L" / 残り " + format_bytes(sample.remaining_bytes) +
+          L"\n  保存先空き: 全体 " +
+          format_bytes(sample.observation.backing_volume_free_bytes) +
+          L" / この処理で利用可能 " +
+          format_bytes(sample.observation.backing_volume_available_bytes) +
+          L" / 安全判定 " +
+          format_bytes(sample.effective_backing_volume_free_bytes) + L"\n";
+      message += L"  検出理由:";
+      if (sample.used_threshold_reached) {
+        message += L" 差分領域使用率";
+      }
+      if (sample.remaining_reserve_reached) {
+        message += L" 差分領域残量";
+      }
+      if (sample.backing_volume_reserve_reached) {
+        message += L" 保存先空き容量";
+      }
+      message += L"\n";
+    }
+    if (evidence.samples.size() > displayed) {
+      message += L"ほか " +
+          std::to_wstring(evidence.samples.size() - displayed) +
+          L" Snapshot\n";
+    }
+    message +=
+        L"\n［はい］: 最新状態を再確認し、次の安全境界まで今回だけ再開"
+        L"\n［いいえ］: 安全境界で処理を中止"
+        L"\n\n自動再開は行いません。続行しますか？";
+    const int selected = MessageBoxW(
+        owner,
+        message.c_str(),
+        L"VSS差分領域の安全確認",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (selected != IDYES && selected != IDNO) {
+      return ytec::clonecore::Result<
+          ytec::vssrequester::VssDiffAreaReviewDecision>::failure({
+          .code = ytec::clonecore::ErrorCode::io_failed,
+          .native_code = GetLastError(),
+          .operation = L"VSS差分領域review表示",
+          .message = L"利用者の再開／安全中止を確認できませんでした",
+      });
+    }
+    return ytec::clonecore::Result<
+        ytec::vssrequester::VssDiffAreaReviewDecision>::success({
+        .displayed_evidence_sequence = evidence.sequence,
+        .action = selected == IDYES
+            ? ytec::vssrequester::VssDiffAreaReviewAction::resume_once
+            : ytec::vssrequester::VssDiffAreaReviewAction::safe_cancel,
+    });
+  };
+}
+
 std::wstring partition_style_text(
     const ytec::diskmodel::PartitionStyle style) {
   switch (style) {
@@ -914,6 +1053,678 @@ std::wstring partition_style_text(
       return L"不明";
   }
   return L"不明";
+}
+
+std::wstring_view migration_partition_role_text(
+    const ytec::migrationcore::MigrationPartitionRole role) noexcept {
+  switch (role) {
+    case ytec::migrationcore::MigrationPartitionRole::efi_system:
+      return L"ESP";
+    case ytec::migrationcore::MigrationPartitionRole::microsoft_reserved:
+      return L"MSR";
+    case ytec::migrationcore::MigrationPartitionRole::bios_system:
+      return L"BIOS起動";
+    case ytec::migrationcore::MigrationPartitionRole::windows:
+      return L"Windows";
+    case ytec::migrationcore::MigrationPartitionRole::recovery:
+      return L"回復";
+    case ytec::migrationcore::MigrationPartitionRole::data:
+      return L"データ";
+  }
+  return L"不明";
+}
+
+std::wstring_view migration_file_system_text(
+    const ytec::migrationcore::MigrationFileSystem file_system) noexcept {
+  switch (file_system) {
+    case ytec::migrationcore::MigrationFileSystem::none:
+      return L"なし";
+    case ytec::migrationcore::MigrationFileSystem::ntfs:
+      return L"NTFS";
+    case ytec::migrationcore::MigrationFileSystem::fat32:
+      return L"FAT32";
+    case ytec::migrationcore::MigrationFileSystem::exfat:
+      return L"exFAT";
+    case ytec::migrationcore::MigrationFileSystem::unsupported:
+      return L"未対応";
+  }
+  return L"不明";
+}
+
+struct ClonePartitionCapacityDialogState final {
+  const ytec::windowsapp::WindowsClonePartitionCapacityReview* review{};
+  ytec::windowsapp::ClonePartitionCapacityDialogLayout layout;
+  HFONT font{};
+  HWND partition_list{};
+  HWND surplus_policy{};
+  HWND surplus_target{};
+  HWND status{};
+  std::optional<
+      ytec::windowsapp::WindowsClonePartitionCapacitySubmission>
+      submission;
+};
+
+std::optional<std::uint32_t> clone_partition_list_item_source_index(
+    const HWND list,
+    const int item_index) {
+  LVITEMW item{
+      .mask = LVIF_PARAM,
+      .iItem = item_index,
+  };
+  if (ListView_GetItem(list, &item) == FALSE) {
+    return std::nullopt;
+  }
+  return ytec::windowsapp::decode_windows_clone_partition_item_data(
+      static_cast<std::uintptr_t>(item.lParam));
+}
+
+const ytec::windowsapp::WindowsClonePartitionCapacityRow*
+find_clone_partition_capacity_row(
+    const ClonePartitionCapacityDialogState& state,
+    const std::uint32_t source_table_index) {
+  if (state.review == nullptr) {
+    return nullptr;
+  }
+  const auto found = std::find_if(
+      state.review->rows().begin(),
+      state.review->rows().end(),
+      [source_table_index](
+          const ytec::windowsapp::WindowsClonePartitionCapacityRow& row) {
+        return row.partition.source_table_index == source_table_index;
+      });
+  return found == state.review->rows().end() ? nullptr : &*found;
+}
+
+std::optional<ytec::migrationcore::ShrinkSurplusAllocation>
+selected_clone_surplus_policy(
+    const ClonePartitionCapacityDialogState& state) {
+  const LRESULT selection = SendMessageW(
+      state.surplus_policy, CB_GETCURSEL, 0, 0);
+  if (selection == CB_ERR) {
+    return std::nullopt;
+  }
+  const LRESULT item_data = SendMessageW(
+      state.surplus_policy,
+      CB_GETITEMDATA,
+      static_cast<WPARAM>(selection),
+      0);
+  if (item_data == CB_ERR) {
+    return std::nullopt;
+  }
+  return ytec::windowsapp::decode_windows_clone_surplus_policy_item_data(
+      static_cast<std::uintptr_t>(item_data));
+}
+
+void set_clone_partition_capacity_status(
+    ClonePartitionCapacityDialogState& state,
+    const std::wstring_view message) {
+  if (state.status != nullptr) {
+    SetWindowTextW(state.status, std::wstring(message).c_str());
+  }
+}
+
+bool rebuild_clone_surplus_target_combo(
+    ClonePartitionCapacityDialogState& state) {
+  if (state.partition_list == nullptr || state.surplus_target == nullptr) {
+    return false;
+  }
+  std::optional<std::uint32_t> previous;
+  const LRESULT old_selection = SendMessageW(
+      state.surplus_target, CB_GETCURSEL, 0, 0);
+  if (old_selection != CB_ERR) {
+    const LRESULT old_data = SendMessageW(
+        state.surplus_target,
+        CB_GETITEMDATA,
+        static_cast<WPARAM>(old_selection),
+        0);
+    if (old_data != CB_ERR) {
+      previous = ytec::windowsapp::
+          decode_windows_clone_partition_item_data(
+              static_cast<std::uintptr_t>(old_data));
+    }
+  }
+  if (SendMessageW(state.surplus_target, CB_RESETCONTENT, 0, 0) == CB_ERR) {
+    return false;
+  }
+  LRESULT selected_item = CB_ERR;
+  const int item_count = ListView_GetItemCount(state.partition_list);
+  for (int item_index = 0; item_index < item_count; ++item_index) {
+    const auto source_table_index = clone_partition_list_item_source_index(
+        state.partition_list, item_index);
+    const auto* row = source_table_index.has_value()
+        ? find_clone_partition_capacity_row(state, *source_table_index)
+        : nullptr;
+    if (row == nullptr || !row->eligible_surplus_target ||
+        ListView_GetCheckState(state.partition_list, item_index) == FALSE) {
+      continue;
+    }
+    std::wstring label =
+        L"#" + std::to_wstring(*source_table_index) + L"  ";
+    label += row->partition.label.empty()
+        ? L"データ領域"
+        : row->partition.label;
+    label += L"  (" + format_bytes(row->partition.source_size_bytes) + L")";
+    const LRESULT combo_index = SendMessageW(
+        state.surplus_target,
+        CB_ADDSTRING,
+        0,
+        reinterpret_cast<LPARAM>(label.c_str()));
+    const auto encoded = ytec::windowsapp::
+        encode_windows_clone_partition_item_data(*source_table_index);
+    if (combo_index == CB_ERR || combo_index == CB_ERRSPACE ||
+        !encoded.has_value() ||
+        SendMessageW(
+            state.surplus_target,
+            CB_SETITEMDATA,
+            static_cast<WPARAM>(combo_index),
+            static_cast<LPARAM>(*encoded)) == CB_ERR) {
+      return false;
+    }
+    if (selected_item == CB_ERR || previous == source_table_index) {
+      selected_item = combo_index;
+    }
+  }
+  if (selected_item != CB_ERR) {
+    static_cast<void>(SendMessageW(
+        state.surplus_target,
+        CB_SETCURSEL,
+        static_cast<WPARAM>(selected_item),
+        0));
+  }
+  const bool selected_data = selected_clone_surplus_policy(state) ==
+      ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition;
+  EnableWindow(state.surplus_target, selected_data ? TRUE : FALSE);
+  if (selected_data && selected_item == CB_ERR) {
+    set_clone_partition_capacity_status(
+        state,
+        L"指定配分には、選択済みのNTFSデータ領域が必要です。");
+  } else {
+    set_clone_partition_capacity_status(
+        state,
+        L"必須領域は解除できません。設定確定時と計画直前に再解析します。");
+  }
+  return true;
+}
+
+bool collect_clone_partition_capacity_submission(
+    ClonePartitionCapacityDialogState& state) {
+  ytec::windowsapp::WindowsClonePartitionCapacitySubmission submission;
+  const int item_count = ListView_GetItemCount(state.partition_list);
+  for (int item_index = 0; item_index < item_count; ++item_index) {
+    const auto source_table_index = clone_partition_list_item_source_index(
+        state.partition_list, item_index);
+    if (!source_table_index.has_value()) {
+      return false;
+    }
+    if (ListView_GetCheckState(state.partition_list, item_index) != FALSE) {
+      const auto encoded = ytec::windowsapp::
+          encode_windows_clone_partition_item_data(*source_table_index);
+      if (!encoded.has_value()) {
+        return false;
+      }
+      submission.selected_partition_item_data.push_back(*encoded);
+    }
+  }
+  const LRESULT policy_selection = SendMessageW(
+      state.surplus_policy, CB_GETCURSEL, 0, 0);
+  if (policy_selection == CB_ERR) {
+    return false;
+  }
+  const LRESULT policy_data = SendMessageW(
+      state.surplus_policy,
+      CB_GETITEMDATA,
+      static_cast<WPARAM>(policy_selection),
+      0);
+  if (policy_data == CB_ERR) {
+    return false;
+  }
+  submission.surplus_policy_item_data =
+      static_cast<std::uintptr_t>(policy_data);
+  const auto policy =
+      ytec::windowsapp::decode_windows_clone_surplus_policy_item_data(
+          submission.surplus_policy_item_data);
+  if (!policy.has_value()) {
+    return false;
+  }
+  if (*policy ==
+      ytec::migrationcore::ShrinkSurplusAllocation::
+          selected_data_partition) {
+    const LRESULT target_selection = SendMessageW(
+        state.surplus_target, CB_GETCURSEL, 0, 0);
+    if (target_selection == CB_ERR) {
+      set_clone_partition_capacity_status(
+          state,
+          L"指定配分先のNTFSデータ領域を選択してください。");
+      return false;
+    }
+    const LRESULT target_data = SendMessageW(
+        state.surplus_target,
+        CB_GETITEMDATA,
+        static_cast<WPARAM>(target_selection),
+        0);
+    if (target_data == CB_ERR) {
+      return false;
+    }
+    submission.surplus_target_partition_item_data =
+        static_cast<std::uintptr_t>(target_data);
+  }
+  state.submission = std::move(submission);
+  return true;
+}
+
+INT_PTR CALLBACK clone_partition_capacity_dialog_proc(
+    const HWND dialog,
+    const UINT message,
+    const WPARAM wparam,
+    const LPARAM lparam) {
+  auto* state = reinterpret_cast<ClonePartitionCapacityDialogState*>(
+      GetWindowLongPtrW(dialog, DWLP_USER));
+  switch (message) {
+    case WM_INITDIALOG: {
+      state = reinterpret_cast<ClonePartitionCapacityDialogState*>(lparam);
+      if (state == nullptr || state->review == nullptr) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      SetWindowLongPtrW(
+          dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+      RECT window_bounds{
+          0, 0, state->layout.client_width, state->layout.client_height};
+      static_cast<void>(AdjustWindowRectEx(
+          &window_bounds,
+          static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_STYLE)),
+          FALSE,
+          static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_EXSTYLE))));
+      MONITORINFO monitor_info{.cbSize = sizeof(MONITORINFO)};
+      const HWND owner = GetWindow(dialog, GW_OWNER);
+      const HMONITOR monitor = MonitorFromWindow(
+          owner != nullptr ? owner : dialog,
+          MONITOR_DEFAULTTONEAREST);
+      RECT work_area{
+          0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+      if (monitor != nullptr &&
+          GetMonitorInfoW(monitor, &monitor_info) != FALSE) {
+        work_area = monitor_info.rcWork;
+      }
+      const int dialog_width = window_bounds.right - window_bounds.left;
+      const int dialog_height = window_bounds.bottom - window_bounds.top;
+      SetWindowPos(
+          dialog,
+          nullptr,
+          work_area.left +
+              ((work_area.right - work_area.left) - dialog_width) / 2,
+          work_area.top +
+              ((work_area.bottom - work_area.top) - dialog_height) / 2,
+          dialog_width,
+          dialog_height,
+          SWP_NOZORDER | SWP_NOACTIVATE);
+
+      const auto make_control =
+          [dialog, state](
+              const wchar_t* class_name,
+              const wchar_t* text,
+              const DWORD style,
+              const DWORD extended_style,
+              const int identifier,
+              const ytec::windowsapp::DialogBounds& bounds) {
+            const HWND control = CreateWindowExW(
+                extended_style,
+                class_name,
+                text,
+                WS_CHILD | WS_VISIBLE | style,
+                bounds.left,
+                bounds.top,
+                bounds.width(),
+                bounds.height(),
+                dialog,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(identifier)),
+                GetModuleHandleW(nullptr),
+                nullptr);
+            if (control != nullptr && state->font != nullptr) {
+              SendMessageW(
+                  control,
+                  WM_SETFONT,
+                  reinterpret_cast<WPARAM>(state->font),
+                  TRUE);
+            }
+            return control;
+          };
+      const HWND guidance = make_control(
+          L"STATIC",
+          L"コピーする領域と、コピー先に残る余剰容量の使い方を確認してください。Windows起動に必要な領域と解析で必要と判定した回復領域は解除できません。",
+          SS_LEFT,
+          0,
+          -1,
+          state->layout.guidance);
+      state->partition_list = make_control(
+          WC_LISTVIEWW,
+          L"",
+          LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_VSCROLL |
+              WS_TABSTOP,
+          WS_EX_CLIENTEDGE,
+          kClonePartitionCapacityListId,
+          state->layout.partition_list);
+      const HWND policy_label = make_control(
+          L"STATIC",
+          L"余剰容量の使い方",
+          SS_LEFT | SS_CENTERIMAGE,
+          0,
+          -1,
+          state->layout.surplus_label);
+      state->surplus_policy = make_control(
+          L"COMBOBOX",
+          L"",
+          CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+          0,
+          kClonePartitionCapacityPolicyId,
+          state->layout.surplus_policy);
+      const HWND target_label = make_control(
+          L"STATIC",
+          L"指定するNTFS領域",
+          SS_LEFT | SS_CENTERIMAGE,
+          0,
+          -1,
+          state->layout.surplus_target_label);
+      state->surplus_target = make_control(
+          L"COMBOBOX",
+          L"",
+          CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+          0,
+          kClonePartitionCapacityTargetId,
+          state->layout.surplus_target);
+      state->status = make_control(
+          L"STATIC",
+          L"",
+          SS_LEFT,
+          0,
+          kClonePartitionCapacityStatusId,
+          state->layout.status);
+      const HWND accept = make_control(
+          L"BUTTON",
+          L"この設定で確定",
+          BS_DEFPUSHBUTTON | WS_TABSTOP,
+          0,
+          IDOK,
+          state->layout.accept_button);
+      const HWND cancel = make_control(
+          L"BUTTON",
+          L"キャンセル",
+          BS_PUSHBUTTON | WS_TABSTOP,
+          0,
+          IDCANCEL,
+          state->layout.cancel_button);
+      if (guidance == nullptr || state->partition_list == nullptr ||
+          policy_label == nullptr || state->surplus_policy == nullptr ||
+          target_label == nullptr || state->surplus_target == nullptr ||
+          state->status == nullptr || accept == nullptr || cancel == nullptr) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      ListView_SetExtendedListViewStyleEx(
+          state->partition_list,
+          LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES,
+          LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+      const int list_width = state->layout.partition_list.width();
+      struct Column final {
+        wchar_t* title;
+        int width;
+      };
+      wchar_t number_title[] = L"番号";
+      wchar_t role_title[] = L"役割";
+      wchar_t file_system_title[] = L"形式";
+      wchar_t label_title[] = L"ラベル";
+      wchar_t size_title[] = L"元の容量";
+      wchar_t status_title[] = L"選択";
+      const int fixed_width = 58 + 112 + 92 + 124 + 154;
+      std::array<Column, 6U> columns{
+          Column{number_title, 58},
+          Column{role_title, 112},
+          Column{file_system_title, 92},
+          Column{label_title, (std::max)(100, list_width - fixed_width)},
+          Column{size_title, 124},
+          Column{status_title, 154},
+      };
+      for (std::size_t column_index = 0U;
+           column_index < columns.size(); ++column_index) {
+        LVCOLUMNW column{
+            .mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT,
+            .fmt = column_index == 4U ? LVCFMT_RIGHT : LVCFMT_LEFT,
+            .cx = columns[column_index].width,
+            .pszText = columns[column_index].title,
+        };
+        if (ListView_InsertColumn(
+                state->partition_list,
+                static_cast<int>(column_index),
+                &column) == -1) {
+          EndDialog(dialog, IDCANCEL);
+          return TRUE;
+        }
+      }
+      int item_index = 0;
+      for (const auto& row : state->review->rows()) {
+        std::wstring number =
+            L"#" + std::to_wstring(row.partition.source_table_index);
+        LVITEMW item{
+            .mask = LVIF_TEXT | LVIF_PARAM,
+            .iItem = item_index,
+            .pszText = number.data(),
+            .lParam = static_cast<LPARAM>(
+                row.partition.source_table_index),
+        };
+        const int inserted = ListView_InsertItem(
+            state->partition_list, &item);
+        if (inserted < 0) {
+          EndDialog(dialog, IDCANCEL);
+          return TRUE;
+        }
+        const auto set_subitem =
+            [state, inserted](const int subitem, const std::wstring& text) {
+              LVITEMW subitem_value{
+                  .mask = LVIF_TEXT,
+                  .iItem = inserted,
+                  .iSubItem = subitem,
+                  .pszText = const_cast<wchar_t*>(text.c_str()),
+              };
+              return ListView_SetItem(
+                         state->partition_list, &subitem_value) != FALSE;
+            };
+        const std::wstring role{migration_partition_role_text(
+            row.partition.role)};
+        const std::wstring file_system{migration_file_system_text(
+            row.partition.file_system)};
+        const std::wstring label = row.partition.label.empty()
+            ? L"（なし）"
+            : row.partition.label;
+        const std::wstring size = format_bytes(
+            row.partition.source_size_bytes);
+        const std::wstring selection = row.required
+            ? L"必須・解除不可"
+            : L"任意";
+        if (!set_subitem(1, role) || !set_subitem(2, file_system) ||
+            !set_subitem(3, label) || !set_subitem(4, size) ||
+            !set_subitem(5, selection)) {
+          EndDialog(dialog, IDCANCEL);
+          return TRUE;
+        }
+        ListView_SetCheckState(
+            state->partition_list,
+            inserted,
+            row.selected_by_default ? TRUE : FALSE);
+        ++item_index;
+      }
+      LRESULT default_policy = CB_ERR;
+      for (const auto& option :
+           ytec::windowsapp::windows_clone_surplus_policy_options()) {
+        const LRESULT index = SendMessageW(
+            state->surplus_policy,
+            CB_ADDSTRING,
+            0,
+            reinterpret_cast<LPARAM>(option.label.data()));
+        if (index == CB_ERR || index == CB_ERRSPACE ||
+            SendMessageW(
+                state->surplus_policy,
+                CB_SETITEMDATA,
+                static_cast<WPARAM>(index),
+                static_cast<LPARAM>(option.item_data)) == CB_ERR) {
+          EndDialog(dialog, IDCANCEL);
+          return TRUE;
+        }
+        if (option.allocation == state->review->default_surplus_allocation()) {
+          default_policy = index;
+        }
+      }
+      if (default_policy == CB_ERR ||
+          SendMessageW(
+              state->surplus_policy,
+              CB_SETCURSEL,
+              static_cast<WPARAM>(default_policy),
+              0) == CB_ERR ||
+          !rebuild_clone_surplus_target_combo(*state)) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      SetFocus(state->partition_list);
+      return FALSE;
+    }
+    case WM_NOTIFY:
+      if (state != nullptr && state->review != nullptr &&
+          reinterpret_cast<const NMHDR*>(lparam)->idFrom ==
+              kClonePartitionCapacityListId) {
+        const auto* header = reinterpret_cast<const NMHDR*>(lparam);
+        if (header->code == LVN_ITEMCHANGING) {
+          const auto* change = reinterpret_cast<const NMLISTVIEW*>(lparam);
+          if ((change->uChanged & LVIF_STATE) != 0U) {
+            const UINT old_check =
+                (change->uOldState & LVIS_STATEIMAGEMASK) >> 12U;
+            const UINT new_check =
+                (change->uNewState & LVIS_STATEIMAGEMASK) >> 12U;
+            const auto source_table_index =
+                clone_partition_list_item_source_index(
+                    state->partition_list, change->iItem);
+            const auto* row = source_table_index.has_value()
+                ? find_clone_partition_capacity_row(
+                      *state, *source_table_index)
+                : nullptr;
+            if (row != nullptr && row->required && old_check == 2U &&
+                new_check == 1U) {
+              MessageBeep(MB_ICONWARNING);
+              set_clone_partition_capacity_status(
+                  *state,
+                  L"Windows・起動・解析必須の回復領域は解除できません。");
+              SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+              return TRUE;
+            }
+          }
+        } else if (header->code == LVN_KEYDOWN) {
+          const auto* key = reinterpret_cast<const NMLVKEYDOWN*>(lparam);
+          if (key->wVKey == VK_SPACE) {
+            const int focused = ListView_GetNextItem(
+                state->partition_list, -1, LVNI_FOCUSED);
+            const auto source_table_index = focused >= 0
+                ? clone_partition_list_item_source_index(
+                      state->partition_list, focused)
+                : std::nullopt;
+            const auto* row = source_table_index.has_value()
+                ? find_clone_partition_capacity_row(
+                      *state, *source_table_index)
+                : nullptr;
+            if (row != nullptr && row->required &&
+                ListView_GetCheckState(
+                    state->partition_list, focused) != FALSE) {
+              MessageBeep(MB_ICONWARNING);
+              set_clone_partition_capacity_status(
+                  *state,
+                  L"Spaceキーでも必須領域の選択は解除できません。");
+              SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+              return TRUE;
+            }
+          }
+        } else if (header->code == LVN_ITEMCHANGED) {
+          static_cast<void>(rebuild_clone_surplus_target_combo(*state));
+        }
+      }
+      break;
+    case WM_COMMAND:
+      if (state != nullptr &&
+          LOWORD(wparam) == kClonePartitionCapacityPolicyId &&
+          HIWORD(wparam) == CBN_SELCHANGE) {
+        static_cast<void>(rebuild_clone_surplus_target_combo(*state));
+        return TRUE;
+      }
+      if (LOWORD(wparam) == IDOK && state != nullptr) {
+        if (collect_clone_partition_capacity_submission(*state)) {
+          EndDialog(dialog, IDOK);
+        } else {
+          MessageBeep(MB_ICONWARNING);
+        }
+        return TRUE;
+      }
+      if (LOWORD(wparam) == IDCANCEL) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      break;
+    case WM_CLOSE:
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    default:
+      break;
+  }
+  return FALSE;
+}
+
+std::optional<ytec::windowsapp::WindowsClonePartitionCapacitySubmission>
+show_clone_partition_capacity_review_dialog(
+    const HWND owner,
+    const HFONT font,
+    const ytec::windowsapp::WindowsClonePartitionCapacityReview& review) {
+  RECT work_area{0, 0, 1024, 600};
+  MONITORINFO monitor_info{.cbSize = sizeof(MONITORINFO)};
+  const HMONITOR monitor = MonitorFromWindow(
+      owner, MONITOR_DEFAULTTONEAREST);
+  if (monitor != nullptr && GetMonitorInfoW(monitor, &monitor_info) != FALSE) {
+    work_area = monitor_info.rcWork;
+  }
+  const unsigned int dpi = GetDpiForWindow(owner);
+  ClonePartitionCapacityDialogState state{
+      .review = &review,
+      .layout = ytec::windowsapp::
+          calculate_clone_partition_capacity_dialog_layout(
+              work_area.right - work_area.left,
+              work_area.bottom - work_area.top,
+              dpi == 0U ? 96U : dpi),
+      .font = font,
+  };
+  alignas(DWORD) std::array<std::byte, 512U> dialog_storage{};
+  auto* dialog_template = reinterpret_cast<DLGTEMPLATE*>(
+      dialog_storage.data());
+  dialog_template->style =
+      WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+  dialog_template->dwExtendedStyle = 0;
+  dialog_template->cdit = 0;
+  dialog_template->x = 0;
+  dialog_template->y = 0;
+  dialog_template->cx = 320;
+  dialog_template->cy = 240;
+  WORD* template_words = reinterpret_cast<WORD*>(dialog_template + 1);
+  *template_words++ = 0;
+  *template_words++ = 0;
+  constexpr std::wstring_view kDialogTitle{L"パーティション・容量設定"};
+  for (const wchar_t value : kDialogTitle) {
+    *template_words++ = static_cast<WORD>(value);
+  }
+  *template_words = 0;
+  const INT_PTR result = DialogBoxIndirectParamW(
+      GetModuleHandleW(nullptr),
+      dialog_template,
+      owner,
+      clone_partition_capacity_dialog_proc,
+      reinterpret_cast<LPARAM>(&state));
+  if (result != IDOK || !state.submission.has_value()) {
+    return std::nullopt;
+  }
+  return std::move(state.submission);
 }
 
 std::wstring disk_label(const ytec::diskmodel::DiskInfo& disk) {
@@ -2277,6 +3088,135 @@ INT_PTR CALLBACK confirmation_dialog_proc(
   return FALSE;
 }
 
+void show_startup_resume_slot_review(AppState& state) {
+#if defined(YTEC_UI_ACCEPTANCE_BUILD)
+  // The host-side acceptance binary is intentionally disk-I/O-free.  Product
+  // startup coverage lives in the synthetic resume-slot product tests.
+  static_cast<void>(state);
+#else
+  auto inspected =
+      ytec::windowsapp::inspect_current_windows_resume_slot();
+  if (!inspected) {
+    log_error_summary(
+        state.logger,
+        L"起動時SingleResumeSlot読取り専用監査失敗",
+        inspected.error());
+    show_product_error(
+        state.window,
+        L"前回の中断状態を安全に確認できません",
+        inspected.error(),
+        L"unknown／corrupt／orphan／identity mismatchの可能性があるため、何も変更せず新規書込みも開始しません。");
+    return;
+  }
+  const auto& view = inspected.value();
+  if (!view.active) {
+    if (state.logger.has_value()) {
+      state.logger->info(
+          L"起動時SingleResumeSlot監査 active=false mutation=false");
+    }
+    return;
+  }
+  if (view.resume_action_available || !view.binding.has_value()) {
+    const ytec::clonecore::Error contract_error{
+        .code = ytec::clonecore::ErrorCode::invalid_data,
+        .native_code = ERROR_INVALID_DATA,
+        .operation = L"Windows起動時SingleResumeSlot UI契約",
+        .message = L"未接続resume actionまたはexact binding欠落を検出しました",
+    };
+    log_error_summary(state.logger, L"SingleResumeSlot UI契約違反", contract_error);
+    show_product_error(
+        state.window,
+        L"前回の中断状態を表示できません",
+        contract_error);
+    return;
+  }
+
+  const std::wstring content =
+      view.details + L"\n\n" + view.owned_discard_summary;
+  constexpr int kReviewDiscardButton = 4101;
+  const TASKDIALOG_BUTTON buttons[]{
+      {kReviewDiscardButton, L"所有対象の破棄確認へ"},
+      {IDCANCEL, L"そのまま残す"},
+  };
+  TASKDIALOGCONFIG dialog{
+      .cbSize = sizeof(TASKDIALOGCONFIG),
+      .hwndParent = state.window,
+      .hInstance = GetModuleHandleW(nullptr),
+      .dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+          TDF_POSITION_RELATIVE_TO_WINDOW | TDF_SIZE_TO_CONTENT,
+      .dwCommonButtons = 0U,
+      .pszWindowTitle = kWindowTitle,
+      .pszMainIcon = TD_WARNING_ICON,
+      .pszMainInstruction = view.title.c_str(),
+      .pszContent = content.c_str(),
+      .cButtons = static_cast<UINT>(std::size(buttons)),
+      .pButtons = buttons,
+      .nDefaultButton = IDCANCEL,
+  };
+  int pressed = IDCANCEL;
+  const HRESULT shown = TaskDialogIndirect(
+      &dialog, &pressed, nullptr, nullptr);
+  if (FAILED(shown) || pressed != kReviewDiscardButton) {
+    if (FAILED(shown)) {
+      const ytec::clonecore::Error display_error{
+          .code = ytec::clonecore::ErrorCode::io_failed,
+          .native_code = static_cast<DWORD>(shown),
+          .operation = L"起動時SingleResumeSlot review表示",
+          .message = L"中断処理の選択画面を表示できないためslotを変更しません",
+      };
+      log_error_summary(
+          state.logger, L"SingleResumeSlot review表示失敗", display_error);
+      show_product_error(
+          state.window,
+          L"前回の中断状態は変更していません",
+          display_error);
+    }
+    return;
+  }
+
+  ConfirmationDialogState confirmation{
+      .details = view.owned_discard_summary +
+          L"\r\n\r\n再開可能なWindows backendはないため、破棄後はこの中断処理を再開できません。",
+      .token = L"破棄",
+      .confirm_button_label = L"完全拘束した所有対象だけを破棄",
+      .font = state.body_font,
+  };
+  if (DialogBoxParamW(
+          GetModuleHandleW(nullptr),
+          MAKEINTRESOURCEW(IDD_CLONE_CONFIRMATION),
+          state.window,
+          confirmation_dialog_proc,
+          reinterpret_cast<LPARAM>(&confirmation)) != IDOK) {
+    return;
+  }
+
+  const auto discarded =
+      ytec::windowsapp::discard_current_windows_resume_slot(
+          view.binding.value());
+  if (!discarded) {
+    log_error_summary(
+        state.logger,
+        L"SingleResumeSlot exact-bound owned discard失敗",
+        discarded.error());
+    show_product_error(
+        state.window,
+        L"中断処理は破棄していません",
+        discarded.error(),
+        L"review後の差替え、identity mismatch、unknown状態ではcheckpointも所有物も変更しません。");
+    return;
+  }
+  if (state.logger.has_value()) {
+    state.logger->warning(
+        L"SingleResumeSlot exact-bound owned discard完了 user_confirmed=2stage");
+  }
+  MessageBoxW(
+      state.window,
+      L"完全bindingを再確認したcheckpointと、そこに列挙されたアプリ所有物だけを破棄しました。\n利用者ファイルや他の履歴は削除していません。",
+      L"前回の中断処理を破棄しました",
+      MB_OK | MB_ICONINFORMATION);
+#endif
+}
+
 bool read_ascii_password_control(
     const HWND dialog,
     const int identifier,
@@ -2652,6 +3592,13 @@ void layout_controls(AppState& state) {
       160,
       TRUE);
   MoveWindow(
+      state.clone_partition_style_combo,
+      image_option_layout.verification_control.left,
+      76,
+      image_option_layout.verification_control.width(),
+      160,
+      TRUE);
+  MoveWindow(
       state.image_verification_mode_combo,
       image_option_layout.verification_control.left,
       76,
@@ -2686,29 +3633,45 @@ void layout_controls(AppState& state) {
       bottom_action_layout.secondary_action.width(),
       42,
       TRUE);
-  const auto diagnostics_buttons = ytec::windowsapp::
-      calculate_first_run_guidance_diagnostic_button_layout(
-          bottom_action_layout.secondary_action.left,
-          bottom_action_layout.secondary_action.right);
+  MoveWindow(
+      state.clone_partition_capacity_action,
+      bottom_action_layout.secondary_action.left,
+      client.bottom - 72,
+      bottom_action_layout.secondary_action.width(),
+      42,
+      TRUE);
+  const auto diagnostics_layout =
+      ytec::windowsapp::calculate_diagnostics_action_layout(client.right);
   MoveWindow(
       state.manual_update_action,
-      diagnostics_buttons.update_left,
+      diagnostics_layout.update_action.left,
       client.bottom - 72,
-      diagnostics_buttons.update_width,
+      diagnostics_layout.update_action.width(),
+      42,
+      TRUE);
+  MoveWindow(
+      state.post_migration_check_action,
+      diagnostics_layout.post_migration_action.left,
+      client.bottom - 72,
+      diagnostics_layout.post_migration_action.width(),
       42,
       TRUE);
   MoveWindow(
       state.first_run_guidance_action,
-      diagnostics_buttons.guidance_left,
+      diagnostics_layout.guidance_action.left,
       client.bottom - 72,
-      diagnostics_buttons.guidance_width,
+      diagnostics_layout.guidance_action.width(),
       42,
       TRUE);
   MoveWindow(
       state.primary_action,
-      bottom_action_layout.primary_action.left,
+      state.page == Page::diagnostics
+          ? diagnostics_layout.support_action.left
+          : bottom_action_layout.primary_action.left,
       client.bottom - 72,
-      bottom_action_layout.primary_action.width(),
+      state.page == Page::diagnostics
+          ? diagnostics_layout.support_action.width()
+          : bottom_action_layout.primary_action.width(),
       42,
       TRUE);
 }
@@ -2750,12 +3713,291 @@ ytec::windowsapp::RescueMediaKind selected_media_kind(
              : ytec::windowsapp::RescueMediaKind::iso_file;
 }
 
-ytec::imageformat::TransferMode selected_transfer_mode(
+std::optional<ytec::windowsapp::WindowsTransferModeContext>
+transfer_mode_context(const Page page) noexcept {
+  switch (page) {
+    case Page::clone:
+      return ytec::windowsapp::WindowsTransferModeContext::clone;
+    case Page::create_image:
+      return ytec::windowsapp::WindowsTransferModeContext::create_image;
+    default:
+      return std::nullopt;
+  }
+}
+
+ytec::windowsapp::WindowsTransferModeChoice remembered_transfer_mode(
+    const AppState& state,
+    const ytec::windowsapp::WindowsTransferModeContext context) noexcept {
+  return context == ytec::windowsapp::WindowsTransferModeContext::clone
+      ? state.clone_transfer_mode
+      : state.image_transfer_mode;
+}
+
+void remember_transfer_mode(
+    AppState& state,
+    const ytec::windowsapp::WindowsTransferModeContext context,
+    const ytec::windowsapp::WindowsTransferModeChoice choice) noexcept {
+  if (context == ytec::windowsapp::WindowsTransferModeContext::clone) {
+    state.clone_transfer_mode = choice;
+  } else {
+    state.image_transfer_mode = choice;
+  }
+}
+
+std::optional<ytec::windowsapp::WindowsTransferModeChoice>
+selected_windows_transfer_mode(const AppState& state) {
+  const auto context = transfer_mode_context(state.page);
+  if (!context.has_value() || !state.transfer_mode_combo_ready) {
+    return std::nullopt;
+  }
+  const LRESULT selection = SendMessageW(
+      state.transfer_mode_combo, CB_GETCURSEL, 0, 0);
+  if (selection == CB_ERR) {
+    return std::nullopt;
+  }
+  const LRESULT item_data = SendMessageW(
+      state.transfer_mode_combo,
+      CB_GETITEMDATA,
+      static_cast<WPARAM>(selection),
+      0);
+  if (item_data == CB_ERR) {
+    return std::nullopt;
+  }
+  const auto choice =
+      ytec::windowsapp::decode_windows_transfer_mode_item_data(
+          static_cast<std::uintptr_t>(item_data));
+  if (!choice.has_value() ||
+      !ytec::windowsapp::windows_transfer_mode_allowed(
+          context.value(), choice.value())) {
+    return std::nullopt;
+  }
+  return choice;
+}
+
+bool populate_transfer_mode_combo_for_page(AppState& state) {
+  state.transfer_mode_combo_ready = false;
+  const auto context = transfer_mode_context(state.page);
+  if (!context.has_value() || state.transfer_mode_combo == nullptr) {
+    return false;
+  }
+  if (SendMessageW(
+          state.transfer_mode_combo, CB_RESETCONTENT, 0, 0) == CB_ERR) {
+    return false;
+  }
+
+  auto desired = remembered_transfer_mode(state, context.value());
+  if (!ytec::windowsapp::windows_transfer_mode_allowed(
+          context.value(), desired)) {
+    desired = ytec::windowsapp::WindowsTransferModeChoice::exact;
+    remember_transfer_mode(state, context.value(), desired);
+  }
+  LRESULT desired_selection = CB_ERR;
+  for (const auto& option :
+       ytec::windowsapp::windows_transfer_mode_options(context.value())) {
+    const LRESULT index = SendMessageW(
+        state.transfer_mode_combo,
+        CB_ADDSTRING,
+        0,
+        reinterpret_cast<LPARAM>(option.label.data()));
+    if (index == CB_ERR || index == CB_ERRSPACE ||
+        SendMessageW(
+            state.transfer_mode_combo,
+            CB_SETITEMDATA,
+            static_cast<WPARAM>(index),
+            static_cast<LPARAM>(
+                ytec::windowsapp::windows_transfer_mode_item_data(
+                    option.choice))) == CB_ERR) {
+      static_cast<void>(SendMessageW(
+          state.transfer_mode_combo, CB_RESETCONTENT, 0, 0));
+      return false;
+    }
+    if (option.choice == desired) {
+      desired_selection = index;
+    }
+  }
+  if (desired_selection == CB_ERR ||
+      SendMessageW(
+          state.transfer_mode_combo,
+          CB_SETCURSEL,
+          static_cast<WPARAM>(desired_selection),
+          0) == CB_ERR) {
+    static_cast<void>(SendMessageW(
+        state.transfer_mode_combo, CB_RESETCONTENT, 0, 0));
+    return false;
+  }
+  state.transfer_mode_combo_ready = true;
+  return true;
+}
+
+const ytec::diskmodel::DiskInfo* selected_clone_source_disk(
     const AppState& state) {
-  return SendMessageW(
-             state.transfer_mode_combo, CB_GETCURSEL, 0, 0) == 1
-             ? ytec::imageformat::TransferMode::shrink
-             : ytec::imageformat::TransferMode::exact;
+  const auto source_index = combo_selection(state.source_combo);
+  if (!state.inventory.has_value() || !source_index.has_value() ||
+      source_index.value() >= state.inventory->disks.size()) {
+    return nullptr;
+  }
+  return &state.inventory->disks[source_index.value()];
+}
+
+bool partition_style_choice_allowed_for_state(
+    const AppState& state,
+    const ytec::windowsapp::WindowsPartitionStyleChoice choice) {
+  const auto transfer_mode = selected_windows_transfer_mode(state);
+  if (state.page != Page::clone || !transfer_mode.has_value()) {
+    return false;
+  }
+  const auto* source = selected_clone_source_disk(state);
+  return ytec::windowsapp::windows_partition_style_choice_allowed(
+      transfer_mode.value(),
+      source == nullptr ? ytec::diskmodel::PartitionStyle::unknown
+                        : source->partition_style,
+      source != nullptr && source->is_system_disk,
+      choice);
+}
+
+bool select_clone_partition_style_item(
+    AppState& state,
+    const ytec::windowsapp::WindowsPartitionStyleChoice choice) {
+  const LRESULT count = SendMessageW(
+      state.clone_partition_style_combo, CB_GETCOUNT, 0, 0);
+  if (count == CB_ERR || count <= 0) {
+    return false;
+  }
+  for (LRESULT index = 0; index < count; ++index) {
+    const LRESULT item_data = SendMessageW(
+        state.clone_partition_style_combo,
+        CB_GETITEMDATA,
+        static_cast<WPARAM>(index),
+        0);
+    if (item_data == CB_ERR) {
+      return false;
+    }
+    const auto decoded =
+        ytec::windowsapp::decode_windows_partition_style_item_data(
+            static_cast<std::uintptr_t>(item_data));
+    if (decoded.has_value() && decoded.value() == choice) {
+      return SendMessageW(
+                 state.clone_partition_style_combo,
+                 CB_SETCURSEL,
+                 static_cast<WPARAM>(index),
+                 0) != CB_ERR;
+    }
+  }
+  return false;
+}
+
+bool synchronize_clone_partition_style_choice(AppState& state) {
+  if (!state.clone_partition_style_combo_ready) {
+    return false;
+  }
+  auto desired = state.clone_partition_style;
+  if (!partition_style_choice_allowed_for_state(state, desired)) {
+    desired = ytec::windowsapp::WindowsPartitionStyleChoice::preserve;
+  }
+  if (!select_clone_partition_style_item(state, desired)) {
+    state.clone_partition_style_combo_ready = false;
+    return false;
+  }
+  state.clone_partition_style = desired;
+  return true;
+}
+
+bool populate_clone_partition_style_combo(AppState& state) {
+  state.clone_partition_style_combo_ready = false;
+  if (state.clone_partition_style_combo == nullptr ||
+      SendMessageW(
+          state.clone_partition_style_combo, CB_RESETCONTENT, 0, 0) ==
+          CB_ERR) {
+    return false;
+  }
+  for (const auto& option :
+       ytec::windowsapp::windows_partition_style_options()) {
+    const LRESULT index = SendMessageW(
+        state.clone_partition_style_combo,
+        CB_ADDSTRING,
+        0,
+        reinterpret_cast<LPARAM>(option.label.data()));
+    if (index == CB_ERR || index == CB_ERRSPACE ||
+        SendMessageW(
+            state.clone_partition_style_combo,
+            CB_SETITEMDATA,
+            static_cast<WPARAM>(index),
+            static_cast<LPARAM>(
+                ytec::windowsapp::windows_partition_style_item_data(
+                    option.choice))) == CB_ERR) {
+      static_cast<void>(SendMessageW(
+          state.clone_partition_style_combo, CB_RESETCONTENT, 0, 0));
+      return false;
+    }
+  }
+  state.clone_partition_style_combo_ready = true;
+  return synchronize_clone_partition_style_choice(state);
+}
+
+std::optional<ytec::windowsapp::WindowsPartitionStyleChoice>
+selected_windows_partition_style(const AppState& state) {
+  if (state.page != Page::clone ||
+      !state.clone_partition_style_combo_ready) {
+    return std::nullopt;
+  }
+  const LRESULT selection = SendMessageW(
+      state.clone_partition_style_combo, CB_GETCURSEL, 0, 0);
+  if (selection == CB_ERR) {
+    return std::nullopt;
+  }
+  const LRESULT item_data = SendMessageW(
+      state.clone_partition_style_combo,
+      CB_GETITEMDATA,
+      static_cast<WPARAM>(selection),
+      0);
+  if (item_data == CB_ERR) {
+    return std::nullopt;
+  }
+  const auto choice =
+      ytec::windowsapp::decode_windows_partition_style_item_data(
+          static_cast<std::uintptr_t>(item_data));
+  if (!choice.has_value() ||
+      !partition_style_choice_allowed_for_state(state, choice.value())) {
+    return std::nullopt;
+  }
+  return choice;
+}
+
+std::optional<ytec::migrationcore::DirectClonePartitionStyleChoice>
+direct_shrink_partition_style_choice(
+    const ytec::windowsapp::WindowsPartitionStyleChoice choice) noexcept {
+  switch (choice) {
+    case ytec::windowsapp::WindowsPartitionStyleChoice::preserve:
+      return ytec::migrationcore::DirectClonePartitionStyleChoice::preserve;
+    case ytec::windowsapp::WindowsPartitionStyleChoice::mbr_to_gpt:
+      return ytec::migrationcore::DirectClonePartitionStyleChoice::mbr_to_gpt;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::wstring_view migration_partition_style_text(
+    const ytec::migrationcore::MigrationPartitionStyle style) noexcept {
+  switch (style) {
+    case ytec::migrationcore::MigrationPartitionStyle::mbr:
+      return L"MBR";
+    case ytec::migrationcore::MigrationPartitionStyle::gpt:
+      return L"GPT";
+    default:
+      return L"不明";
+  }
+}
+
+bool clone_partition_style_conversion_available(const AppState& state) {
+  const auto transfer_mode = selected_windows_transfer_mode(state);
+  const auto* source = selected_clone_source_disk(state);
+  return state.page == Page::clone && transfer_mode.has_value() &&
+      source != nullptr &&
+      ytec::windowsapp::windows_partition_style_choice_allowed(
+          transfer_mode.value(),
+          source->partition_style,
+          source->is_system_disk,
+          ytec::windowsapp::WindowsPartitionStyleChoice::mbr_to_gpt);
 }
 
 std::optional<ytec::imageformat::TsumugiCreateVerificationMode>
@@ -2784,15 +4026,17 @@ std::wstring_view image_create_verification_mode_label(
 }
 
 bool selected_clone_rescue_mode(const AppState& state) {
-  return state.page == Page::clone &&
-         SendMessageW(
-             state.transfer_mode_combo, CB_GETCURSEL, 0, 0) == 2;
+  const auto selected = selected_windows_transfer_mode(state);
+  return state.page == Page::clone && selected.has_value() &&
+      selected.value() ==
+          ytec::windowsapp::WindowsTransferModeChoice::rescue;
 }
 
 bool selected_image_rescue_mode(const AppState& state) {
-  return state.page == Page::create_image &&
-         SendMessageW(
-             state.transfer_mode_combo, CB_GETCURSEL, 0, 0) == 2;
+  const auto selected = selected_windows_transfer_mode(state);
+  return state.page == Page::create_image && selected.has_value() &&
+      selected.value() ==
+          ytec::windowsapp::WindowsTransferModeChoice::rescue;
 }
 
 ytec::windowsapp::RescueMediaBootProfile selected_media_profile(
@@ -2896,13 +4140,43 @@ ytec::windowsapp::RescueMediaPlanView current_rescue_media_plan(
 
 ytec::windowsapp::CloneSelectionView current_clone_selection(
     const AppState& state) {
-  return ytec::windowsapp::evaluate_clone_selection(
+  const auto mode = selected_windows_transfer_mode(state);
+  if (!mode.has_value()) {
+    return ytec::windowsapp::CloneSelectionView{
+        .issue = ytec::windowsapp::CloneSelectionIssue::
+            transfer_mode_unavailable,
+        .message =
+            L"動作モードを安全に識別できません。選び直してください。"};
+  }
+  const auto partition_style = selected_windows_partition_style(state);
+  if (!partition_style.has_value()) {
+    return ytec::windowsapp::CloneSelectionView{
+        .issue = ytec::windowsapp::CloneSelectionIssue::
+            partition_style_unavailable,
+        .message =
+            L"コピー先のパーティション形式を安全に識別できません。選び直してください。"};
+  }
+  auto selection = ytec::windowsapp::evaluate_clone_selection(
       state.inventory.has_value() ? &state.inventory.value() : nullptr,
       combo_selection(state.source_combo),
       combo_selection(state.target_combo),
       state.inventory_loading.load(),
-      selected_transfer_mode(state) ==
-          ytec::imageformat::TransferMode::exact);
+      ytec::windowsapp::windows_transfer_mode_requires_same_or_larger_target(
+          mode.value()));
+  const auto* source = selected_clone_source_disk(state);
+  if (selection.ready && source != nullptr &&
+      !ytec::windowsapp::windows_partition_style_route_available(
+          mode.value(),
+          source->partition_style,
+          source->is_system_disk,
+          partition_style.value())) {
+    selection.issue = ytec::windowsapp::CloneSelectionIssue::
+        partition_style_route_unavailable;
+    selection.ready = false;
+    selection.message =
+        L"選択したコピー元形式・転送方式・コピー先形式の組み合わせは安全な製品経路へ接続されていません。選択を見直してください。";
+  }
+  return selection;
 }
 
 bool current_windows_data_rescue_selection_ready(const AppState& state) {
@@ -3433,7 +4707,138 @@ void select_default_media_usb_target(AppState& state) {
   state.media_usb_inspection.reset();
 }
 
+#if defined(YTEC_UI_ACCEPTANCE_BUILD)
+[[nodiscard]] ytec::windowsapp::PostMigrationCheckReport
+make_acceptance_post_migration_check_report() {
+  ytec::diskmodel::DiskInfo disk{
+      .disk_number = 7U,
+      .device_path = L"\\\\.\\PhysicalDrive7",
+      .model = L"UI acceptance synthetic boot disk",
+      .size_bytes = 256ULL * 1024ULL * 1024ULL,
+      .sector_count = 524288ULL,
+      .logical_sector_size = 512U,
+      .physical_sector_size = 4096U,
+      .bus_type = L"Synthetic",
+      .serial_suffix = "0000",
+      .partition_style = ytec::diskmodel::PartitionStyle::gpt,
+      .disk_identifier = L"{11111111-2222-3333-4444-555555555555}",
+      .offline = false,
+      .read_only = false,
+      .removable = false,
+      .is_system_disk = true,
+      .partitions = {
+          ytec::diskmodel::PartitionInfo{
+              .number = 1U,
+              .offset_bytes = 1048576ULL,
+              .size_bytes = 33554432ULL,
+              .style = ytec::diskmodel::PartitionStyle::gpt,
+              .type = L"{C12A7328-F81F-11D2-BA4B-00A0C93EC93B}",
+              .identifier = L"{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}",
+              .name = L"EFI",
+          },
+          ytec::diskmodel::PartitionInfo{
+              .number = 3U,
+              .offset_bytes = 67108864ULL,
+              .size_bytes = 167772160ULL,
+              .style = ytec::diskmodel::PartitionStyle::gpt,
+              .type = L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}",
+              .identifier = L"{BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF}",
+              .name = L"Windows",
+          },
+      },
+  };
+  disk.health.state = ytec::diskmodel::DiskHealthState::healthy;
+  disk.health.smart_status_available = true;
+  const auto verified = [](const wchar_t* summary) {
+    return ytec::windowsapp::PostMigrationEvidence{
+        .state = ytec::windowsapp::PostMigrationEvidenceState::verified,
+        .summary = summary,
+        .detail = L"UI受入用の合成読取り専用結果です。実ディスクにはアクセスしていません。",
+    };
+  };
+  return ytec::windowsapp::PostMigrationCheckReport{
+      .current_boot_disk = std::move(disk),
+      .windows_partition_number = 3U,
+      .system_partition_number = 1U,
+      .windows_volume_name =
+          L"\\\\?\\Volume{BBBBBBBB-CCCC-DDDD-EEEE-FFFFFFFFFFFF}\\",
+      .windows_file_system = L"NTFS",
+      .system_volume_name =
+          L"\\\\?\\Volume{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}\\",
+      .system_file_system = L"FAT32",
+      .winre_state = ytec::windowsapp::PostMigrationWinReState::registered,
+      .bitlocker = {
+          .conversion = ytec::windowsapp::
+              PostMigrationBitLockerConversionState::fully_encrypted,
+          .protection = ytec::windowsapp::
+              PostMigrationBitLockerProtectionState::on,
+          .encryption_percentage = 100U,
+      },
+      .boot_disk_and_layout = verified(L"起動ディスクと区画構成を確認しました"),
+      .bcd_and_boot_manager = verified(L"BCDとWindows Boot Managerを確認しました"),
+      .winre = verified(L"WinRE登録状態を確認しました"),
+      .file_system_and_disk_health = verified(L"ファイルシステムとディスク健全性を確認しました"),
+      .bitlocker_status = verified(L"BitLocker状態を確認しました"),
+      .read_only_operations_only = true,
+      .preboot_success_guaranteed = false,
+  };
+}
+#endif
+
+void start_post_migration_check(AppState& state) {
+  if (state.clone_running.load() || state.backup_running.load() ||
+      state.restore_running.load() || state.media_creation_running.load() ||
+      state.inventory_loading.load() || state.manual_update_running.load() ||
+      state.adk_management_running.load() ||
+      state.support_zip_planning.load() ||
+      state.support_zip_creation_running.load() ||
+      state.media_preflight_running.load() ||
+      state.media_usb_inspection_running.load() ||
+      state.restore_preflight_running.load()) {
+    return;
+  }
+  if (state.post_migration_check_running.exchange(true)) {
+    return;
+  }
+  if (state.post_migration_check_thread.joinable()) {
+    state.post_migration_check_thread.join();
+  }
+  state.post_migration_check_report.reset();
+  state.post_migration_check_error.clear();
+  if (state.logger.has_value()) {
+    state.logger->info(L"利用者操作による換装後読取り専用チェックを開始");
+  }
+  update_action_state(state);
+  InvalidateRect(state.window, nullptr, FALSE);
+  const HWND window = state.window;
+  state.post_migration_check_thread = std::thread([window]() {
+    auto payload = std::make_unique<PostMigrationCheckPayload>();
+#if defined(YTEC_UI_ACCEPTANCE_BUILD)
+    auto result = ytec::windowsapp::validate_post_migration_check_report(
+        make_acceptance_post_migration_check_report());
+#else
+    auto result =
+        ytec::windowsapp::run_post_migration_check_with_windows_apis();
+#endif
+    if (result.has_value()) {
+      payload->report = result.take_value();
+    } else {
+      payload->error = result.error();
+    }
+    if (PostMessageW(
+            window,
+            kPostMigrationCheckCompleteMessage,
+            0,
+            reinterpret_cast<LPARAM>(payload.get())) != FALSE) {
+      static_cast<void>(payload.release());
+    }
+  });
+}
+
 void start_manual_update_check(AppState& state) {
+  if (state.post_migration_check_running.load()) {
+    return;
+  }
   if (state.manual_update_running.exchange(true)) {
     return;
   }
@@ -3520,6 +4925,7 @@ void choose_support_zip_destination(AppState& state) {
       state.media_creation_running.load() ||
       state.inventory_loading.load() ||
       state.manual_update_running.load() ||
+      state.post_migration_check_running.load() ||
       state.adk_management_running.load() ||
       state.media_preflight_running.load() ||
       state.media_usb_inspection_running.load() ||
@@ -3747,48 +5153,46 @@ HRESULT CALLBACK adk_management_dialog_callback(
   return S_OK;
 }
 
-void start_adk_management_action(
+void log_adk_evidence(
     AppState& state,
-    const ytec::windowsapp::AdkManagementAction action) {
-  if (state.adk_management_running.load() ||
-      state.clone_running.load() || state.backup_running.load() ||
-      state.restore_running.load() ||
-      state.media_creation_running.load() ||
-      state.media_preflight_running.load() ||
-      state.support_zip_planning.load() ||
-      state.support_zip_creation_running.load()) {
+    const ytec::windowsapp::AdkReleaseManifest& manifest,
+    const ytec::windowsapp::AdkEvidenceFacts& facts) {
+  if (!state.logger.has_value()) {
     return;
   }
+  const auto evidence =
+      ytec::windowsapp::format_adk_evidence_event(manifest, facts);
+  if (evidence.has_value()) {
+    state.logger->info(evidence.value());
+  }
+}
+
+void start_adk_management_execution(
+    AppState& state,
+    const ytec::windowsapp::AdkReleaseManifest& manifest,
+    ytec::windowsapp::AdkManagementRequest request) {
   if (state.adk_management_thread.joinable()) {
     state.adk_management_thread.join();
   }
-
-  const auto manifest =
-      ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
-  const auto view =
-      ytec::windowsapp::build_adk_management_view(manifest);
-  ytec::windowsapp::AdkManagementRequest request{
-      .action = action,
-      .administrator = state.elevated,
-      .explicit_start_confirmed = true,
-  };
-  // The current release gate is closed. In particular, do not display a
-  // path picker or acquire an EULA document before that pure gate is open.
-  // execute_adk_management_action repeats the gate as its first operation;
-  // the factory lambdas below therefore remain uninvoked in this release.
-  if (!view.path_selection_permitted) {
-    request.offline_layout_root.clear();
-  }
-
+  const bool path_selected = !request.offline_layout_root.empty();
+  const bool full_eula = request.consent_acknowledgement.has_value() &&
+      request.consent_acknowledgement->eula_body_fully_presented;
+  const bool explicit_consent =
+      request.consent_acknowledgement.has_value() &&
+      request.consent_acknowledgement->explicit_acceptance;
+  log_adk_evidence(
+      state,
+      manifest,
+      ytec::windowsapp::AdkEvidenceFacts{
+          .action = request.action,
+          .stage = ytec::windowsapp::AdkEvidenceStage::action_started,
+          .path_selected = path_selected,
+          .complete_eula_presented = full_eula,
+          .explicit_consent = explicit_consent,
+      });
   state.adk_management_status =
-      view.execution_gate_open
-          ? L"明示されたADK管理操作をバックグラウンドで確認しています…"
-          : L"ADK安全ゲートを確認中です。通信・UAC・installer・フォルダー参照は開始しません。";
+      L"明示されたADK管理操作をバックグラウンドで実行しています…";
   state.adk_management_running.store(true);
-  if (state.logger.has_value()) {
-    state.logger->info(
-        L"利用者操作によるADK取得・管理の安全ゲート確認開始");
-  }
   update_action_state(state);
   InvalidateRect(state.window, nullptr, TRUE);
 
@@ -3796,6 +5200,7 @@ void start_adk_management_action(
   state.adk_management_thread = std::thread(
       [window, manifest, request = std::move(request)]() mutable {
         auto payload = std::make_unique<AdkManagementPayload>();
+        payload->action = request.action;
         auto result = ytec::windowsapp::execute_adk_management_action(
             manifest,
             request,
@@ -3822,6 +5227,225 @@ void start_adk_management_action(
           static_cast<void>(payload.release());
         }
       });
+}
+
+void start_adk_consent_preparation(
+    AppState& state,
+    const ytec::windowsapp::AdkReleaseManifest& manifest,
+    const ytec::windowsapp::AdkManagementAction action,
+    std::filesystem::path selected_path) {
+  if (state.adk_management_thread.joinable()) {
+    state.adk_management_thread.join();
+  }
+  log_adk_evidence(
+      state,
+      manifest,
+      ytec::windowsapp::AdkEvidenceFacts{
+          .action = action,
+          .stage =
+              ytec::windowsapp::AdkEvidenceStage::eula_retrieval_started,
+          .path_selected = !selected_path.empty(),
+      });
+  state.adk_management_status =
+      action ==
+              ytec::windowsapp::AdkManagementAction::offline_layout_install
+          ? L"選択したlayoutの固定bootstrapを検証し、EULA全文を準備しています…"
+          : L"固定Microsoft bootstrapを検証し、EULA全文だけを準備しています…";
+  state.adk_management_running.store(true);
+  update_action_state(state);
+  InvalidateRect(state.window, nullptr, TRUE);
+
+  const HWND window = state.window;
+  state.adk_management_thread = std::thread(
+      [window, manifest, action,
+       selected_path = std::move(selected_path)]() mutable {
+        auto payload =
+            std::make_unique<AdkConsentPreparationPayload>();
+        payload->action = action;
+        payload->selected_path = selected_path;
+        ytec::windowsapp::WindowsAdkAcquisitionPlatform platform;
+        const auto source =
+            action == ytec::windowsapp::AdkManagementAction::
+                          offline_layout_install
+                ? ytec::windowsapp::AdkAcquisitionSource::
+                      official_offline_layout
+                : ytec::windowsapp::AdkAcquisitionSource::
+                      official_download;
+        auto prepared = ytec::windowsapp::prepare_adk_consent_document(
+            manifest,
+            ytec::windowsapp::AdkConsentDocumentPreparationRequest{
+                .source = source,
+                .offline_layout_root =
+                    source == ytec::windowsapp::AdkAcquisitionSource::
+                                  official_offline_layout
+                        ? selected_path
+                        : std::filesystem::path{},
+                .explicit_eula_retrieval_confirmed = true,
+            },
+            platform,
+            [&platform](
+                const ytec::windowsapp::AdkPinnedPayload& pinned,
+                const ytec::windowsapp::AdkVerifiedPayload& verified,
+                const ytec::windowsapp::AdkEmbeddedEulaPin& eula) {
+              auto extracted = platform.extract_verified_embedded_eula(
+                  pinned, verified, eula);
+              if (!extracted.has_value()) {
+                return ytec::clonecore::Result<
+                    ytec::windowsapp::AdkVerifiedEulaDocument>::failure(
+                    extracted.error());
+              }
+              auto result = extracted.take_value();
+              return ytec::clonecore::Result<
+                  ytec::windowsapp::AdkVerifiedEulaDocument>::success(
+                  ytec::windowsapp::AdkVerifiedEulaDocument{
+                      .receipt = std::move(result.receipt),
+                      .rtf_document = std::move(result.rtf_document),
+                  });
+            });
+        if (prepared.has_value()) {
+          payload->document = prepared.take_value();
+        } else {
+          payload->error = prepared.error();
+        }
+        if (PostMessageW(
+                window,
+                kAdkConsentPreparationCompleteMessage,
+                0,
+                reinterpret_cast<LPARAM>(payload.get())) != FALSE) {
+          static_cast<void>(payload.release());
+        }
+      });
+}
+
+void start_adk_management_action(
+    AppState& state,
+    const ytec::windowsapp::AdkManagementAction action) {
+  if (state.adk_management_running.load() ||
+      state.clone_running.load() || state.backup_running.load() ||
+      state.restore_running.load() ||
+      state.media_creation_running.load() ||
+      state.media_preflight_running.load() ||
+      state.support_zip_planning.load() ||
+      state.support_zip_creation_running.load()) {
+    return;
+  }
+  const auto manifest =
+      ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
+  const auto review =
+      ytec::windowsapp::build_adk_management_action_review(
+          manifest, action);
+  log_adk_evidence(
+      state,
+      manifest,
+      ytec::windowsapp::AdkEvidenceFacts{
+          .action = action,
+          .stage = ytec::windowsapp::AdkEvidenceStage::review_opened,
+      });
+  if (!review.execution_gate_open) {
+    state.adk_management_status =
+        L"安全ゲート停止中: 通信・フォルダー参照・UAC・installerは開始していません。";
+    log_adk_evidence(
+        state,
+        manifest,
+        ytec::windowsapp::AdkEvidenceFacts{
+            .action = action,
+            .stage = ytec::windowsapp::AdkEvidenceStage::gate_blocked,
+        });
+    MessageBoxW(
+        state.window,
+        review.summary.c_str(),
+        review.title.c_str(),
+        MB_OK | MB_ICONINFORMATION);
+    InvalidateRect(state.window, nullptr, TRUE);
+    return;
+  }
+
+  std::filesystem::path selected_path;
+  if (review.path_selection !=
+      ytec::windowsapp::AdkManagementPathSelection::none) {
+    const auto selected = ytec::windowsapp::select_adk_product_folder(
+        state.window,
+        review.path_selection ==
+                ytec::windowsapp::AdkManagementPathSelection::
+                    existing_offline_layout
+            ? L"検証する既存ADKオフラインレイアウトを選択"
+            : L"新しいADKオフラインレイアウトを作成する親フォルダーを選択");
+    if (!selected.has_value()) {
+      state.adk_management_status = selected.error().message;
+      if (selected.error().native_code != ERROR_CANCELLED) {
+        show_product_error(
+            state.window,
+            L"ADKフォルダーを選択できませんでした",
+            selected.error());
+      }
+      InvalidateRect(state.window, nullptr, TRUE);
+      return;
+    }
+    selected_path = selected.value();
+    if (review.path_selection ==
+        ytec::windowsapp::AdkManagementPathSelection::
+            new_offline_layout_parent) {
+      const auto destination =
+          ytec::windowsapp::make_adk_offline_layout_destination(
+              manifest, selected_path);
+      if (!destination.has_value()) {
+        show_product_error(
+            state.window,
+            L"ADKオフラインレイアウト保存先を確定できません",
+            destination.error());
+        return;
+      }
+      selected_path = destination.value();
+    }
+    log_adk_evidence(
+        state,
+        manifest,
+        ytec::windowsapp::AdkEvidenceFacts{
+            .action = action,
+            .stage = ytec::windowsapp::AdkEvidenceStage::path_selected,
+            .path_selected = true,
+        });
+  }
+
+  if (review.requires_explicit_uninstall_confirmation) {
+    const int confirmed = MessageBoxW(
+        state.window,
+        (review.summary +
+         L"\n\nこの固定管理記録に一致する登録だけを削除します。続行しますか？")
+            .c_str(),
+        review.title.c_str(),
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (confirmed != IDYES) {
+      state.adk_management_status =
+          L"ADK管理対象の削除をキャンセルしました。何も変更していません。";
+      return;
+    }
+    start_adk_management_execution(
+        state,
+        manifest,
+        ytec::windowsapp::AdkManagementRequest{
+            .action = action,
+            .administrator = state.elevated,
+            .explicit_start_confirmed = true,
+        });
+    return;
+  }
+
+  const std::wstring retrieval_message =
+      review.requires_network_retrieval
+          ? L"EULA全文を表示するため、固定Microsoft bootstrap 1件だけを一時取得し、署名・版・SHA-256を検証してEULAを有界抽出後、一時領域を削除します。この段階ではinstallerを起動しません。続行しますか？"
+          : L"EULA全文を表示するため、選択したローカルlayoutの固定bootstrap 1件だけを一時領域へ複製し、署名・版・SHA-256を検証してEULAを有界抽出後、一時領域を削除します。この段階ではinstallerを起動しません。続行しますか？";
+  if (MessageBoxW(
+          state.window,
+          retrieval_message.c_str(),
+          L"ADK利用条件を準備",
+          MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDYES) {
+    state.adk_management_status =
+        L"ADK利用条件の準備をキャンセルしました。取得・導入は開始していません。";
+    return;
+  }
+  start_adk_consent_preparation(
+      state, manifest, action, std::move(selected_path));
 }
 
 void show_adk_management_dialog(AppState& state) {
@@ -3861,9 +5485,12 @@ void show_adk_management_dialog(AppState& state) {
   std::wstring content =
       view.status + L"\n\n対象ADK: " + manifest.tested_adk_version +
       L" / 固定取得物: " +
-      std::to_wstring(manifest.payloads.size()) + L"件";
+      std::to_wstring(manifest.payloads.size()) + L"件\nquiet導入の予期しない再起動なし: " +
+      (view.unattended_no_restart_confirmed ? L"確認済み"
+                                             : L"未確認（停止）");
   std::wstring payload_details =
-      L"固定取得物（この製品には同梱しません）";
+      view.summary +
+      L"\n\n固定manifest pin（取得物はこの製品に同梱しません）";
   for (const auto& row : view.payload_rows) {
     payload_details += L"\n・" + row;
   }
@@ -4052,7 +5679,8 @@ void start_rescue_media_creation(
   }
   const std::wstring final_path = control_text(state.media_output_edit);
   std::vector<ytec::clonecore::StableDiskIdentity> protected_log_disks;
-  std::optional<ytec::clonecore::Error> output_identity_error;
+  std::optional<ytec::clonecore::StableDiskIdentity>
+      reviewed_iso_output_backing;
   if (kind == ytec::windowsapp::RescueMediaKind::usb_drive) {
     if (plan.usb_target_identity.has_value()) {
       protected_log_disks.push_back(plan.usb_target_identity.value());
@@ -4061,9 +5689,16 @@ void start_rescue_media_creation(
     auto output_identity =
         identify_local_path_backing_read_only(final_path);
     if (output_identity) {
-      protected_log_disks.push_back(output_identity.take_value());
+      reviewed_iso_output_backing = output_identity.take_value();
+      protected_log_disks.push_back(
+          reviewed_iso_output_backing.value());
     } else {
-      output_identity_error = output_identity.error();
+      show_product_error(
+          state.window,
+          L"ISO保存先の物理ディスクを識別できません",
+          output_identity.error(),
+          L"SingleResumeSlot admissionへ実レビュー済みoutputを拘束できないため、ISOは作成していません。");
+      return;
     }
   }
   if (!prepare_source_safe_product_logging(
@@ -4073,12 +5708,6 @@ void start_rescue_media_creation(
       !require_startup_write_access(
           state, L"レスキューメディア作成")) {
     return;
-  }
-  if (output_identity_error.has_value()) {
-    log_error_summary(
-        state.logger,
-        L"ISO保存先の物理ディスク識別失敗（RAM隔離で継続）",
-        output_identity_error.value());
   }
   if (!confirm_long_operation_power(
           state, L"レスキューメディア作成")) {
@@ -4247,6 +5876,84 @@ void start_rescue_media_creation(
     usb_mapping = mapping.take_value();
   }
 
+  const auto reviewed_media_target =
+      kind == ytec::windowsapp::RescueMediaKind::usb_drive
+      ? (usb_authorization.has_value()
+             ? std::optional<ytec::clonecore::StableDiskIdentity>(
+                   usb_authorization->target)
+             : std::nullopt)
+      : reviewed_iso_output_backing;
+  if (!reviewed_media_target.has_value()) {
+    MessageBoxW(
+        state.window,
+        L"レビュー済みのUSBまたはISO保存先をSingleResumeSlot gateへ拘束できません。媒体は作成していません。",
+        L"レスキューメディアを開始できません",
+        MB_OK | MB_ICONERROR);
+    return;
+  }
+  auto resume_operation_id = ytec::windowsapp::
+      make_windows_resume_slot_admission_operation_id_with_windows_apis();
+  if (!resume_operation_id) {
+    show_product_error(
+        state.window,
+        L"メディア作成のSingleResumeSlot拘束を作成できません",
+        resume_operation_id.error());
+    return;
+  }
+  const std::wstring media_destination =
+      kind == ytec::windowsapp::RescueMediaKind::usb_drive &&
+              usb_mapping.has_value()
+          ? usb_mapping->root_path
+          : final_path;
+  const std::wstring media_mode =
+      kind == ytec::windowsapp::RescueMediaKind::iso_file
+          ? L"media=iso-new-file"
+          : usb_authorization->storage_plan.has_value() &&
+                    usb_authorization->storage_plan->mode ==
+                        ytec::windowsapp::RescueUsbProvisioningMode::
+                            preserve_data_refresh
+              ? L"media=usb-preserve-data-refresh"
+              : L"media=usb-initialize-all";
+  const std::array<std::wstring, 4U> admission_owned_fields{
+      L"windows-rescue-media-create-v1",
+      media_destination,
+      media_mode,
+      ytec::windowsapp::rescue_media_boot_profile_label(
+          selected_media_profile(state)),
+  };
+  const std::array<std::wstring_view, 4U> admission_fields{
+      admission_owned_fields[0],
+      admission_owned_fields[1],
+      admission_owned_fields[2],
+      admission_owned_fields[3],
+  };
+  auto resume_admission = ytec::windowsapp::
+      make_windows_resume_slot_admission_plan({
+          .operation_id = resume_operation_id.take_value(),
+          // Rescue media is a target/output boot publication route.  This is
+          // admission-only and is never passed to a boot-repair executor.
+          .kind = ytec::operationcore::OperationKind::boot_repair,
+          .source = std::nullopt,
+          .target = reviewed_media_target.value(),
+          .output_backing = kind ==
+                  ytec::windowsapp::RescueMediaKind::iso_file
+              ? reviewed_iso_output_backing
+              : std::nullopt,
+          .expected_work_bytes = kind ==
+                  ytec::windowsapp::RescueMediaKind::usb_drive
+              ? reviewed_media_target->size_bytes
+              : 1U,
+          .immutable_review_fields = admission_fields,
+          .immutable_review_digests = {},
+      });
+  if (!resume_admission) {
+    show_product_error(
+        state.window,
+        L"メディア作成のSingleResumeSlot拘束を作成できません",
+        resume_admission.error());
+    return;
+  }
+
   state.media_creation_cancel_requested.store(false);
   state.media_creation_progress.reset();
   state.media_creation_report.reset();
@@ -4306,6 +6013,8 @@ void start_rescue_media_creation(
       [window,
        cancellation = &state.media_creation_cancel_requested,
        request = std::move(request),
+       resume_admission = resume_admission.take_value(),
+       resume_protected = protected_log_disks,
        completion_power_operation_binding]() {
         auto payload = std::make_unique<MediaCreationPayload>();
         payload->requested_kind = request.kind;
@@ -4336,12 +6045,19 @@ void start_rescue_media_creation(
             }
           }
           if (!payload->error.has_value()) {
-            auto result = ytec::windowsapp::
-                execute_rescue_media_creation_with_windows_apis(request);
-            if (result) {
-              payload->report = result.take_value();
+            const auto admission = ytec::windowsapp::
+                guard_current_windows_operation_start(
+                    resume_admission, resume_protected);
+            if (!admission) {
+              payload->error = admission.error();
             } else {
-              payload->error = result.error();
+              auto result = ytec::windowsapp::
+                  execute_rescue_media_creation_with_windows_apis(request);
+              if (result) {
+                payload->report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
             }
           }
         }
@@ -4752,12 +6468,40 @@ void start_windows_data_rescue_clone_flow(AppState& state) {
     return;
   }
 
+  const std::array<std::wstring_view, 1U> admission_fields{
+      L"windows-data-rescue-clone-v1"};
+  const std::array<ytec::operationcore::Sha256Digest, 2U>
+      admission_digests{
+          plan.value().expected_source_layout_hash,
+          plan.value().expected_target_layout_hash,
+      };
+  auto resume_admission = ytec::windowsapp::
+      make_windows_resume_slot_admission_plan({
+          .operation_id = plan.value().operation_id,
+          .kind = ytec::operationcore::OperationKind::rescue_clone,
+          .source = plan.value().expected_source,
+          .target = plan.value().expected_target,
+          .output_backing = std::nullopt,
+          .expected_work_bytes = plan.value().expected_source.size_bytes,
+          .immutable_review_fields = admission_fields,
+          .immutable_review_digests = admission_digests,
+      });
+  if (!resume_admission) {
+    show_product_error(
+        state.window,
+        L"救出コピーのSingleResumeSlot拘束を作成できません",
+        resume_admission.error());
+    return;
+  }
+
   state.clone_cancel_requested.store(false);
   state.clone_completion_post_failed.store(false);
   state.clone_progress.reset();
   state.clone_elapsed = std::chrono::milliseconds::zero();
-  state.active_clone_is_rescue = true;
-  state.active_clone_is_shrink = false;
+  state.active_clone_mode =
+      ytec::windowsapp::WindowsTransferModeChoice::rescue;
+  state.active_clone_partition_style =
+      ytec::windowsapp::WindowsPartitionStyleChoice::preserve;
   state.clone_pause_controller =
       make_ui_manual_pause_controller(state.window);
   const auto pause_controller = state.clone_pause_controller;
@@ -4823,6 +6567,8 @@ void start_windows_data_rescue_clone_flow(AppState& state) {
   state.clone_thread = std::thread(
       [window,
        reviewed_plan = plan.take_value(),
+       resume_admission = resume_admission.take_value(),
+       resume_protected = protected_log_disks,
        dependencies = std::move(dependencies),
        callbacks = std::move(callbacks),
        target_disk_number,
@@ -4832,7 +6578,10 @@ void start_windows_data_rescue_clone_flow(AppState& state) {
        clone_running = &state.clone_running]() mutable {
         auto payload = std::make_unique<ClonePayload>();
         payload->target_disk_number = target_disk_number;
-        payload->rescue_mode = true;
+        payload->mode =
+            ytec::windowsapp::WindowsTransferModeChoice::rescue;
+        payload->partition_style =
+            ytec::windowsapp::WindowsPartitionStyleChoice::preserve;
         payload->completion_power_operation_binding =
             completion_power_operation_binding;
         ThreadSleepPrevention sleep_prevention;
@@ -4844,17 +6593,24 @@ void start_windows_data_rescue_clone_flow(AppState& state) {
               .message = L"自動スリープを安全に防止できないため開始しません",
           };
         } else {
-          auto result =
-              ytec::windowsapp::execute_windows_data_rescue_clone(
-                  reviewed_plan,
-                  true,
-                  L"OK",
-                  dependencies,
-                  std::move(callbacks));
-          if (result) {
-            payload->rescue_report = result.take_value();
+          const auto admission = ytec::windowsapp::
+              guard_current_windows_operation_start(
+                  resume_admission, resume_protected);
+          if (!admission) {
+            payload->error = admission.error();
           } else {
-           payload->error = result.error();
+            auto result =
+                ytec::windowsapp::execute_windows_data_rescue_clone(
+                    reviewed_plan,
+                    true,
+                    L"OK",
+                    dependencies,
+                    std::move(callbacks));
+            if (result) {
+              payload->rescue_report = result.take_value();
+            } else {
+              payload->error = result.error();
+            }
           }
         }
         pause_controller->mark_completed();
@@ -4887,16 +6643,246 @@ void start_windows_data_rescue_clone_flow(AppState& state) {
       });
 }
 
+bool clone_partition_capacity_choice_matches(
+    const AppState& state,
+    const ytec::diskmodel::DiskInfo& source,
+    const ytec::diskmodel::DiskInfo& target,
+    const ytec::windowsapp::WindowsPartitionStyleChoice style_choice) {
+  if (!state.clone_partition_capacity_choice.has_value() ||
+      state.clone_partition_capacity_choice->partition_style_choice !=
+          style_choice) {
+    return false;
+  }
+  const auto current_source = ytec::diskmodel::make_stable_disk_identity(
+      source, source.is_system_disk);
+  const auto current_target = ytec::diskmodel::make_stable_disk_identity(
+      target, false);
+  const auto source_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(source);
+  const auto target_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(target);
+  if (!current_source || !current_target || !source_layout ||
+      !target_layout) {
+    return false;
+  }
+  const auto& choice = *state.clone_partition_capacity_choice;
+  const auto source_status = ytec::clonecore::validate_stable_identity(
+      choice.decision.binding.source,
+      current_source.value(),
+      L"パーティション・容量設定コピー元");
+  const auto target_status = ytec::clonecore::validate_stable_identity(
+      choice.expected_target,
+      current_target.value(),
+      L"パーティション・容量設定コピー先");
+  return source_status && target_status &&
+      choice.decision.binding.source_layout_hash == source_layout.value() &&
+      choice.expected_target_layout_hash == target_layout.value();
+}
+
+std::wstring clone_partition_capacity_decision_summary(
+    const ytec::windowsapp::WindowsClonePartitionCapacityDecision& decision) {
+  std::wstring summary =
+      std::to_wstring(decision.selected_source_table_indexes.size()) +
+      L"領域をコピー / 余剰: ";
+  switch (decision.surplus_allocation) {
+    case ytec::migrationcore::ShrinkSurplusAllocation::
+        automatic_proportional:
+      summary += L"自動（推奨）";
+      break;
+    case ytec::migrationcore::ShrinkSurplusAllocation::
+        selected_data_partition:
+      summary += L"NTFS #" + std::to_wstring(
+          decision.surplus_target_source_table_index.value_or(0U));
+      break;
+    case ytec::migrationcore::ShrinkSurplusAllocation::leave_unallocated:
+      summary += L"未割当のまま";
+      break;
+  }
+  return summary;
+}
+
+bool review_clone_partition_capacity_settings(
+    AppState& state,
+    const ytec::diskmodel::DiskInfo& source,
+    const ytec::diskmodel::DiskInfo& target,
+    const ytec::windowsapp::WindowsPartitionStyleChoice
+        partition_style_choice) {
+  const auto product_style =
+      direct_shrink_partition_style_choice(partition_style_choice);
+  const auto version = current_windows_version();
+  const std::string architecture = current_native_architecture();
+  const std::string analysis_created_utc = current_utc_timestamp();
+  auto operation_id = ytec::windowsapp::
+      make_online_direct_clone_operation_id_with_windows_apis();
+  if (!product_style.has_value() || !version || architecture.empty() ||
+      analysis_created_utc.empty() || !operation_id) {
+    state.clone_partition_capacity_choice.reset();
+    if (!version) {
+      show_product_error(
+          state.window,
+          L"パーティション設定用のWindows情報を確認できません",
+          version.error());
+    } else if (!operation_id) {
+      show_product_error(
+          state.window,
+          L"パーティション設定用の操作IDを作成できません",
+          operation_id.error());
+    } else {
+      MessageBoxW(
+          state.window,
+          L"縮小移行の形式、AMD64環境、または解析時刻を安全に確定できませんでした。",
+          L"パーティション・容量設定を開けません",
+          MB_OK | MB_ICONERROR);
+    }
+    return false;
+  }
+  ytec::windowsapp::WindowsDirectShrinkProductPlanningRequest request{
+      .administrator = state.elevated,
+      .target_is_active_rescue_media = false,
+      .reviewed_source = source,
+      .reviewed_target = target,
+      .operation_id = operation_id.take_value(),
+      .mode_choice = ytec::migrationcore::DirectCloneModeChoice::shrink,
+      .partition_style_choice = *product_style,
+      .surplus_allocation = ytec::migrationcore::
+          ShrinkSurplusAllocation::automatic_proportional,
+      .windows_major = version.value()[0],
+      .windows_minor = version.value()[1],
+      .windows_build = version.value()[2],
+      .windows_architecture = architecture,
+      .analysis_created_utc = analysis_created_utc,
+      .app_version = std::string(kAppVersion),
+  };
+  auto inspected = ytec::windowsapp::
+      inspect_windows_direct_shrink_partition_capacity_with_windows_apis(
+          request);
+  if (!inspected) {
+    state.clone_partition_capacity_choice.reset();
+    show_product_error(
+        state.window,
+        L"パーティション設定用の読取り専用解析に失敗しました",
+        inspected.error(),
+        L"コピー元・コピー先への書き込み、VSS作成、対象ディスクの変更は開始していません。");
+    return false;
+  }
+  auto review = ytec::windowsapp::
+      build_windows_clone_partition_capacity_review(
+          inspected.value().binding,
+          inspected.value().candidates);
+  if (!review) {
+    state.clone_partition_capacity_choice.reset();
+    show_product_error(
+        state.window,
+        L"パーティション設定を安全に構成できません",
+        review.error());
+    return false;
+  }
+  auto submission = show_clone_partition_capacity_review_dialog(
+      state.window, state.body_font, review.value());
+  if (!submission.has_value()) {
+    return false;
+  }
+
+  // Reopen and reanalyze after the user's choice. The pure completion step
+  // accepts the choice only when stable identity, exact layout and complete
+  // analysis digest still equal the values shown in the modal.
+  auto revalidated = ytec::windowsapp::
+      inspect_windows_direct_shrink_partition_capacity_with_windows_apis(
+          request);
+  if (!revalidated) {
+    state.clone_partition_capacity_choice.reset();
+    show_product_error(
+        state.window,
+        L"設定確定後のコピー元再解析に失敗しました",
+        revalidated.error());
+    return false;
+  }
+  submission->revalidated_binding = revalidated.value().binding;
+  auto decision = ytec::windowsapp::
+      complete_windows_clone_partition_capacity_review(
+          review.value(), *submission);
+  if (!decision) {
+    state.clone_partition_capacity_choice.reset();
+    show_product_error(
+        state.window,
+        L"表示後にコピー元が変化したため設定を確定できません",
+        decision.error(),
+        L"パーティション一覧を再度開き、現在の解析結果を確認してください。");
+    return false;
+  }
+  auto target_identity = ytec::diskmodel::make_stable_disk_identity(
+      target, false);
+  auto target_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(target);
+  if (!target_identity || !target_layout) {
+    state.clone_partition_capacity_choice.reset();
+    show_product_error(
+        state.window,
+        L"コピー先の設定bindingを作成できません",
+        target_identity ? target_layout.error() : target_identity.error());
+    return false;
+  }
+  state.clone_partition_capacity_choice = ClonePartitionCapacityChoiceState{
+      .decision = decision.take_value(),
+      .expected_target = target_identity.take_value(),
+      .expected_target_layout_hash = target_layout.take_value(),
+      .partition_style_choice = partition_style_choice,
+      .analysis_created_utc = analysis_created_utc,
+  };
+  if (state.logger.has_value()) {
+    state.logger->info(
+        L"パーティション・容量設定を確定 " +
+        clone_partition_capacity_decision_summary(
+            state.clone_partition_capacity_choice->decision));
+  }
+  update_action_state(state);
+  InvalidateRect(state.window, nullptr, TRUE);
+  return true;
+}
+
 void start_windows_direct_shrink_clone_flow(
     AppState& state,
     const ytec::diskmodel::DiskInfo& source,
-    const ytec::diskmodel::DiskInfo& target) {
+    const ytec::diskmodel::DiskInfo& target,
+    const ytec::windowsapp::WindowsPartitionStyleChoice
+        partition_style_choice) {
   if (!require_healthy_write_target(
           state, target, L"縮小移行クローン") ||
       !confirm_source_health_advice(
           state, source, L"縮小移行クローン")) {
     return;
   }
+  const auto product_partition_style_choice =
+      direct_shrink_partition_style_choice(partition_style_choice);
+  if (!product_partition_style_choice.has_value() ||
+      !ytec::windowsapp::windows_partition_style_choice_allowed(
+          ytec::windowsapp::WindowsTransferModeChoice::shrink,
+          source.partition_style,
+          source.is_system_disk,
+          partition_style_choice)) {
+    MessageBoxW(
+        state.window,
+        L"選択した転送方式とパーティション形式の組み合わせを安全に実行できません。縮小移行、コピー元形式、形式維持/変換の選択を見直してください。",
+        L"縮小移行を開始できません",
+        MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  if (!clone_partition_capacity_choice_matches(
+          state, source, target, partition_style_choice)) {
+    state.clone_partition_capacity_choice.reset();
+    if (!review_clone_partition_capacity_settings(
+            state, source, target, partition_style_choice)) {
+      return;
+    }
+  }
+  if (!state.clone_partition_capacity_choice.has_value()) {
+    return;
+  }
+  const auto capacity_decision =
+      state.clone_partition_capacity_choice->decision;
+  const std::string analysis_created_utc =
+      state.clone_partition_capacity_choice->analysis_created_utc;
 
   const auto source_identity =
       ytec::diskmodel::make_stable_disk_identity(
@@ -4921,7 +6907,6 @@ void start_windows_direct_shrink_clone_flow(
 
   const auto version = current_windows_version();
   const std::string architecture = current_native_architecture();
-  const std::string analysis_created_utc = current_utc_timestamp();
   if (!version || architecture.empty() || analysis_created_utc.empty()) {
     if (!version) {
       show_product_error(
@@ -4950,28 +6935,81 @@ void start_windows_direct_shrink_clone_flow(
   }
 
   auto plan = ytec::windowsapp::
-      plan_windows_direct_shrink_clone_with_windows_apis(
+      plan_windows_direct_shrink_clone_after_partition_review_with_windows_apis(
           ytec::windowsapp::WindowsDirectShrinkProductPlanningRequest{
               .administrator = state.elevated,
               .target_is_active_rescue_media = false,
               .reviewed_source = source,
               .reviewed_target = target,
               .operation_id = operation_id.take_value(),
-              .surplus_allocation = ytec::migrationcore::
-                  ShrinkSurplusAllocation::automatic_proportional,
+              .mode_choice =
+                  ytec::migrationcore::DirectCloneModeChoice::shrink,
+              .partition_style_choice =
+                  product_partition_style_choice.value(),
+              .selected_source_table_indexes =
+                  capacity_decision.selected_source_table_indexes,
+              .surplus_allocation = capacity_decision.surplus_allocation,
+              .surplus_target_source_table_index =
+                  capacity_decision.surplus_target_source_table_index,
               .windows_major = version.value()[0],
               .windows_minor = version.value()[1],
               .windows_build = version.value()[2],
               .windows_architecture = architecture,
               .analysis_created_utc = analysis_created_utc,
               .app_version = std::string(kAppVersion),
-          });
+          },
+          capacity_decision.binding);
   if (!plan) {
+    state.clone_partition_capacity_choice.reset();
     show_product_error(
         state.window,
         L"縮小移行の安全計画を作成できません",
         plan.error(),
-        L"コピー先への書き込み、VSS作成、対象ディスクの変更は開始していません。稼働中Windowsとアプリの通常ログ書き込みは別です。MBR維持とMBRからGPTへの変換はWindows版の直接縮小では扱いません。");
+        L"コピー先への書き込み、VSS作成、対象ディスクの変更は開始していません。稼働中Windowsとアプリの通常ログ書き込みは別です。MBR維持/MBR→GPTはいずれも、読取り専用解析で適格性を証明した計画からコピー先だけをtarget-onlyで再構成します。");
+    return;
+  }
+  if (plan.value().partition_style_choice() !=
+          product_partition_style_choice.value() ||
+      plan.value().surplus_allocation() !=
+          capacity_decision.surplus_allocation ||
+      plan.value().surplus_target_source_table_index() !=
+          capacity_decision.surplus_target_source_table_index) {
+    state.clone_partition_capacity_choice.reset();
+    MessageBoxW(
+        state.window,
+        L"安全計画のパーティション形式が画面の選択と一致しません。コピー先への書き込みは開始していません。",
+        L"縮小移行の計画を確定できません",
+        MB_OK | MB_ICONERROR);
+    return;
+  }
+  const bool planned_selection_exact =
+      static_cast<std::size_t>(std::count_if(
+          plan.value().source_partition_mappings().begin(),
+          plan.value().source_partition_mappings().end(),
+          [](const ytec::windowsapp::
+                 WindowsDirectShrinkSourcePartitionMapping& mapping) {
+            return mapping.selected;
+          })) == capacity_decision.selected_source_table_indexes.size() &&
+      std::all_of(
+          capacity_decision.selected_source_table_indexes.begin(),
+          capacity_decision.selected_source_table_indexes.end(),
+          [&plan](const std::uint32_t source_table_index) {
+            return std::any_of(
+                plan.value().source_partition_mappings().begin(),
+                plan.value().source_partition_mappings().end(),
+                [source_table_index](const ytec::windowsapp::
+                    WindowsDirectShrinkSourcePartitionMapping& mapping) {
+                  return mapping.source_table_index == source_table_index &&
+                      mapping.selected;
+                });
+          });
+  if (!planned_selection_exact) {
+    state.clone_partition_capacity_choice.reset();
+    MessageBoxW(
+        state.window,
+        L"安全計画のコピー対象が確定済みパーティション設定と一致しません。コピー先への書き込みは開始していません。",
+        L"縮小移行の計画を確定できません",
+        MB_OK | MB_ICONERROR);
     return;
   }
   if (!confirm_long_operation_power(state, L"縮小移行クローン")) {
@@ -4984,7 +7022,51 @@ void start_windows_direct_shrink_clone_flow(
         : std::wstring(
               disk.serial_suffix.begin(), disk.serial_suffix.end());
   };
-  const std::wstring first_confirmation =
+  const bool mbr_to_gpt =
+      plan.value().partition_style_choice() ==
+      ytec::migrationcore::DirectClonePartitionStyleChoice::mbr_to_gpt;
+  const bool mbr_preserve =
+      plan.value().partition_style_choice() ==
+          ytec::migrationcore::DirectClonePartitionStyleChoice::preserve &&
+      plan.value().source_partition_style() ==
+          ytec::migrationcore::MigrationPartitionStyle::mbr &&
+      plan.value().partition_style() ==
+          ytec::migrationcore::MigrationPartitionStyle::mbr;
+  const bool system_clone = plan.value().boot_finalization_required();
+  const auto planned_source_partition_style =
+      plan.value().source_partition_style();
+  const auto planned_target_partition_style = plan.value().partition_style();
+  const std::wstring source_style(
+      migration_partition_style_text(planned_source_partition_style));
+  const std::wstring target_style(
+      migration_partition_style_text(planned_target_partition_style));
+  const std::size_t selected_mapping_count =
+      static_cast<std::size_t>(std::count_if(
+          plan.value().source_partition_mappings().begin(),
+          plan.value().source_partition_mappings().end(),
+          [](const ytec::windowsapp::
+                 WindowsDirectShrinkSourcePartitionMapping& mapping) {
+            return mapping.selected;
+          }));
+  const std::wstring style_review = mbr_to_gpt
+      ? L"MBR→GPT（コピー先だけをtarget-only再構成）"
+      : mbr_preserve
+            ? (system_clone
+                   ? L"MBR形式維持（Legacy BIOS / コピー先だけをtarget-only再構成）"
+                   : L"MBR形式維持（データ / コピー先だけをtarget-only再構成）")
+            : source_style + L"維持";
+  const std::wstring capacity_review =
+      clone_partition_capacity_decision_summary(capacity_decision);
+  std::wstring selected_partition_review;
+  for (const auto source_table_index :
+       capacity_decision.selected_source_table_indexes) {
+    if (!selected_partition_review.empty()) {
+      selected_partition_review += L", ";
+    }
+    selected_partition_review +=
+        L"#" + std::to_wstring(source_table_index);
+  }
+  std::wstring first_confirmation =
       L"手順 1/2  コピー元と消去対象を確認してください。\n\n"
       L"コピー元: ディスク " +
       std::to_wstring(source.disk_number) + L" / " + source.model +
@@ -4997,27 +7079,44 @@ void start_windows_direct_shrink_clone_flow(
       L"\n削除対象: コピー先ディスク全体（" +
       std::to_wstring(target.partitions.size()) +
       L" パーティションと全データ）"
-      L"\n作成構成: GPT維持 / " +
+      L"\n作成構成: " + style_review + L" / " +
       std::to_wstring(plan.value().tasks().size()) +
       L" パーティション / NTFS取込 " +
       std::to_wstring(plan.value().archive_task_count()) +
       L" 件"
-      L"\n一時領域: コピー先内部の専用NTFS（上限 " +
+      L"\nコピー元区画mapping: " +
+      std::to_wstring(selected_mapping_count) + L" / " +
+      std::to_wstring(plan.value().source_partition_mappings().size()) +
+      L" 件を選択\n"
+      L"一時領域: コピー先内部の専用NTFS（上限 " +
       format_bytes(plan.value().staging().archive_capacity_bytes) +
       L"）"
-      L"\n余剰容量: 検証後にNTFSへ自動配分"
+      L"\nパーティション・容量設定: " + capacity_review +
+      L" / 対象 " + selected_partition_review +
       L"\n完了後: コピー先はオフラインのまま保持"
       L"\n\nVSS Snapshotから1領域ずつ一時WIMへ取り込み、"
-      L"読戻し検証後にだけ最終GPTを公開します。"
+      L"読戻し検証後にだけコピー先の最終" + target_style +
+      L"を公開します。"
       L"一時WIMが専用領域に収まらない場合はコピー先を未完成・"
       L"オフラインにして安全に中止します。"
       L"\nアプリはコピー元へ書き込みませんが、稼働中Windowsと"
-      L"VSSの通常書き込みは発生します。"
-      L"\n\nこの対象で最終確認へ進みますか？";
+      L"VSSの通常書き込みは発生します。";
+  if (mbr_to_gpt) {
+    first_confirmation +=
+        L"\nMBR2GPT.exeと/allowFullOSは使用せず、コピー元の全区画を明示mappingした不変計画からコピー先だけをGPTへ再構成します。";
+  } else if (mbr_preserve) {
+    first_confirmation += system_clone
+        ? L"\nMBR形式とLegacy BIOS構成を維持し、コピー元raw MBR/bootstrapは変更せず、コピー先だけへfresh disk signatureと起動情報をtarget-only再構成します。最終Active付きsector0は全処理の最後に公開し、実機起動成功は証明しません。"
+        : L"\nMBR形式を維持し、コピー元raw MBR/bootstrapは変更せず、コピー先だけへfresh disk signatureをtarget-only再構成します。データ用の最終sector0はsource bootstrapを保持してもActiveを設定せず、起動用途として有効化しないまま全処理の最後に公開します。";
+  }
+  first_confirmation += L"\n\nこの対象で最終確認へ進みますか？";
   if (MessageBoxW(
           state.window,
           first_confirmation.c_str(),
-          L"縮小移行の安全確認 1/2",
+          mbr_to_gpt ? L"MBR→GPT縮小移行の安全確認 1/2"
+                     : mbr_preserve
+                           ? L"MBR維持縮小移行の安全確認 1/2"
+                           : L"縮小移行の安全確認 1/2",
           MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
     return;
   }
@@ -5029,11 +7128,28 @@ void start_windows_direct_shrink_clone_flow(
           L"\r\n容量: " + format_bytes(target.size_bytes) +
           L" / シリアル末尾: " + serial_text(target) +
           L"\r\n削除対象: ディスク全体（既存パーティションを含む全内容）"
-          L"\r\n作成構成: GPT維持 / Windows・回復NTFSを縮小再構成"
-          L"\r\n一時領域: コピー先所有 / 容量超過時は未完成のまま停止"
-          L"\r\n完了状態: 全読戻し検証後もオフライン / 実機起動は未証明",
+          L"\r\n作成構成: " + style_review + L" / " +
+          (system_clone ? L"Windows・回復NTFSを縮小再構成"
+                        : L"データNTFSを縮小再構成") +
+          L"\r\nコピー元: " + source_style + L"のまま変更しない"
+          + (mbr_preserve
+                 ? (system_clone
+                        ? L"\r\n起動方式: Legacy BIOS / コピー先だけへBCDBoot /f BIOS / 実起動未証明"
+                          L"\r\n最終公開: hidden MBRで検証後、source bootstrap + fresh signature + exactly one Activeのsector0を最後に確定"
+                        : L"\r\n用途: MBRデータディスク / BCDBootなし / Activeなし"
+                          L"\r\n最終公開: hidden MBRで検証後、source bootstrap + fresh signature + Activeなしのsector0を最後に確定")
+                 : L"") +
+          L"\r\nパーティション・容量設定: " + capacity_review +
+          L" / 対象 " + selected_partition_review +
+          L"\r\n一時領域: コピー先所有 / 容量超過時は未完成のまま停止" +
+          (system_clone
+               ? L"\r\n完了状態: 全読戻し検証後もオフライン / 実機起動は未証明"
+               : L"\r\n完了状態: 全読戻し検証後もオフライン / データディスクとして接続後に読取確認が必要"),
       .token = L"OK",
-      .confirm_button_label = L"縮小移行を開始",
+      .confirm_button_label =
+          mbr_to_gpt ? L"MBR→GPT縮小移行を開始"
+                     : mbr_preserve ? L"MBR維持縮小移行を開始"
+                                    : L"縮小移行を開始",
       .font = state.body_font,
   };
   const INT_PTR dialog_result = DialogBoxParamW(
@@ -5046,12 +7162,16 @@ void start_windows_direct_shrink_clone_flow(
     return;
   }
 
+  const ytec::operationcore::OperationPlan resume_admission_plan =
+      plan.value().operation_plan();
+
   state.clone_cancel_requested.store(false);
   state.clone_completion_post_failed.store(false);
   state.clone_progress.reset();
   state.clone_elapsed = std::chrono::milliseconds::zero();
-  state.active_clone_is_rescue = false;
-  state.active_clone_is_shrink = true;
+  state.active_clone_mode =
+      ytec::windowsapp::WindowsTransferModeChoice::shrink;
+  state.active_clone_partition_style = partition_style_choice;
   state.clone_pause_controller =
       make_ui_manual_pause_controller(state.window);
   const auto pause_controller = state.clone_pause_controller;
@@ -5112,6 +7232,8 @@ void start_windows_direct_shrink_clone_flow(
               },
           },
           pause_controller),
+      .diff_area_review_callback =
+          make_vss_diff_area_review_callback(window),
       .logger = state.logger.has_value() ? &state.logger.value() : nullptr,
   };
   if (state.logger.has_value()) {
@@ -5120,6 +7242,7 @@ void start_windows_direct_shrink_clone_flow(
         std::to_wstring(source.disk_number) + L" target_disk=" +
         std::to_wstring(target.disk_number) + L" tasks=" +
         std::to_wstring(plan.value().tasks().size()) +
+        L" partition_style=" + style_review +
         L" target_owned_staging_bytes=" +
         std::to_wstring(plan.value().staging().length_bytes));
   }
@@ -5131,15 +7254,24 @@ void start_windows_direct_shrink_clone_flow(
   state.clone_thread = std::thread(
       [window,
        reviewed_plan = plan.take_value(),
+       resume_admission_plan,
+       resume_protected = protected_log_disks,
        options = std::move(options),
        target_disk_number = target.disk_number,
+       partition_style_choice,
+       source_partition_style = planned_source_partition_style,
+       target_partition_style = planned_target_partition_style,
        pause_controller,
        completion_post_failed = &state.clone_completion_post_failed,
        clone_running = &state.clone_running,
        completion_power_operation_binding]() mutable {
         auto payload = std::make_unique<ClonePayload>();
         payload->target_disk_number = target_disk_number;
-        payload->shrink_mode = true;
+        payload->mode =
+            ytec::windowsapp::WindowsTransferModeChoice::shrink;
+        payload->partition_style = partition_style_choice;
+        payload->source_partition_style = source_partition_style;
+        payload->target_partition_style = target_partition_style;
         payload->completion_power_operation_binding =
             completion_power_operation_binding;
         ThreadSleepPrevention sleep_prevention;
@@ -5151,13 +7283,20 @@ void start_windows_direct_shrink_clone_flow(
               .message = L"自動スリープを安全に防止できないため開始しません",
           };
         } else {
-          auto result = ytec::windowsapp::
-              execute_windows_direct_shrink_clone_with_windows_apis(
-                  reviewed_plan, options);
-          if (result) {
-            payload->shrink_report = result.take_value();
+          const auto admission = ytec::windowsapp::
+              guard_current_windows_operation_start(
+                  resume_admission_plan, resume_protected);
+          if (!admission) {
+            payload->error = admission.error();
           } else {
-            payload->error = result.error();
+            auto result = ytec::windowsapp::
+                execute_windows_direct_shrink_clone_with_windows_apis(
+                    reviewed_plan, options);
+            if (result) {
+              payload->shrink_report = result.take_value();
+            } else {
+              payload->error = result.error();
+            }
           }
         }
         pause_controller->mark_completed();
@@ -5231,9 +7370,15 @@ void start_online_direct_clone_flow(AppState& state) {
   }
   const auto& source = state.inventory->disks[source_index.value()];
   const auto& target = state.inventory->disks[target_index.value()];
-  if (selected_transfer_mode(state) ==
-      ytec::imageformat::TransferMode::shrink) {
-    start_windows_direct_shrink_clone_flow(state, source, target);
+  const auto transfer_mode = selected_windows_transfer_mode(state);
+  const auto partition_style = selected_windows_partition_style(state);
+  if (!transfer_mode.has_value() || !partition_style.has_value()) {
+    return;
+  }
+  if (transfer_mode.value() ==
+      ytec::windowsapp::WindowsTransferModeChoice::shrink) {
+    start_windows_direct_shrink_clone_flow(
+        state, source, target, partition_style.value());
     return;
   }
   if (!require_healthy_write_target(
@@ -5350,8 +7495,10 @@ void start_online_direct_clone_flow(AppState& state) {
   state.clone_completion_post_failed.store(false);
   state.clone_progress.reset();
   state.clone_elapsed = std::chrono::milliseconds::zero();
-  state.active_clone_is_rescue = false;
-  state.active_clone_is_shrink = false;
+  state.active_clone_mode =
+      ytec::windowsapp::WindowsTransferModeChoice::exact;
+  state.active_clone_partition_style =
+      ytec::windowsapp::WindowsPartitionStyleChoice::preserve;
   state.clone_pause_controller =
       make_ui_manual_pause_controller(state.window);
   const auto pause_controller = state.clone_pause_controller;
@@ -5414,6 +7561,8 @@ void start_online_direct_clone_flow(AppState& state) {
           },
           },
           pause_controller),
+      .diff_area_review_callback =
+          make_vss_diff_area_review_callback(window),
       .logger = state.logger.has_value() ? &state.logger.value() : nullptr,
   };
   ytec::windowsapp::OnlineDirectCloneOperationRequest operation_request{
@@ -5436,6 +7585,7 @@ void start_online_direct_clone_flow(AppState& state) {
   state.clone_thread = std::thread(
       [window,
        request = std::move(operation_request),
+       resume_protected = protected_log_disks,
        target_disk_number = target.disk_number,
        pause_controller,
        completion_power_operation_binding,
@@ -5444,6 +7594,10 @@ void start_online_direct_clone_flow(AppState& state) {
        clone_running = &state.clone_running]() {
         auto payload = std::make_unique<ClonePayload>();
         payload->target_disk_number = target_disk_number;
+        payload->mode = ytec::windowsapp::
+            WindowsTransferModeChoice::exact;
+        payload->partition_style =
+            ytec::windowsapp::WindowsPartitionStyleChoice::preserve;
         payload->completion_power_operation_binding =
             completion_power_operation_binding;
         ThreadSleepPrevention sleep_prevention;
@@ -5455,13 +7609,26 @@ void start_online_direct_clone_flow(AppState& state) {
               .message = L"自動スリープを安全に防止できないため開始しません",
           };
         } else {
-          auto result = ytec::windowsapp::
-              execute_online_direct_clone_operation_with_windows_apis(
-                  request);
-          if (result) {
-            payload->report = result.take_value();
+          auto resume_admission = ytec::windowsapp::
+              make_online_direct_clone_operation_plan(request);
+          if (!resume_admission) {
+            payload->error = resume_admission.error();
           } else {
-            payload->error = result.error();
+            const auto admission = ytec::windowsapp::
+                guard_current_windows_operation_start(
+                    resume_admission.value(), resume_protected);
+            if (!admission) {
+              payload->error = admission.error();
+            } else {
+              auto result = ytec::windowsapp::
+                  execute_online_direct_clone_operation_with_windows_apis(
+                      request);
+              if (result) {
+                payload->report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
+            }
           }
         }
         pause_controller->mark_completed();
@@ -5939,6 +8106,7 @@ void start_online_image_restore_flow(AppState& state) {
       [window,
        exact_request = std::move(exact_request),
        shrink_request = std::move(shrink_request),
+       resume_protected = protected_log_disks,
        restore_password = std::move(restore_password),
        pause_controller,
        completion_power_operation_binding,
@@ -5959,22 +8127,50 @@ void start_online_image_restore_flow(AppState& state) {
               .message = L"自動スリープを安全に防止できないため開始しません",
           };
         } else if (shrink_request.has_value()) {
-          auto result = ytec::windowsapp::
-              execute_windows_online_shrink_restore_operation_with_windows_apis(
+          auto resume_admission = ytec::windowsapp::
+              make_windows_online_shrink_restore_operation_plan(
                   shrink_request.value());
-          if (result) {
-            payload->shrink_report = result.take_value();
+          if (!resume_admission) {
+            payload->error = resume_admission.error();
           } else {
-            payload->error = result.error();
+            const auto admission = ytec::windowsapp::
+                guard_current_windows_operation_start(
+                    resume_admission.value(), resume_protected);
+            if (!admission) {
+              payload->error = admission.error();
+            } else {
+              auto result = ytec::windowsapp::
+                  execute_windows_online_shrink_restore_operation_with_windows_apis(
+                      shrink_request.value());
+              if (result) {
+                payload->shrink_report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
+            }
           }
         } else if (exact_request.has_value()) {
-          auto result = ytec::windowsapp::
-              execute_online_image_restore_operation_with_windows_apis(
+          auto resume_admission = ytec::windowsapp::
+              make_online_image_restore_operation_plan(
                   exact_request.value());
-          if (result) {
-            payload->report = result.take_value();
+          if (!resume_admission) {
+            payload->error = resume_admission.error();
           } else {
-            payload->error = result.error();
+            const auto admission = ytec::windowsapp::
+                guard_current_windows_operation_start(
+                    resume_admission.value(), resume_protected);
+            if (!admission) {
+              payload->error = admission.error();
+            } else {
+              auto result = ytec::windowsapp::
+                  execute_online_image_restore_operation_with_windows_apis(
+                      exact_request.value());
+              if (result) {
+                payload->report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
+            }
           }
         } else {
           payload->error = ytec::clonecore::Error{
@@ -5996,8 +8192,146 @@ void start_online_image_restore_flow(AppState& state) {
       });
 }
 
+struct ImagePartitionUiSelection final {
+  ytec::diskmodel::ImagePartitionSelection normalized;
+  std::vector<std::uint32_t> request_partition_numbers;
+};
+
+std::wstring format_image_partition_selection_review(
+    const ytec::diskmodel::ImagePartitionSelection& selection) {
+  if (selection.whole_disk) {
+    return L"ディスク全体（全パーティション）";
+  }
+  std::wstring text = L"Partition ";
+  for (std::size_t index = 0U;
+       index < selection.selected_partition_numbers.size(); ++index) {
+    if (index != 0U) {
+      text += L", ";
+    }
+    const auto number = selection.selected_partition_numbers[index];
+    text += L"#" + std::to_wstring(number);
+    if (std::find(
+            selection.required_partition_numbers.begin(),
+            selection.required_partition_numbers.end(),
+            number) != selection.required_partition_numbers.end()) {
+      text += L"（Windows必須）";
+    }
+  }
+  text += L" / 合計 " + format_bytes(selection.selected_bytes);
+  return text;
+}
+
+std::wstring canonical_image_partition_selection_binding(
+    const ytec::diskmodel::ImagePartitionSelection& selection) {
+  if (selection.whole_disk) {
+    return L"partitions=whole";
+  }
+  std::wstring result = L"partitions=";
+  for (std::size_t index = 0U;
+       index < selection.selected_partition_numbers.size(); ++index) {
+    if (index != 0U) {
+      result.push_back(L',');
+    }
+    result += std::to_wstring(selection.selected_partition_numbers[index]);
+  }
+  return result;
+}
+
+std::optional<ImagePartitionUiSelection>
+prompt_image_partition_selection(
+    const HWND owner,
+    const ytec::diskmodel::DiskInfo& source) {
+  const int scope = MessageBoxW(
+      owner,
+      L"イメージへ保存する範囲を選択します。\n\n"
+      L"[はい] ディスク全体（既定）\n"
+      L"[いいえ] パーティションを個別選択\n"
+      L"[キャンセル] 戻る\n\n"
+      L"Windows領域を選んだ場合、ESP／システム／MSR／必要な回復領域は自動追加され、解除できません。",
+      L"イメージ対象の選択",
+      MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1);
+  if (scope == IDCANCEL) {
+    return std::nullopt;
+  }
+
+  std::vector<std::uint32_t> requested;
+  if (scope == IDNO) {
+    auto partitions = source.partitions;
+    std::sort(
+        partitions.begin(),
+        partitions.end(),
+        [](const auto& left, const auto& right) {
+          return left.offset_bytes < right.offset_bytes;
+        });
+    for (const auto& partition : partitions) {
+      std::wstring prompt =
+          L"Partition #" + std::to_wstring(partition.number) + L" を"
+          L"イメージへ含めますか？\n\n容量: " +
+          format_bytes(partition.size_bytes);
+      if (!partition.name.empty()) {
+        prompt += L"\n名前: " + partition.name;
+      }
+      if (!partition.type.empty()) {
+        prompt += L"\n種類: " + partition.type;
+      }
+      const int selected = MessageBoxW(
+          owner,
+          prompt.c_str(),
+          L"パーティション選択",
+          MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
+      if (selected == IDCANCEL) {
+        return std::nullopt;
+      }
+      if (selected == IDYES) {
+        requested.push_back(partition.number);
+      }
+    }
+    if (requested.empty()) {
+      MessageBoxW(
+          owner,
+          L"個別選択では少なくとも1つのパーティションを選んでください。\n"
+          L"何も選ばない操作をディスク全体として解釈しません。",
+          kWindowTitle,
+          MB_OK | MB_ICONWARNING);
+      return std::nullopt;
+    }
+  }
+
+  auto normalized = ytec::diskmodel::normalize_image_partition_selection(
+      source,
+      requested);
+  if (!normalized) {
+    const std::wstring message =
+        L"パーティション選択を確定できません。\n\n" +
+        normalized.error().message;
+    MessageBoxW(
+        owner,
+        message.c_str(),
+        kWindowTitle,
+        MB_OK | MB_ICONWARNING);
+    return std::nullopt;
+  }
+  ImagePartitionUiSelection result{
+      .normalized = normalized.take_value(),
+  };
+  if (!result.normalized.whole_disk) {
+    result.request_partition_numbers =
+        result.normalized.selected_partition_numbers;
+  }
+  return result;
+}
+
 void create_online_backup_flow(AppState& state) {
   if (state.backup_running.load()) {
+    return;
+  }
+  const auto transfer_mode = selected_windows_transfer_mode(state);
+  if (!transfer_mode.has_value()) {
+    MessageBoxW(
+        state.window,
+        L"イメージ作成の動作モードを安全に識別できません。選び直してください。",
+        kWindowTitle,
+        MB_OK | MB_ICONWARNING);
     return;
   }
   const bool rescue_mode = selected_image_rescue_mode(state);
@@ -6056,10 +8390,33 @@ void create_online_backup_flow(AppState& state) {
     return;
   }
 
-  const auto transfer_mode = selected_transfer_mode(state);
   const bool shrink_mode =
       !rescue_mode &&
-      transfer_mode == ytec::imageformat::TransferMode::shrink;
+      transfer_mode.value() ==
+          ytec::windowsapp::WindowsTransferModeChoice::shrink;
+  std::optional<ImagePartitionUiSelection> partition_selection;
+  if (!rescue_mode && !shrink_mode) {
+    partition_selection = prompt_image_partition_selection(
+        state.window,
+        source);
+    if (!partition_selection.has_value()) {
+      return;
+    }
+  } else {
+    auto whole = ytec::diskmodel::normalize_image_partition_selection(
+        source,
+        std::span<const std::uint32_t>{});
+    if (!whole) {
+      show_product_error(
+          state.window,
+          L"イメージ対象を確定できません",
+          whole.error());
+      return;
+    }
+    partition_selection = ImagePartitionUiSelection{
+        .normalized = whole.take_value(),
+    };
+  }
   auto source_identity = ytec::diskmodel::make_stable_disk_identity(
       source, source.is_system_disk);
   if (!source_identity) {
@@ -6126,6 +8483,16 @@ void create_online_backup_flow(AppState& state) {
         L"EXEと同じフォルダーのdata、その配下、AppDataは保存先に使用しません。別のローカルフォルダーを選択してください。");
     return;
   }
+  auto image_output_backing =
+      identify_local_path_backing_read_only(path.data());
+  if (!image_output_backing) {
+    show_product_error(
+        state.window,
+        L"イメージ保存先の物理ディスクを識別できません",
+        image_output_backing.error(),
+        L"SingleResumeSlot admissionへ実レビュー済みoutputを拘束できないため、ファイルは作成していません。");
+    return;
+  }
   const int encryption_choice = MessageBoxW(
       state.window,
       L"この.tsumugiイメージをパスワードで暗号化しますか？\n\n暗号化にはArgon2idとAES-256-GCMを使用します。回復キーはなく、パスワードを紛失すると復元できません。",
@@ -6174,6 +8541,9 @@ void create_online_backup_flow(AppState& state) {
       (source.model.empty() ? L"モデル不明" : source.model) +
       L"\n容量: " + format_bytes(source.size_bytes) +
        L"\n形式: " + partition_style_text(source.partition_style) +
+       L"\nイメージ対象: " +
+        format_image_partition_selection_review(
+            partition_selection->normalized) +
        L"\nモード: " +
         (rescue_mode ? L"救出モード（非systemデータディスク）"
                      : shrink_mode ? L"縮小移行モード" : L"通常モード") +
@@ -6233,6 +8603,62 @@ void create_online_backup_flow(AppState& state) {
     }
     return;
   }
+
+  auto resume_operation_id = ytec::windowsapp::
+      make_windows_resume_slot_admission_operation_id_with_windows_apis();
+  if (!resume_operation_id) {
+    show_product_error(
+        state.window,
+        L"イメージ作成のSingleResumeSlot拘束を作成できません",
+        resume_operation_id.error());
+    return;
+  }
+  const std::array<std::wstring, 5U> admission_owned_fields{
+      rescue_mode ? L"windows-rescue-image-create-v1"
+                  : shrink_mode ? L"windows-shrink-image-create-v1"
+                                : L"windows-exact-image-create-v1",
+      std::wstring(path.data()),
+      verification_mode.value() ==
+              ytec::imageformat::TsumugiCreateVerificationMode::complete
+          ? L"verification=complete"
+          : L"verification=fast",
+      backup_password != nullptr ? L"encryption=enabled"
+                                 : L"encryption=disabled",
+      canonical_image_partition_selection_binding(
+          partition_selection->normalized),
+  };
+  const std::array<std::wstring_view, 5U> admission_fields{
+      admission_owned_fields[0],
+      admission_owned_fields[1],
+      admission_owned_fields[2],
+      admission_owned_fields[3],
+      admission_owned_fields[4],
+  };
+  auto resume_admission = ytec::windowsapp::
+      make_windows_resume_slot_admission_plan({
+          .operation_id = resume_operation_id.take_value(),
+          .kind = rescue_mode
+              ? ytec::operationcore::OperationKind::rescue_image
+              : ytec::operationcore::OperationKind::image_create,
+          .source = source_identity.value(),
+          .target = std::nullopt,
+          .output_backing = image_output_backing.value(),
+          .expected_work_bytes = !rescue_mode && !shrink_mode
+              ? partition_selection->normalized.selected_bytes
+              : source.size_bytes,
+          .immutable_review_fields = admission_fields,
+          .immutable_review_digests = {},
+      });
+  if (!resume_admission) {
+    show_product_error(
+        state.window,
+        L"イメージ作成のSingleResumeSlot拘束を作成できません",
+        resume_admission.error());
+    return;
+  }
+  const std::array<ytec::clonecore::StableDiskIdentity, 2U>
+      resume_protected_identities{
+          source_identity.value(), image_output_backing.take_value()};
 
   state.backup_cancel_requested.store(false);
   state.backup_progress.reset();
@@ -6316,6 +8742,8 @@ void create_online_backup_flow(AppState& state) {
       : std::nullopt;
   auto exact_request = ytec::windowsapp::OnlineImageCreateRequest{
       .selected_source = source,
+      .selected_partition_numbers =
+          partition_selection->request_partition_numbers,
       .final_path = path.data(),
       .administrator = state.elevated,
       .windows_major = version.value()[0],
@@ -6329,6 +8757,8 @@ void create_online_backup_flow(AppState& state) {
       .replace_existing = false,
       .async_wait = async_wait,
       .callbacks = callbacks,
+      .diff_area_review_callback =
+          make_vss_diff_area_review_callback(state.window),
       .logger = logger,
   };
   auto shrink_request =
@@ -6347,6 +8777,8 @@ void create_online_backup_flow(AppState& state) {
           .replace_existing = false,
           .async_wait = async_wait,
           .callbacks = callbacks,
+          .diff_area_review_callback =
+              make_vss_diff_area_review_callback(state.window),
           .logger = logger,
           .persistent_log_path = state.log_path,
           .log_is_ram_only = state.log_path.empty(),
@@ -6358,6 +8790,8 @@ void create_online_backup_flow(AppState& state) {
       [window,
        shrink_mode,
        rescue_mode,
+       resume_admission = resume_admission.take_value(),
+       resume_protected = resume_protected_identities,
        exact_request = std::move(exact_request),
        shrink_request = std::move(shrink_request),
        backup_password = std::move(backup_password),
@@ -6378,27 +8812,34 @@ void create_online_backup_flow(AppState& state) {
               .message = L"自動スリープを安全に防止できないため開始しません",
           };
         } else {
-          if (rescue_mode) {
-            auto result = ytec::windowsapp::
-                execute_windows_data_rescue_image_create_with_windows_apis(
-                    exact_request);
-            if (result) {
-              payload->rescue_report = result.take_value();
-            } else {
-              payload->error = result.error();
-            }
+          const auto admission = ytec::windowsapp::
+              guard_current_windows_operation_start(
+                  resume_admission, resume_protected);
+          if (!admission) {
+            payload->error = admission.error();
           } else {
-            auto result = shrink_mode
-                ? ytec::windowsapp::
-                      execute_windows_online_shrink_image_create_with_windows_apis(
-                          shrink_request)
-                : ytec::windowsapp::
-                      execute_online_image_create_with_windows_apis(
-                          exact_request);
-            if (result) {
-              payload->report = result.take_value();
+            if (rescue_mode) {
+              auto result = ytec::windowsapp::
+                  execute_windows_data_rescue_image_create_with_windows_apis(
+                      exact_request);
+              if (result) {
+                payload->rescue_report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
             } else {
-              payload->error = result.error();
+              auto result = shrink_mode
+                  ? ytec::windowsapp::
+                        execute_windows_online_shrink_image_create_with_windows_apis(
+                            shrink_request)
+                  : ytec::windowsapp::
+                        execute_online_image_create_with_windows_apis(
+                            exact_request);
+              if (result) {
+                payload->report = result.take_value();
+              } else {
+                payload->error = result.error();
+              }
             }
           }
         }
@@ -6507,11 +8948,23 @@ void update_action_state(AppState& state) {
       state.transfer_mode_combo,
       source_page ? SW_SHOW : SW_HIDE);
   ShowWindow(
+      state.clone_partition_style_combo,
+      clone_page ? SW_SHOW : SW_HIDE);
+  ShowWindow(
       state.image_verification_mode_combo,
       state.page == Page::create_image ? SW_SHOW : SW_HIDE);
   EnableWindow(
       state.transfer_mode_combo,
-      source_page && !state.backup_running.load() &&
+      source_page && state.transfer_mode_combo_ready &&
+              !state.backup_running.load() &&
+              !state.clone_running.load() &&
+              !state.inventory_loading.load()
+          ? TRUE
+          : FALSE);
+  EnableWindow(
+      state.clone_partition_style_combo,
+      clone_page && state.clone_partition_style_combo_ready &&
+              clone_partition_style_conversion_available(state) &&
               !state.clone_running.load() &&
               !state.inventory_loading.load()
           ? TRUE
@@ -6669,6 +9122,7 @@ void update_action_state(AppState& state) {
   std::wstring action = L"安全確認へ";
   bool enabled = false;
   if (state.page == Page::clone) {
+    const auto transfer_mode = selected_windows_transfer_mode(state);
     action = state.clone_running.load()
         ? state.clone_cancel_requested.load()
               ? L"安全な停止を待っています…"
@@ -6678,11 +9132,13 @@ void update_action_state(AppState& state) {
         ? !state.clone_cancel_requested.load() &&
               (!state.clone_progress.has_value() ||
                state.clone_progress->cancellation_allowed)
-        : (selected_clone_rescue_mode(state)
+        : transfer_mode.has_value() &&
+              (selected_clone_rescue_mode(state)
                ? current_windows_data_rescue_selection_ready(state)
                : current_clone_selection(state).ready) &&
               state.elevated;
   } else if (state.page == Page::create_image) {
+    const auto transfer_mode = selected_windows_transfer_mode(state);
     action = state.backup_running.load()
         ? state.backup_cancel_requested.load()
               ? L"安全な停止を待っています…"
@@ -6693,7 +9149,7 @@ void update_action_state(AppState& state) {
         ? !state.backup_cancel_requested.load() &&
               (!state.backup_progress.has_value() ||
                state.backup_progress->cancellation_allowed)
-        : state.elevated &&
+        : state.elevated && transfer_mode.has_value() &&
               selected_image_create_verification_mode(state).has_value() &&
               (selected_image_rescue_mode(state)
                    ? current_windows_data_rescue_image_selection_ready(state)
@@ -6812,6 +9268,7 @@ void update_action_state(AppState& state) {
         !state.media_creation_running.load() &&
         !state.inventory_loading.load() &&
         !state.manual_update_running.load() &&
+        !state.post_migration_check_running.load() &&
         !state.adk_management_running.load() &&
         !state.media_preflight_running.load() &&
         !state.media_usb_inspection_running.load() &&
@@ -6857,12 +9314,34 @@ void update_action_state(AppState& state) {
   }
   update_manual_pause_button(
       state.pause_action, pause_operation_running, pause_controller);
+  const auto clone_transfer_mode = selected_windows_transfer_mode(state);
+  const bool partition_capacity_visible =
+      state.page == Page::clone && !state.clone_running.load() &&
+      clone_transfer_mode.has_value() &&
+      *clone_transfer_mode ==
+          ytec::windowsapp::WindowsTransferModeChoice::shrink;
+  SetWindowTextW(
+      state.clone_partition_capacity_action,
+      L"パーティション・容量設定…");
+  ShowWindow(
+      state.clone_partition_capacity_action,
+      partition_capacity_visible ? SW_SHOW : SW_HIDE);
+  EnableWindow(
+      state.clone_partition_capacity_action,
+      partition_capacity_visible && state.elevated &&
+              current_clone_selection(state).ready &&
+              state.startup_data_policy.write_operations_permitted()
+          ? TRUE
+          : FALSE);
   const bool diagnostics_page = state.page == Page::diagnostics;
   ShowWindow(
       state.manual_update_action,
       diagnostics_page ? SW_SHOW : SW_HIDE);
   ShowWindow(
       state.first_run_guidance_action,
+      diagnostics_page ? SW_SHOW : SW_HIDE);
+  ShowWindow(
+      state.post_migration_check_action,
       diagnostics_page ? SW_SHOW : SW_HIDE);
   SetWindowTextW(
       state.manual_update_action,
@@ -6872,6 +9351,25 @@ void update_action_state(AppState& state) {
   EnableWindow(
       state.manual_update_action,
       diagnostics_page && !state.manual_update_running.load() &&
+              !state.post_migration_check_running.load() &&
+              !state.adk_management_running.load() &&
+              !state.support_zip_planning.load() &&
+              !state.support_zip_creation_running.load()
+          ? TRUE
+          : FALSE);
+  SetWindowTextW(
+      state.post_migration_check_action,
+      state.post_migration_check_running.load()
+          ? L"換装後チェック中…"
+          : L"換装後チェック");
+  EnableWindow(
+      state.post_migration_check_action,
+      diagnostics_page && !state.post_migration_check_running.load() &&
+              !state.manual_update_running.load() &&
+              !state.clone_running.load() && !state.backup_running.load() &&
+              !state.restore_running.load() &&
+              !state.media_creation_running.load() &&
+              !state.inventory_loading.load() &&
               !state.adk_management_running.load() &&
               !state.support_zip_planning.load() &&
               !state.support_zip_creation_running.load()
@@ -6883,6 +9381,7 @@ void update_action_state(AppState& state) {
   EnableWindow(
       state.first_run_guidance_action,
       diagnostics_page && !state.support_zip_planning.load() &&
+              !state.post_migration_check_running.load() &&
               !state.adk_management_running.load() &&
               !state.support_zip_creation_running.load()
           ? TRUE
@@ -6890,6 +9389,7 @@ void update_action_state(AppState& state) {
   EnableWindow(
       state.refresh,
       !state.inventory_loading.load() &&
+              !state.post_migration_check_running.load() &&
               !state.adk_management_running.load() &&
               !state.media_usb_inspection_running.load() &&
               !state.support_zip_planning.load() &&
@@ -6902,6 +9402,10 @@ void populate_disk_combos(AppState& state) {
   SendMessageW(state.source_combo, CB_RESETCONTENT, 0, 0);
   SendMessageW(state.target_combo, CB_RESETCONTENT, 0, 0);
   if (!state.inventory.has_value()) {
+    if (state.page == Page::clone) {
+      static_cast<void>(
+          synchronize_clone_partition_style_choice(state));
+    }
     update_action_state(state);
     return;
   }
@@ -6961,10 +9465,16 @@ void populate_disk_combos(AppState& state) {
           ytec::windowsapp::RescueMediaKind::usb_drive) {
     select_default_media_usb_target(state);
   }
+  if (state.page == Page::clone) {
+    static_cast<void>(synchronize_clone_partition_style_choice(state));
+  }
   update_action_state(state);
 }
 
 void start_inventory(AppState& state) {
+  if (!state.clone_running.load()) {
+    state.clone_partition_capacity_choice.reset();
+  }
 #if defined(YTEC_UI_ACCEPTANCE_BUILD)
   state.inventory.reset();
   state.inventory_error =
@@ -7092,9 +9602,9 @@ void paint_header(const AppState& state, HDC dc, const RECT& client) {
       state.page == Page::clone || state.page == Page::create_image;
   const auto image_options =
       ytec::windowsapp::calculate_image_create_option_layout(client.right);
-  const int lead_right = state.page == Page::create_image
+  const int lead_right = shows_transfer_mode
       ? image_options.verification_control.left - 10
-      : shows_transfer_mode ? client.right - 322 : client.right - 36;
+      : client.right - 36;
   RECT lead{
       286,
       68,
@@ -7626,16 +10136,34 @@ void paint_online_backup_progress(
 void paint_clone_safety(
     const AppState& state,
     HDC dc,
-    const RECT& client) {
+  const RECT& client) {
   const auto selection = current_clone_selection(state);
-  const bool rescue = state.clone_running.load()
-      ? state.active_clone_is_rescue
-      : selected_clone_rescue_mode(state);
-  const bool shrink = state.clone_running.load()
-      ? state.active_clone_is_shrink
-      : !rescue &&
-      selected_transfer_mode(state) ==
-          ytec::imageformat::TransferMode::shrink;
+  const auto mode = state.clone_running.load()
+      ? state.active_clone_mode
+      : selected_windows_transfer_mode(state);
+  const bool rescue = mode.has_value() &&
+      mode.value() == ytec::windowsapp::WindowsTransferModeChoice::rescue;
+  const bool shrink = mode.has_value() &&
+      mode.value() == ytec::windowsapp::WindowsTransferModeChoice::shrink;
+  const auto partition_style = state.clone_running.load()
+      ? state.active_clone_partition_style
+      : selected_windows_partition_style(state);
+  const bool mbr_to_gpt =
+      partition_style.has_value() &&
+      partition_style.value() ==
+          ytec::windowsapp::WindowsPartitionStyleChoice::mbr_to_gpt;
+  const auto* progress_source = selected_clone_source_disk(state);
+  const bool mbr_preserve =
+      partition_style.has_value() &&
+      partition_style.value() ==
+          ytec::windowsapp::WindowsPartitionStyleChoice::preserve &&
+      progress_source != nullptr &&
+      ytec::diskmodel::normalize_disk_partition_style(
+          progress_source->partition_style,
+          progress_source->partitions.size()) ==
+          ytec::diskmodel::PartitionStyle::mbr;
+  const bool mbr_system_source =
+      mbr_preserve && progress_source->is_system_disk;
   RECT area{
       306,
       client.bottom - 78,
@@ -7644,20 +10172,54 @@ void paint_clone_safety(
   const std::wstring text = state.clone_running.load()
       ? state.clone_cancel_requested.load()
             ? L"● 安全なチャンク境界で停止し、コピー先をオフラインに保護します。"
-            : rescue
-                  ? L"● 救出RAWを読取り中。失敗範囲は有限再試行し、残る欠損をゼロ埋めmapへ記録します。"
-                  : shrink
-                        ? L"● VSSから一時WIMへ縮小再構成中。失敗時はコピー先を未完成・オフラインに保護します。"
-                        : L"● VSS Snapshotから読み取り中。コピー元にはアプリから書き込みません。"
+             : rescue
+                    ? L"● 救出RAWを読取り中。失敗範囲は有限再試行し、残る欠損をゼロ埋めmapへ記録します。"
+                    : shrink
+                          ? mbr_to_gpt
+                                ? L"● VSSからコピー先だけをtarget-only GPTへ縮小再構成中。失敗時は未完成・オフラインに保護します。"
+                                : mbr_preserve
+                                      ? (mbr_system_source
+                                             ? L"● MBR形式/Legacy BIOSを維持し、コピー先だけをtarget-only再構成中。Active付きsector0は最後まで公開せず、実起動は未証明です。"
+                                             : L"● MBRデータ形式を維持し、コピー先だけをtarget-only再構成中。Activeなしの最終sector0は最後まで公開しません。")
+                                      : L"● VSSから一時WIMへ縮小再構成中。失敗時はコピー先を未完成・オフラインに保護します。"
+                          : L"● VSS Snapshotから読み取り中。コピー元にはアプリから書き込みません。"
       : L"● " +
             (rescue
-                 ? current_windows_data_rescue_selection_message(state)
-                 : shrink && selection.ready
-                       ? L"縮小計画を読取り専用で作成します。一時WIMがコピー先の専用領域に収まらない場合は安全に中止します。"
-                       : selection.message);
+                  ? current_windows_data_rescue_selection_message(state)
+                  : mbr_to_gpt && selection.ready
+                        ? L"コピー元を変更せず、全区画mappingからコピー先だけをGPTへ再構成するtarget-only計画を作成します。"
+                  : mbr_preserve && selection.ready
+                        ? (mbr_system_source
+                               ? L"MBR形式/Legacy BIOSを維持し、コピー元を変更せず、コピー先だけへhidden MBR→sector0-lastで再構成します。実起動は証明しません。"
+                               : L"MBRデータ形式を維持し、コピー元を変更せず、コピー先だけへhidden MBR→Activeなしsector0-lastで再構成します。")
+                  : shrink && selection.ready
+                        ? L"縮小計画を読取り専用で作成します。一時WIMがコピー先の専用領域に収まらない場合は安全に中止します。"
+                        : selection.message);
   const bool ready = rescue
       ? current_windows_data_rescue_selection_ready(state)
       : selection.ready;
+  if (!state.clone_running.load() && shrink) {
+    const std::wstring capacity_summary =
+        state.clone_partition_capacity_choice.has_value()
+        ? L"パーティション・容量: " +
+            clone_partition_capacity_decision_summary(
+                state.clone_partition_capacity_choice->decision)
+        : L"パーティション・容量: 未設定（開始前に確認します）";
+    RECT capacity_area{
+        306,
+        client.bottom - 104,
+        client.right - 270,
+        client.bottom - 80};
+    draw_text(
+        dc,
+        capacity_summary,
+        capacity_area,
+        state.clone_partition_capacity_choice.has_value()
+            ? kTsumugiBlue
+            : kWarning,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        state.small_font);
+  }
   draw_text(
       dc,
       text,
@@ -8088,6 +10650,12 @@ void paint_non_clone_page(
   const auto selected_create_verification =
       selected_image_create_verification_mode(state).value_or(
           ytec::imageformat::TsumugiCreateVerificationMode::complete);
+  const auto selected_image_transfer_mode =
+      selected_windows_transfer_mode(state);
+  const bool selected_image_shrink =
+      selected_image_transfer_mode.has_value() &&
+      selected_image_transfer_mode.value() ==
+          ytec::windowsapp::WindowsTransferModeChoice::shrink;
   switch (state.page) {
     case Page::create_image:
       title = L"オンライン・イメージバックアップ";
@@ -8101,11 +10669,12 @@ void paint_non_clone_page(
             : L"\n\n高速検証: 完成前の追加全走査だけを省略します。";
         body += L"\n\n完了結果が表示されるまで、このアプリを終了しないでください。";
       } else {
-        body = selected_image_rescue_mode(state)
+        body = !selected_image_transfer_mode.has_value()
+            ? L"動作モードを安全に識別できません。画面を切り替えてから選び直してください。"
+            : selected_image_rescue_mode(state)
             ? current_windows_data_rescue_image_selection_message(state) +
                   L"\n\n稼働中Windowsのシステムディスクは対象外です。欠損ゼロでも結果分類は救出のままです。"
-            : selected_transfer_mode(state) ==
-                ytec::imageformat::TransferMode::shrink
+            : selected_image_shrink
             ? L"NTFS領域を同一VSS Snapshot SetからWIMへ取り込み、静的システム領域をexact RAWで保持する単一 .tsumugi を作成します。\n\n現在のWindows直接縮小作成は、BitLocker・exFAT・FAT32の内容領域を開始前に拒否します。縮小復元は安全なオフライン配置Adapterの完成まで停止します。"
             : L"VSSで整合したSnapshotを作成し、保存先の空き容量と同一ディスク誤指定を確認してから単一 .tsumugi を作成します。\n\nWindowsディスクとNTFSデータ専用ディスクに対応し、アプリはコピー元へ直接書き込まず、既存ファイルも上書きしません。";
         body += L"\n\n現在の作成後検証: " +
@@ -8332,6 +10901,18 @@ void paint_non_clone_page(
             L"）";
       }
       body +=
+          L"\n\n「換装後チェック」は、換装後にこのWindowsで起動した状態を"
+          L"読取り専用で確認します。起動ディスク構成、BCD、WinRE、"
+          L"BitLocker、ファイルシステム、SMART／NVMe状態を確認しますが、"
+          L"換装前の起動成功を遡って保証するものではありません。";
+      if (state.post_migration_check_running.load()) {
+        body += L"\n換装後チェック状態: 読取り専用で確認中…";
+      } else if (state.post_migration_check_report.has_value()) {
+        body += L"\n換装後チェック状態: 完了（詳細は完了時の結果画面を参照）";
+      } else if (!state.post_migration_check_error.empty()) {
+        body += L"\n換装後チェック状態: 確認失敗（詳細は再試行時の画面に表示）";
+      }
+      body +=
           L"\n\n更新確認は自動実行しません。「更新を確認」を押した場合だけ、"
           L"固定Y-TEC HTTPSへ16KiB以下の更新情報を問い合わせます。"
           L"更新ファイルの自動ダウンロードや自動実行は行いません。";
@@ -8350,7 +10931,7 @@ void paint_non_clone_page(
             body += L"現在の版が最新";
             break;
           case ytec::windowsapp::ManualUpdateDisposition::local_version_newer:
-            body += L"この内部候補は公開情報より新しい版";
+            body += L"この公開前検証候補は公開情報より新しい版";
             break;
         }
       } else if (!state.manual_update_error.empty()) {
@@ -8389,6 +10970,13 @@ void paint_non_clone_page(
     }
     body +=
         L"\n更新確認: 利用者が押した時だけ固定Y-TEC HTTPSへ接続";
+    body += state.post_migration_check_running.load()
+        ? L"\n換装後チェック: 読取り専用で確認中…"
+        : state.post_migration_check_report.has_value()
+              ? L"\n換装後チェック: 完了（換装前の起動成功は保証しません）"
+              : !state.post_migration_check_error.empty()
+                    ? L"\n換装後チェック: 確認失敗"
+                    : L"\n換装後チェック: 未実施（換装前の起動成功は保証しません）";
   } else if (compact_height && state.page == Page::boot_repair) {
     for (std::size_t separator = body.find(L"\n\n");
          separator != std::wstring::npos;
@@ -8730,6 +11318,20 @@ LRESULT CALLBACK window_proc(
               static_cast<INT_PTR>(kTransferModeComboId)),
           nullptr,
           nullptr);
+      state->clone_partition_style_combo = CreateWindowExW(
+          WS_EX_CLIENTEDGE,
+          WC_COMBOBOXW,
+          L"",
+          WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+          0,
+          0,
+          0,
+          0,
+          window,
+          reinterpret_cast<HMENU>(
+              static_cast<INT_PTR>(kClonePartitionStyleComboId)),
+          nullptr,
+          nullptr);
       state->image_verification_mode_combo = CreateWindowExW(
           WS_EX_CLIENTEDGE,
           WC_COMBOBOXW,
@@ -8913,6 +11515,20 @@ LRESULT CALLBACK window_proc(
               static_cast<INT_PTR>(kPauseActionId)),
           nullptr,
           nullptr);
+      state->clone_partition_capacity_action = CreateWindowExW(
+          0,
+          L"BUTTON",
+          L"パーティション・容量設定…",
+          WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+          0,
+          0,
+          0,
+          0,
+          window,
+          reinterpret_cast<HMENU>(
+              static_cast<INT_PTR>(kClonePartitionCapacityActionId)),
+          nullptr,
+          nullptr);
       state->manual_update_action = CreateWindowExW(
           0,
           L"BUTTON",
@@ -8925,6 +11541,20 @@ LRESULT CALLBACK window_proc(
           window,
           reinterpret_cast<HMENU>(
               static_cast<INT_PTR>(kManualUpdateActionId)),
+          nullptr,
+          nullptr);
+      state->post_migration_check_action = CreateWindowExW(
+          0,
+          L"BUTTON",
+          L"換装後チェック",
+          WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+          0,
+          0,
+          0,
+          0,
+          window,
+          reinterpret_cast<HMENU>(
+              static_cast<INT_PTR>(kPostMigrationCheckActionId)),
           nullptr,
           nullptr);
       state->first_run_guidance_action = CreateWindowExW(
@@ -8942,6 +11572,7 @@ LRESULT CALLBACK window_proc(
           nullptr,
           nullptr);
       if (state->transfer_mode_combo == nullptr ||
+          state->clone_partition_style_combo == nullptr ||
           state->image_verification_mode_combo == nullptr ||
           state->restore_source_partition_combo == nullptr ||
           state->restore_target_partition_combo == nullptr ||
@@ -8952,23 +11583,18 @@ LRESULT CALLBACK window_proc(
           state->media_output_edit == nullptr ||
           state->media_browse == nullptr ||
           state->pause_action == nullptr ||
+          state->clone_partition_capacity_action == nullptr ||
           state->manual_update_action == nullptr ||
+          state->post_migration_check_action == nullptr ||
           state->first_run_guidance_action == nullptr) {
         return -1;
       }
-      constexpr std::array<std::wstring_view, 3> transfer_modes{
-          L"通常モード（完全複製）",
-          L"縮小移行モード（小容量へ）",
-          L"救出モード（データディスク）",
-      };
-      for (const auto label : transfer_modes) {
-        SendMessageW(
-            state->transfer_mode_combo,
-            CB_ADDSTRING,
-            0,
-            reinterpret_cast<LPARAM>(label.data()));
+      if (!populate_transfer_mode_combo_for_page(*state)) {
+        return -1;
       }
-      SendMessageW(state->transfer_mode_combo, CB_SETCURSEL, 0, 0);
+      if (!populate_clone_partition_style_combo(*state)) {
+        return -1;
+      }
       constexpr std::array<std::wstring_view, 2>
           image_verification_modes{
               L"検証: 完全（推奨）",
@@ -9057,6 +11683,8 @@ LRESULT CALLBACK window_proc(
       set_control_font(state->target_combo, state->small_font);
       set_control_font(state->transfer_mode_combo, state->small_font);
       set_control_font(
+          state->clone_partition_style_combo, state->small_font);
+      set_control_font(
           state->image_verification_mode_combo, state->small_font);
       set_control_font(
           state->restore_source_partition_combo, state->small_font);
@@ -9072,7 +11700,11 @@ LRESULT CALLBACK window_proc(
       set_control_font(state->media_browse, state->small_font);
       set_control_font(state->primary_action, state->body_font);
       set_control_font(state->pause_action, state->body_font);
+      set_control_font(
+          state->clone_partition_capacity_action, state->body_font);
       set_control_font(state->manual_update_action, state->body_font);
+      set_control_font(
+          state->post_migration_check_action, state->body_font);
       set_control_font(
           state->first_run_guidance_action, state->body_font);
       layout_controls(*state);
@@ -9155,8 +11787,43 @@ LRESULT CALLBACK window_proc(
                 MB_OK | MB_ICONINFORMATION);
             return 0;
           }
+          if (state->post_migration_check_running.load()) {
+            MessageBoxW(
+                window,
+                L"換装後の読取り専用チェックが完了するまで、この画面で結果を確認してください。",
+                L"換装後チェック中です",
+                MB_OK | MB_ICONINFORMATION);
+            return 0;
+          }
+          const auto previous_transfer_context =
+              transfer_mode_context(state->page);
+          const auto previous_transfer_mode =
+              selected_windows_transfer_mode(*state);
+          if (previous_transfer_context.has_value() &&
+              previous_transfer_mode.has_value()) {
+            remember_transfer_mode(
+                *state,
+                previous_transfer_context.value(),
+                previous_transfer_mode.value());
+          }
           state->page =
               static_cast<Page>(identifier - kNavFirstId);
+          if (transfer_mode_context(state->page).has_value() &&
+              !populate_transfer_mode_combo_for_page(*state)) {
+            MessageBoxW(
+                window,
+                L"動作モード一覧を安全に構成できませんでした。処理は開始できません。",
+                kWindowTitle,
+                MB_OK | MB_ICONERROR);
+          }
+          if (state->page == Page::clone &&
+              !populate_clone_partition_style_combo(*state)) {
+            MessageBoxW(
+                window,
+                L"パーティション形式一覧を安全に構成できませんでした。処理は開始できません。",
+                kWindowTitle,
+                MB_OK | MB_ICONERROR);
+          }
           if (state->page == Page::restore_image &&
               state->restore_preflight.has_value()) {
             select_default_restore_target(*state);
@@ -9167,6 +11834,7 @@ LRESULT CALLBACK window_proc(
             select_default_media_usb_target(*state);
           }
           update_navigation_state(*state);
+          layout_controls(*state);
           update_action_state(*state);
           InvalidateRect(window, nullptr, TRUE);
           SetFocus(state->navigation[
@@ -9189,10 +11857,45 @@ LRESULT CALLBACK window_proc(
           start_manual_update_check(*state);
           return 0;
         }
+        if (identifier == kPostMigrationCheckActionId &&
+            state->page == Page::diagnostics) {
+          start_post_migration_check(*state);
+          return 0;
+        }
         if (identifier == kFirstRunGuidanceActionId &&
             state->page == Page::diagnostics) {
           static_cast<void>(
               show_first_run_guidance_dialog(*state, false));
+          return 0;
+        }
+        if (identifier == kClonePartitionCapacityActionId &&
+            state->page == Page::clone &&
+            !state->clone_running.load()) {
+          const auto source_index = combo_selection(state->source_combo);
+          const auto target_index = combo_selection(state->target_combo);
+          const auto transfer_mode = selected_windows_transfer_mode(*state);
+          const auto partition_style =
+              selected_windows_partition_style(*state);
+          if (!state->inventory.has_value() || !source_index.has_value() ||
+              !target_index.has_value() || !transfer_mode.has_value() ||
+              !partition_style.has_value() ||
+              *transfer_mode !=
+                  ytec::windowsapp::WindowsTransferModeChoice::shrink ||
+              *source_index >= state->inventory->disks.size() ||
+              *target_index >= state->inventory->disks.size() ||
+              !current_clone_selection(*state).ready) {
+            MessageBoxW(
+                window,
+                L"縮小移行に対応するコピー元・コピー先・形式を先に選択してください。",
+                L"パーティション・容量設定を開けません",
+                MB_OK | MB_ICONINFORMATION);
+            return 0;
+          }
+          static_cast<void>(review_clone_partition_capacity_settings(
+              *state,
+              state->inventory->disks[*source_index],
+              state->inventory->disks[*target_index],
+              *partition_style));
           return 0;
         }
         if (identifier == kPauseActionId) {
@@ -9230,9 +11933,16 @@ LRESULT CALLBACK window_proc(
           if (state->clone_running.load()) {
             if (!state->clone_cancel_requested.exchange(true)) {
               if (state->logger.has_value()) {
+                const auto active_mode = state->active_clone_mode.value_or(
+                    ytec::windowsapp::WindowsTransferModeChoice::
+                        exact);
                 state->logger->info(
-                    state->active_clone_is_rescue
+                    active_mode ==
+                            ytec::windowsapp::WindowsTransferModeChoice::rescue
                         ? L"Windowsデータ救出の安全な取消を要求"
+                        : active_mode == ytec::windowsapp::
+                              WindowsTransferModeChoice::shrink
+                        ? L"Windows直接縮小クローンの安全な取消を要求"
                         : L"Windows直接クローンの安全な取消を要求");
               }
               if (state->clone_pause_controller != nullptr) {
@@ -9372,11 +12082,39 @@ LRESULT CALLBACK window_proc(
       if ((LOWORD(wparam) == kSourceComboId ||
            LOWORD(wparam) == kTargetComboId ||
            LOWORD(wparam) == kTransferModeComboId ||
+           LOWORD(wparam) == kClonePartitionStyleComboId ||
            LOWORD(wparam) == kImageVerificationModeComboId ||
            LOWORD(wparam) == kRestoreSourcePartitionComboId ||
            LOWORD(wparam) == kRestoreTargetPartitionComboId) &&
           HIWORD(wparam) == CBN_SELCHANGE) {
-        if (state->page == Page::restore_image &&
+        if (state->page == Page::clone &&
+            (LOWORD(wparam) == kSourceComboId ||
+             LOWORD(wparam) == kTargetComboId ||
+             LOWORD(wparam) == kTransferModeComboId ||
+             LOWORD(wparam) == kClonePartitionStyleComboId)) {
+          state->clone_partition_capacity_choice.reset();
+        }
+        if (LOWORD(wparam) == kTransferModeComboId) {
+          const auto context = transfer_mode_context(state->page);
+          const auto choice = selected_windows_transfer_mode(*state);
+          if (context.has_value() && choice.has_value()) {
+            remember_transfer_mode(
+                *state, context.value(), choice.value());
+          } else {
+            state->transfer_mode_combo_ready = false;
+          }
+          if (state->page == Page::clone) {
+            static_cast<void>(
+                synchronize_clone_partition_style_choice(*state));
+          }
+        } else if (LOWORD(wparam) == kClonePartitionStyleComboId) {
+          const auto choice = selected_windows_partition_style(*state);
+          if (choice.has_value()) {
+            state->clone_partition_style = choice.value();
+          } else {
+            state->clone_partition_style_combo_ready = false;
+          }
+        } else if (state->page == Page::restore_image &&
             LOWORD(wparam) == kRestoreSourcePartitionComboId) {
           select_default_restore_target(*state);
         } else if (
@@ -9387,6 +12125,11 @@ LRESULT CALLBACK window_proc(
             state->page == Page::rescue_media &&
             LOWORD(wparam) == kTargetComboId) {
           start_rescue_usb_inspection(*state);
+        }
+        if (state->page == Page::clone &&
+            LOWORD(wparam) == kSourceComboId) {
+          static_cast<void>(
+              synchronize_clone_partition_style_choice(*state));
         }
         update_action_state(*state);
         InvalidateRect(window, nullptr, FALSE);
@@ -9446,6 +12189,7 @@ LRESULT CALLBACK window_proc(
           state->inventory_thread.join();
         }
         state->inventory = std::move(payload->report);
+        state->clone_partition_capacity_choice.reset();
         state->inventory_error = std::move(payload->error);
         EnableWindow(state->refresh, TRUE);
         populate_disk_combos(*state);
@@ -9588,14 +12332,54 @@ LRESULT CALLBACK window_proc(
           } else {
             MessageBoxW(
                 window,
-                (L"この内部候補 " + widen_ascii(report.current_version) +
+                (L"この公開前検証候補 " + widen_ascii(report.current_version) +
                  L" は、公開されている版 " +
                  widen_ascii(report.manifest.latest_version) +
                  L" より新しいため、更新は行いません。")
                     .c_str(),
-                L"内部候補を使用中です",
+                L"公開前検証候補を使用中です",
                 MB_OK | MB_ICONINFORMATION);
           }
+        }
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, TRUE);
+      }
+      return 0;
+    }
+    case kPostMigrationCheckCompleteMessage: {
+      std::unique_ptr<PostMigrationCheckPayload> payload(
+          reinterpret_cast<PostMigrationCheckPayload*>(lparam));
+      if (state != nullptr) {
+        state->post_migration_check_running.store(false);
+        if (state->post_migration_check_thread.joinable()) {
+          state->post_migration_check_thread.join();
+        }
+        state->post_migration_check_report = std::move(payload->report);
+        state->post_migration_check_error.clear();
+        if (payload->error.has_value()) {
+          state->post_migration_check_error =
+              format_error_message(payload->error.value());
+          log_error_summary(
+              state->logger,
+              L"換装後読取り専用チェックに失敗",
+              payload->error.value());
+          show_product_error(
+              window,
+              L"換装後チェックを完了できませんでした",
+              payload->error.value());
+        } else if (state->post_migration_check_report.has_value()) {
+          const auto& report = state->post_migration_check_report.value();
+          if (state->logger.has_value()) {
+            state->logger->info(
+                L"換装後読取り専用チェック完了 disk=" +
+                std::to_wstring(report.current_boot_disk.disk_number));
+          }
+          MessageBoxW(
+              window,
+              ytec::windowsapp::format_post_migration_check_report(report)
+                  .c_str(),
+              L"換装後チェック結果",
+              MB_OK | MB_ICONINFORMATION);
         }
         update_action_state(*state);
         InvalidateRect(window, nullptr, TRUE);
@@ -9742,10 +12526,14 @@ LRESULT CALLBACK window_proc(
           state->clone_thread.join();
         }
         state->clone_pause_controller.reset();
-        const bool rescue_completion = payload->rescue_mode;
-        const bool shrink_completion = payload->shrink_mode;
-        state->active_clone_is_rescue = false;
-        state->active_clone_is_shrink = false;
+        const bool rescue_completion =
+            payload->mode ==
+            ytec::windowsapp::WindowsTransferModeChoice::rescue;
+        const bool shrink_completion =
+            payload->mode ==
+            ytec::windowsapp::WindowsTransferModeChoice::shrink;
+        state->active_clone_mode.reset();
+        state->active_clone_partition_style.reset();
         update_action_state(*state);
         InvalidateRect(window, nullptr, TRUE);
         bool completion_power_requested = false;
@@ -9815,7 +12603,7 @@ LRESULT CALLBACK window_proc(
                     ? L"救出コピーを安全に取り消しました"
                     : L"救出コピーを完了できませんでした",
                 rescue_error.value(),
-                L"コピー先はオフラインへ再保護しましたが、ディスクの管理でも状態を確認してください。救出結果は完成扱いにせず、コピー先を使用しないでください。");
+                L"コピー先がオフラインであることを証明できていません。ディスクの管理でオフラインを確認できるまで、救出結果を完成扱いにせずコピー先を使用しないでください。");
           }
           start_inventory(*state);
           return 0;
@@ -9826,33 +12614,73 @@ LRESULT CALLBACK window_proc(
           const ytec::windowsapp::
               WindowsDirectShrinkCloneExecutionReport* shrink_report =
               nullptr;
+          std::optional<ytec::windowsapp::WindowsCompletionPowerProof>
+              completion_proof;
           if (payload->shrink_report.has_value()) {
             const auto& operation_report = payload->shrink_report.value();
             if (operation_report.lifecycle.outcome ==
                     ytec::operationcore::OperationOutcome::completed &&
                 operation_report.execution.has_value()) {
-              const auto& execution = operation_report.execution.value();
-              if (execution.target_left_offline &&
-                  execution.workflow.backup_completed &&
-                  execution.workflow.snapshots_deleted &&
-                  execution.every_payload_captured_and_applied_inside_snapshot_callback &&
-                  execution.snapshots_deleted_before_final_layout_commit &&
-                  execution.final_commit.every_write_flushed &&
-                  execution.final_commit.every_write_read_back &&
-                  execution.final_commit.primary_layout_committed_last &&
-                  execution.final_commit.target_offline &&
-                  (!execution.boot.required ||
-                   (execution.boot.completed &&
-                    execution.boot.boot_files_read_back_verified &&
-                    execution.boot.recovery_configuration_verified &&
-                    execution.boot.target_offline))) {
-                shrink_report = &execution;
+              const auto proof = ytec::windowsapp::
+                  make_direct_shrink_clone_completion_power_proof(
+                      operation_report,
+                      payload->sleep_prevention_release,
+                      payload->completion_power_operation_binding);
+              const bool mbr_to_gpt =
+                  payload->partition_style == ytec::windowsapp::
+                      WindowsPartitionStyleChoice::mbr_to_gpt;
+              const auto& final_commit =
+                  operation_report.execution->final_commit;
+              const bool mbr_preserve =
+                  payload->partition_style == ytec::windowsapp::
+                      WindowsPartitionStyleChoice::preserve &&
+                  payload->source_partition_style ==
+                      ytec::migrationcore::MigrationPartitionStyle::mbr &&
+                  payload->target_partition_style ==
+                      ytec::migrationcore::MigrationPartitionStyle::mbr;
+              const bool requested_style_consistent = mbr_to_gpt
+                  ? payload->source_partition_style ==
+                            ytec::migrationcore::MigrationPartitionStyle::mbr &&
+                        payload->target_partition_style ==
+                            ytec::migrationcore::MigrationPartitionStyle::gpt
+                  : payload->partition_style == ytec::windowsapp::
+                            WindowsPartitionStyleChoice::preserve &&
+                        payload->source_partition_style ==
+                            payload->target_partition_style;
+              const bool final_style_proof =
+                  final_commit.final_partition_style ==
+                      payload->target_partition_style &&
+                  (mbr_preserve
+                       ? final_commit.source_mbr_sector0_unchanged &&
+                             final_commit.source_mbr_bootstrap_unchanged &&
+                             final_commit.target_mbr_signature_collision_free &&
+                             final_commit.final_mbr_sector0_read_back_verified &&
+                             final_commit.final_mbr_disk_signature != 0U &&
+                             final_commit.final_mbr_active_partition_count ==
+                                 (operation_report.execution->boot.required
+                                      ? 1U
+                                      : 0U)
+                       : !final_commit.source_mbr_sector0_unchanged &&
+                             !final_commit.source_mbr_bootstrap_unchanged &&
+                             !final_commit.target_mbr_signature_collision_free &&
+                             !final_commit.final_mbr_sector0_read_back_verified &&
+                             final_commit.final_mbr_disk_signature == 0U &&
+                             final_commit.final_mbr_active_partition_count ==
+                                 0U);
+              const bool style_evidence_consistent =
+                  requested_style_consistent && final_style_proof;
+              if (style_evidence_consistent &&
+                  ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+                      .prompt_allowed) {
+                shrink_report = &operation_report.execution.value();
+                completion_proof = proof;
               } else {
                 shrink_error = ytec::clonecore::Error{
                     .code = ytec::clonecore::ErrorCode::verification_failed,
                     .native_code = ERROR_CRC,
-                    .operation = L"Windows直接縮小クローン完了証跡",
-                    .message = L"Snapshot削除、最終GPT、起動情報、読戻し、またはオフライン証跡が不足しています",
+                    .operation = L"Windows直接縮小クローン製品完了証跡",
+                    .message =
+                        L"コピー元再識別・構成不変、形式、Snapshot削除、最終layout、起動情報、全読戻し、オフライン、自動スリープ解除、または操作bindingの証跡が不足しています",
                 };
               }
             } else if (operation_report.lifecycle.error.has_value()) {
@@ -9866,7 +12694,21 @@ LRESULT CALLBACK window_proc(
               };
             }
           }
-          if (shrink_report != nullptr) {
+          if (shrink_report != nullptr && completion_proof.has_value()) {
+            const bool mbr_to_gpt =
+                payload->partition_style == ytec::windowsapp::
+                    WindowsPartitionStyleChoice::mbr_to_gpt;
+            const bool mbr_preserve =
+                payload->partition_style == ytec::windowsapp::
+                    WindowsPartitionStyleChoice::preserve &&
+                payload->target_partition_style ==
+                    ytec::migrationcore::MigrationPartitionStyle::mbr;
+            const bool checkpoint_cleanup_pending =
+                shrink_report->final_commit.checkpoint_retirement_pending;
+            const bool system_clone = shrink_report->boot.required;
+            const std::wstring target_style(
+                migration_partition_style_text(
+                    payload->target_partition_style));
             if (state->logger.has_value()) {
               state->logger->info(
                   L"Windows直接縮小クローン検証完了 target_disk=" +
@@ -9879,10 +12721,24 @@ LRESULT CALLBACK window_proc(
                   std::to_wstring(
                       shrink_report->final_commit.
                           extended_ntfs_partition_count) +
+                  L" source_reidentified=true source_layout_unchanged=true" +
+                  L" partition_style=" + target_style +
+                  L" checkpoint_cleanup_pending=" +
+                  (checkpoint_cleanup_pending ? L"true" : L"false") +
                   L" target_offline=true");
             }
             const std::wstring completion =
-                L"縮小移行、各WIM適用・読戻し、Snapshot削除後の最終GPT公開" +
+                std::wstring(
+                    mbr_to_gpt
+                        ? L"target-only GPT再構成、各WIM適用・読戻し、コピー元再識別・構成不変確認、Snapshot削除後の最終GPT公開"
+                        : mbr_preserve
+                              ? system_clone
+                                    ? L"MBR形式/Legacy BIOS維持、target-only再構成、raw source MBR不変・fresh署名非衝突確認、hidden MBR後のsector0-last公開"
+                                    : L"MBR形式維持データ再構成、raw source MBR不変・fresh署名非衝突確認、hidden MBR後のsector0-last公開"
+                              : L"縮小移行、各WIM適用・読戻し、コピー元再識別・構成不変確認、Snapshot削除後の最終") +
+                (mbr_to_gpt || mbr_preserve
+                     ? std::wstring()
+                     : target_style + L"公開") +
                 std::wstring(
                     shrink_report->boot.required
                         ? L"、起動情報と回復環境の再構築"
@@ -9897,21 +12753,47 @@ LRESULT CALLBACK window_proc(
                 std::to_wstring(
                     shrink_report->final_commit.
                         extended_ntfs_partition_count) +
-                L" 領域\n状態: 検証完了・換装待ち（オフライン）"
-                L"\n\n実機での起動成功を確認した表示ではありません。"
-                L"アプリを終了し、換装後に起動確認を行ってください。";
+                L" 領域\nコピー元: 再識別済み・構成不変" +
+                std::wstring(
+                    system_clone
+                        ? L"\nコピー先: 検証完了・換装待ち（オフライン）"
+                        : L"\nコピー先: 検証完了・データディスク（オフライン）") +
+                std::wstring(
+                    checkpoint_cleanup_pending
+                        ? L"\n\n最終" + target_style +
+                              L"の公開と読戻しは完了していますが、"
+                          L"完了checkpointの消去確認だけ保留されています。"
+                          L"コピー内容や起動情報の未完了を示す状態ではありません。"
+                        : L"") +
+                std::wstring(
+                    system_clone
+                        ? L"\n\n実機での起動成功は未証明です。アプリを終了し、換装後に起動確認を行ってください。"
+                        : L"\n\nデータディスクとして接続後に読取確認を行ってください。Windowsの起動ディスクとしての完成を示す結果ではありません。");
             MessageBoxW(
                 window,
                 completion.c_str(),
-                L"縮小移行を検証しました・換装待ち",
-                MB_OK | MB_ICONINFORMATION);
-            const auto proof = ytec::windowsapp::
-                make_direct_shrink_clone_completion_power_proof(
-                    payload->shrink_report.value(),
-                    payload->sleep_prevention_release,
-                    payload->completion_power_operation_binding);
+                checkpoint_cleanup_pending
+                    ? L"縮小移行を検証しました・checkpoint掃除保留"
+                    : system_clone
+                          ? mbr_to_gpt
+                                ? L"target-only MBR→GPTを検証しました・換装待ち"
+                                : mbr_preserve
+                                      ? L"MBR維持/Legacy BIOSを検証しました・換装待ち"
+                                      : L"縮小移行を検証しました・換装待ち"
+                          : L"データディスク縮小移行を検証しました・読取確認待ち",
+                MB_OK | (checkpoint_cleanup_pending
+                              ? MB_ICONWARNING
+                              : MB_ICONINFORMATION));
             completion_power_requested = offer_completion_power_action(
-                *state, proof, L"縮小移行クローン");
+                *state,
+                completion_proof.value(),
+                mbr_to_gpt ? L"MBR→GPT縮小移行クローン"
+                           : mbr_preserve
+                                 ? system_clone
+                                       ? L"MBR維持/Legacy BIOS縮小移行クローン"
+                                       : L"MBR維持データディスク縮小移行"
+                                 : system_clone ? L"縮小移行クローン"
+                                                : L"データディスクの縮小移行");
           } else if (shrink_error.has_value()) {
             log_error_summary(
                 state->logger,
@@ -9926,11 +12808,31 @@ LRESULT CALLBACK window_proc(
                     ? L"縮小移行を安全に取り消しました"
                     : L"縮小移行を完了できませんでした",
                 shrink_error.value(),
-                L"コピー先は未完成としてオフラインへ再保護しました。Windowsの「ディスクの管理」でもオフラインを確認し、確認できるまで内容を使用しないでください。");
+                L"コピー先がオフラインであることを証明できていません。Windowsの「ディスクの管理」でオフラインを確認できるまで、コピー先を使用しないでください。");
           }
           if (!completion_power_requested) {
             start_inventory(*state);
           }
+          return 0;
+        }
+        if (payload->mode !=
+            ytec::windowsapp::WindowsTransferModeChoice::exact) {
+          const auto mode_error = payload->error.value_or(
+              ytec::clonecore::Error{
+                  .code = ytec::clonecore::ErrorCode::verification_failed,
+                  .native_code = ERROR_INVALID_DATA,
+                  .operation = L"Windowsクローン完了モード",
+                  .message =
+                      L"実行モードに対応する専用完了証跡がありません",
+              });
+          log_error_summary(
+              state->logger, L"Windowsクローン完了モード不一致", mode_error);
+          show_product_error(
+              window,
+              L"クローン結果を完成扱いにできません",
+              mode_error,
+              L"コピー先のオフラインを証明できていません。Windowsの「ディスクの管理」で確認できるまでコピー先を使用しないでください。");
+          start_inventory(*state);
           return 0;
         }
         std::optional<ytec::clonecore::Error> completion_error =
@@ -10329,6 +13231,87 @@ LRESULT CALLBACK window_proc(
       }
       return 0;
     }
+    case kAdkConsentPreparationCompleteMessage: {
+      std::unique_ptr<AdkConsentPreparationPayload> payload(
+          reinterpret_cast<AdkConsentPreparationPayload*>(lparam));
+      if (state != nullptr) {
+        state->adk_management_running.store(false);
+        if (state->adk_management_thread.joinable()) {
+          state->adk_management_thread.join();
+        }
+        const auto manifest =
+            ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
+        if (payload->document.has_value()) {
+          log_adk_evidence(
+              *state,
+              manifest,
+              ytec::windowsapp::AdkEvidenceFacts{
+                  .action = payload->action,
+                  .stage =
+                      ytec::windowsapp::AdkEvidenceStage::eula_verified,
+                  .path_selected = !payload->selected_path.empty(),
+              });
+          auto acknowledgement =
+              ytec::windowsapp::show_adk_product_consent_dialog(
+                  window, manifest, payload->document.value());
+          if (acknowledgement.has_value()) {
+            log_adk_evidence(
+                *state,
+                manifest,
+                ytec::windowsapp::AdkEvidenceFacts{
+                    .action = payload->action,
+                    .stage =
+                        ytec::windowsapp::AdkEvidenceStage::consent_accepted,
+                    .path_selected = !payload->selected_path.empty(),
+                    .complete_eula_presented = true,
+                    .explicit_consent = true,
+                });
+            start_adk_management_execution(
+                *state,
+                manifest,
+                ytec::windowsapp::AdkManagementRequest{
+                    .action = payload->action,
+                    .administrator = state->elevated,
+                    .explicit_start_confirmed = true,
+                    .offline_layout_root = payload->selected_path,
+                    .eula_receipt = payload->document->receipt,
+                    .consent_acknowledgement =
+                        acknowledgement.take_value(),
+                });
+            return 0;
+          }
+          state->adk_management_status = acknowledgement.error().message;
+          if (acknowledgement.error().native_code != ERROR_CANCELLED) {
+            show_product_error(
+                window,
+                L"ADK利用条件の全文レビューを完了できませんでした",
+                acknowledgement.error());
+          }
+        } else if (payload->error.has_value()) {
+          state->adk_management_status =
+              L"ADK利用条件を安全に準備できませんでした。";
+          log_adk_evidence(
+              *state,
+              manifest,
+              ytec::windowsapp::AdkEvidenceFacts{
+                  .action = payload->action,
+                  .stage = ytec::windowsapp::AdkEvidenceStage::action_failed,
+                  .path_selected = !payload->selected_path.empty(),
+                  .native_code = payload->error->native_code,
+              });
+          show_product_error(
+              window,
+              L"ADK利用条件を安全に準備できませんでした",
+              payload->error.value());
+        } else {
+          state->adk_management_status =
+              L"ADK利用条件の準備結果を受信できませんでした。";
+        }
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, TRUE);
+      }
+      return 0;
+    }
     case kAdkManagementCompleteMessage: {
       std::unique_ptr<AdkManagementPayload> payload(
           reinterpret_cast<AdkManagementPayload*>(lparam));
@@ -10339,6 +13322,24 @@ LRESULT CALLBACK window_proc(
         }
         if (payload->report.has_value()) {
           const auto& report = payload->report.value();
+          const auto manifest =
+              ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
+          log_adk_evidence(
+              *state,
+              manifest,
+              ytec::windowsapp::AdkEvidenceFacts{
+                  .action = payload->action,
+                  .stage =
+                      ytec::windowsapp::AdkEvidenceStage::action_succeeded,
+                  .complete_eula_presented =
+                      payload->action !=
+                      ytec::windowsapp::AdkManagementAction::
+                          uninstall_managed,
+                  .explicit_consent =
+                      payload->action !=
+                      ytec::windowsapp::AdkManagementAction::
+                          uninstall_managed,
+              });
           if (report.offline_layout_completed) {
             state->adk_management_status =
                 L"検証済みADKオフラインレイアウトを作成しました。";
@@ -10366,6 +13367,16 @@ LRESULT CALLBACK window_proc(
           start_media_preflight(*state);
         } else if (payload->error.has_value()) {
           const auto& error = payload->error.value();
+          const auto manifest =
+              ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
+          log_adk_evidence(
+              *state,
+              manifest,
+              ytec::windowsapp::AdkEvidenceFacts{
+                  .action = payload->action,
+                  .stage = ytec::windowsapp::AdkEvidenceStage::action_failed,
+                  .native_code = error.native_code,
+              });
           const auto view = ytec::windowsapp::build_adk_management_view(
               ytec::windowsapp::tsumugi_1_0_0_adk_manifest());
           if (!view.execution_gate_open) {
@@ -10618,8 +13629,8 @@ LRESULT CALLBACK window_proc(
           state->clone_thread.join();
         }
         state->clone_pause_controller.reset();
-        state->active_clone_is_rescue = false;
-        state->active_clone_is_shrink = false;
+        state->active_clone_mode.reset();
+        state->active_clone_partition_style.reset();
         update_action_state(*state);
         InvalidateRect(window, nullptr, TRUE);
         MessageBoxW(
@@ -10691,6 +13702,14 @@ LRESULT CALLBACK window_proc(
             MB_OK | MB_ICONINFORMATION);
         return 0;
       }
+      if (state != nullptr && state->post_migration_check_running.load()) {
+        MessageBoxW(
+            window,
+            L"換装後の読取り専用チェックが完了するまで、この画面で結果を確認してください。",
+            L"換装後チェック中です",
+            MB_OK | MB_ICONINFORMATION);
+        return 0;
+      }
       if (state != nullptr) {
         state->media_usb_inspection_cancel_requested.store(true);
         state->clean_close_requested = true;
@@ -10738,6 +13757,7 @@ LRESULT CALLBACK window_proc(
             state->media_preflight_running.load() ||
             state->restore_preflight_running.load() ||
             state->manual_update_running.load() ||
+            state->post_migration_check_running.load() ||
             state->adk_management_running.load() ||
             state->support_zip_planning.load() ||
             state->support_zip_creation_running.load();
@@ -10787,6 +13807,9 @@ LRESULT CALLBACK window_proc(
         }
         if (state->manual_update_thread.joinable()) {
           state->manual_update_thread.join();
+        }
+        if (state->post_migration_check_thread.joinable()) {
+          state->post_migration_check_thread.join();
         }
         if (state->support_zip_thread.joinable()) {
           state->support_zip_thread.join();
@@ -10847,7 +13870,8 @@ int WINAPI wWinMain(
       DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
   INITCOMMONCONTROLSEX common_controls{
       .dwSize = sizeof(INITCOMMONCONTROLSEX),
-      .dwICC = ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS};
+      .dwICC = ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS |
+          ICC_LISTVIEW_CLASSES};
   InitCommonControlsEx(&common_controls);
 
   WNDCLASSEXW window_class{
@@ -10913,6 +13937,7 @@ int WINAPI wWinMain(
       window,
       desired_exceeds_display ? SW_MAXIMIZE : show_command);
   UpdateWindow(window);
+  show_startup_resume_slot_review(state);
   show_first_run_guidance_if_needed(state);
 
   MSG message{};

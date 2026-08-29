@@ -92,6 +92,92 @@ add_test(
 )
 
 add_executable(
+  ytec-post-migration-check-tests
+  Unit/post_migration_check_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/WindowsApp/src/post_migration_check.cpp
+)
+
+target_include_directories(
+  ytec-post-migration-check-tests
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/WindowsApp/include
+)
+
+target_link_libraries(
+  ytec-post-migration-check-tests
+  PRIVATE
+    ole32
+    oleaut32
+    wbemuuid
+    ytec::boot_repair
+    ytec::disk_model
+)
+
+target_compile_definitions(
+  ytec-post-migration-check-tests
+  PRIVATE
+    YTEC_WINDOWS_APP_MAIN_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/WindowsApp/src/main.cpp"
+)
+
+ytec_configure_target(ytec-post-migration-check-tests)
+
+add_test(
+  NAME ytec-post-migration-check-tests
+  COMMAND ytec-post-migration-check-tests
+)
+
+add_executable(
+  ytec-winpe-completion-power-ui-tests
+  Unit/winpe_completion_power_ui_tests.cpp
+)
+
+target_link_libraries(
+  ytec-winpe-completion-power-ui-tests
+  PRIVATE
+    ytec::winpe_app_logic
+)
+
+ytec_configure_target(ytec-winpe-completion-power-ui-tests)
+add_test(
+  NAME ytec-winpe-completion-power-ui-tests
+  COMMAND ytec-winpe-completion-power-ui-tests
+)
+
+add_executable(
+  ytec-winpe-resume-slot-admission-tests
+  Unit/winpe_resume_slot_admission_tests.cpp
+)
+
+target_link_libraries(
+  ytec-winpe-resume-slot-admission-tests
+  PRIVATE
+    ytec::winpe_app_logic
+)
+
+ytec_configure_target(ytec-winpe-resume-slot-admission-tests)
+add_test(
+  NAME ytec-winpe-resume-slot-admission-tests
+  COMMAND ytec-winpe-resume-slot-admission-tests
+)
+
+add_executable(
+  ytec-windows-resume-slot-product-tests
+  Unit/windows_resume_slot_product_tests.cpp
+)
+
+target_link_libraries(
+  ytec-windows-resume-slot-product-tests
+  PRIVATE
+    ytec::windows_app
+)
+
+ytec_configure_target(ytec-windows-resume-slot-product-tests)
+add_test(
+  NAME ytec-windows-resume-slot-product-tests
+  COMMAND ytec-windows-resume-slot-product-tests
+)
+
+add_executable(
   ytec-manual-pause-tests
   Unit/manual_pause_tests.cpp
 )
@@ -147,6 +233,33 @@ target_link_libraries(
 
 ytec_configure_target(ytec-tsumugi-stream-tests)
 add_test(NAME ytec-tsumugi-stream-tests COMMAND ytec-tsumugi-stream-tests)
+
+add_executable(
+  ytec-tsumugi-v1-golden-corpus-tests
+  Unit/tsumugi_v1_golden_corpus_tests.cpp
+)
+
+target_link_libraries(
+  ytec-tsumugi-v1-golden-corpus-tests
+  PRIVATE
+    ytec::image_format
+)
+
+target_compile_definitions(
+  ytec-tsumugi-v1-golden-corpus-tests
+  PRIVATE
+    YTEC_IMAGE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/ImageGolden"
+)
+
+ytec_configure_target(ytec-tsumugi-v1-golden-corpus-tests)
+add_test(
+  NAME ytec-tsumugi-v1-golden-corpus-tests
+  COMMAND ytec-tsumugi-v1-golden-corpus-tests
+)
+set_tests_properties(
+  ytec-tsumugi-v1-golden-corpus-tests
+  PROPERTIES TIMEOUT 120
+)
 
 add_executable(
   ytec-tsumugi-manifest-tests
@@ -336,6 +449,106 @@ ytec_configure_target(ytec-direct-clone-plan-tests)
 add_test(
   NAME ytec-direct-clone-plan-tests
   COMMAND ytec-direct-clone-plan-tests
+)
+
+add_executable(
+  ytec-direct-shrink-target-contract-tests
+  Unit/direct_shrink_target_contract_tests.cpp
+)
+
+target_link_libraries(
+  ytec-direct-shrink-target-contract-tests
+  PRIVATE
+    ytec::direct_shrink_target
+)
+
+ytec_configure_target(ytec-direct-shrink-target-contract-tests)
+add_test(
+  NAME ytec-direct-shrink-target-contract-tests
+  COMMAND ytec-direct-shrink-target-contract-tests
+)
+
+add_executable(
+  ytec-winpe-offline-ntfs-direct-shrink-product-tests
+  Unit/winpe_offline_ntfs_direct_shrink_product_tests.cpp
+)
+
+target_link_libraries(
+  ytec-winpe-offline-ntfs-direct-shrink-product-tests
+  PRIVATE
+    ytec::winpe_app_logic
+)
+
+target_compile_definitions(
+  ytec-winpe-offline-ntfs-direct-shrink-product-tests
+  PRIVATE
+    YTEC_WINPE_GUI_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/WinPEApp/src/gui_main.cpp"
+    YTEC_WINPE_DIRECT_SHRINK_PRODUCT_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/WinPEApp/src/offline_ntfs_direct_shrink_product.cpp"
+)
+
+ytec_configure_target(ytec-winpe-offline-ntfs-direct-shrink-product-tests)
+add_test(
+  NAME ytec-winpe-offline-ntfs-direct-shrink-product-tests
+  COMMAND ytec-winpe-offline-ntfs-direct-shrink-product-tests
+)
+
+add_executable(
+  ytec-file-system-recreate-tests
+  Unit/file_system_recreate_tests.cpp
+)
+
+target_link_libraries(
+  ytec-file-system-recreate-tests
+  PRIVATE
+    ytec::migration_core
+)
+
+ytec_configure_target(ytec-file-system-recreate-tests)
+add_test(
+  NAME ytec-file-system-recreate-tests
+  COMMAND ytec-file-system-recreate-tests
+)
+
+add_executable(
+  ytec-windows-file-system-recreate-tests
+  Unit/windows_file_system_recreate_tests.cpp
+)
+
+target_link_libraries(
+  ytec-windows-file-system-recreate-tests
+  PRIVATE
+    ytec::migration_engine
+    ytec::migration_core
+    ytec::image_format
+)
+
+ytec_configure_target(ytec-windows-file-system-recreate-tests)
+add_test(
+  NAME ytec-windows-file-system-recreate-tests
+  COMMAND ytec-windows-file-system-recreate-tests
+)
+
+add_executable(
+  ytec-windows-clone-partition-capacity-review-tests
+  Unit/windows_clone_partition_capacity_review_tests.cpp
+)
+
+target_link_libraries(
+  ytec-windows-clone-partition-capacity-review-tests
+  PRIVATE
+    ytec::windows_app
+)
+
+target_compile_definitions(
+  ytec-windows-clone-partition-capacity-review-tests
+  PRIVATE
+    YTEC_WINDOWS_APP_MAIN_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/WindowsApp/src/main.cpp"
+)
+
+ytec_configure_target(ytec-windows-clone-partition-capacity-review-tests)
+add_test(
+  NAME ytec-windows-clone-partition-capacity-review-tests
+  COMMAND ytec-windows-clone-partition-capacity-review-tests
 )
 
 add_executable(
@@ -1012,6 +1225,12 @@ target_link_libraries(
     ytec::winpe_app_logic
 )
 
+target_compile_definitions(
+  ytec-winpe-automatic-boot-repair-ui-tests
+  PRIVATE
+    YTEC_WINPE_GUI_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/WinPEApp/src/gui_main.cpp"
+)
+
 ytec_configure_target(ytec-winpe-automatic-boot-repair-ui-tests)
 add_test(
   NAME ytec-winpe-automatic-boot-repair-ui-tests
@@ -1092,6 +1311,23 @@ ytec_configure_target(ytec-automatic-boot-repair-windows-tests)
 add_test(
   NAME ytec-automatic-boot-repair-windows-tests
   COMMAND ytec-automatic-boot-repair-windows-tests
+)
+
+add_executable(
+  ytec-system-partition-creation-tests
+  Unit/system_partition_creation_tests.cpp
+)
+
+target_link_libraries(
+  ytec-system-partition-creation-tests
+  PRIVATE
+    ytec::boot_repair
+)
+
+ytec_configure_target(ytec-system-partition-creation-tests)
+add_test(
+  NAME ytec-system-partition-creation-tests
+  COMMAND ytec-system-partition-creation-tests
 )
 
 add_executable(
@@ -1208,6 +1444,23 @@ ytec_configure_target(ytec-vss-workflow-tests)
 add_test(NAME ytec-vss-workflow-tests COMMAND ytec-vss-workflow-tests)
 
 add_executable(
+  ytec-vss-diff-area-monitor-tests
+  Unit/vss_diff_area_monitor_tests.cpp
+)
+
+target_link_libraries(
+  ytec-vss-diff-area-monitor-tests
+  PRIVATE
+    ytec::vss_requester
+)
+
+ytec_configure_target(ytec-vss-diff-area-monitor-tests)
+add_test(
+  NAME ytec-vss-diff-area-monitor-tests
+  COMMAND ytec-vss-diff-area-monitor-tests
+)
+
+add_executable(
   ytec-windows-bcdboot-trust-tests
   Integration/windows_bcdboot_trust_tests.cpp
 )
@@ -1237,6 +1490,23 @@ target_link_libraries(
 
 ytec_configure_target(ytec-media-builder-tests)
 add_test(NAME ytec-media-builder-tests COMMAND ytec-media-builder-tests)
+
+add_executable(
+  ytec-media-driver-selection-tests
+  Unit/media_driver_selection_tests.cpp
+)
+
+target_link_libraries(
+  ytec-media-driver-selection-tests
+  PRIVATE
+    ytec::media_builder
+)
+
+ytec_configure_target(ytec-media-driver-selection-tests)
+add_test(
+  NAME ytec-media-driver-selection-tests
+  COMMAND ytec-media-driver-selection-tests
+)
 
 add_executable(
   ytec-windows-adk-detection-tests
@@ -1324,6 +1594,97 @@ target_link_libraries(
 ytec_configure_target(ytec-image-fuzz-tests)
 add_test(NAME ytec-image-fuzz-tests COMMAND ytec-image-fuzz-tests)
 set_tests_properties(ytec-image-fuzz-tests PROPERTIES TIMEOUT 120)
+
+option(
+  YTEC_BUILD_IMAGE_LIBFUZZER
+  "Build the opt-in MSVC coverage-guided .tsumugi v1 fuzz target"
+  OFF
+)
+
+if(YTEC_BUILD_IMAGE_LIBFUZZER)
+  if(MSVC_VERSION LESS 1950)
+    message(FATAL_ERROR
+      "YTEC_BUILD_IMAGE_LIBFUZZER requires MSVC 19.50 or newer")
+  endif()
+
+  # Compile a parser-only twin so coverage instrumentation never changes the
+  # production ImageFormat target or normal test executables in this build.
+  add_library(
+    ytec-image-libfuzzer-format
+    STATIC
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/compression.cpp
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/partition_snapshot.cpp
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/sha256.cpp
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/tsumugi.cpp
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/tsumugi_crypto.cpp
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/src/tsumugi_manifest.cpp
+  )
+
+  target_include_directories(
+    ytec-image-libfuzzer-format
+    PUBLIC
+      ${PROJECT_SOURCE_DIR}/src/ImageFormat/include
+  )
+
+  # CloneCore is deliberately reused from the normal MSVC build graph. Keep
+  # the MSVC STL annotation ABI consistent across that boundary; ASan still
+  # instruments the parser twin and harness themselves.
+  target_compile_definitions(
+    ytec-image-libfuzzer-format
+    PRIVATE
+      _DISABLE_STRING_ANNOTATION
+      _DISABLE_VECTOR_ANNOTATION
+  )
+
+  target_link_libraries(
+    ytec-image-libfuzzer-format
+    PUBLIC
+      ytec::clone_core
+    PRIVATE
+      bcrypt
+      advapi32
+      ytec::argon2
+      ytec::zstd
+  )
+
+  ytec_configure_target(ytec-image-libfuzzer-format)
+  target_compile_options(
+    ytec-image-libfuzzer-format
+    PRIVATE
+      /fsanitize=fuzzer
+      /fsanitize=address
+  )
+
+  add_executable(
+    ytec-image-libfuzzer
+    ImageFuzz/image_fuzz_libfuzzer.cpp
+  )
+
+  target_link_libraries(
+    ytec-image-libfuzzer
+    PRIVATE
+      ytec-image-libfuzzer-format
+  )
+
+  ytec_configure_target(ytec-image-libfuzzer)
+  target_compile_definitions(
+    ytec-image-libfuzzer
+    PRIVATE
+      _DISABLE_STRING_ANNOTATION
+      _DISABLE_VECTOR_ANNOTATION
+  )
+  target_compile_options(
+    ytec-image-libfuzzer
+    PRIVATE
+      /fsanitize=fuzzer
+      /fsanitize=address
+  )
+  target_link_options(
+    ytec-image-libfuzzer
+    PRIVATE
+      /INCREMENTAL:NO
+  )
+endif()
 
 add_executable(
   ytec-backup-manifest-tests
@@ -1635,25 +1996,6 @@ if(YTEC_BUILD_DESTRUCTIVE_VM_TESTS)
   )
 
   ytec_configure_target(ytec-phase1-physical-clone-vm)
-
-  add_executable(
-    ytec-winpe-clone-vm
-    VM/winpe_clone_vm.cpp
-  )
-
-  target_link_libraries(
-    ytec-winpe-clone-vm
-    PRIVATE
-      ytec-vm-clone-execution
-  )
-
-  target_compile_definitions(
-    ytec-winpe-clone-vm
-    PRIVATE
-      YTEC_VM_DESTRUCTIVE_TEST_ONLY=1
-  )
-
-  ytec_configure_target(ytec-winpe-clone-vm)
 
   add_executable(
     ytec-product-mbr2gpt-verifier-vm

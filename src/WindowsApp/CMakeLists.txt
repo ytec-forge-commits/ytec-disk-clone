@@ -36,7 +36,9 @@ add_library(
     src/adk_acquisition.cpp
     src/adk_consent_review.cpp
     src/adk_management.cpp
+    src/adk_product_ui.cpp
     src/adk_patch_archive.cpp
+    src/clone_partition_capacity_review.cpp
     src/completion_power_ui.cpp
     src/first_run_guidance.cpp
     src/layout.cpp
@@ -55,10 +57,12 @@ add_library(
     src/online_shrink_image_plan.cpp
     src/online_shrink_image_product.cpp
     src/online_shrink_image_restore.cpp
+    src/post_migration_check.cpp
     src/progress.cpp
     src/rescue_media_inspection.cpp
     src/rescue_media_storage.cpp
     src/rescue_media_ui.cpp
+    src/resume_slot_product.cpp
     src/restore_preflight.cpp
     src/selection.cpp
     src/startup_data_policy.cpp
@@ -99,7 +103,9 @@ target_link_libraries(
     cabinet
     msi
     ole32
+    oleaut32
     version
+    wbemuuid
     winhttp
     xmllite
     ytec::boot_repair

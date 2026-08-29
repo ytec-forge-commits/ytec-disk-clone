@@ -5,17 +5,23 @@
 Y-TEC Tsumugi Drive is a Windows x64 native application for safety-first disk
 cloning, image creation and restore, and boot repair on Windows and Windows PE.
 
-> **This repository contains the 0.2.0-dev development preview on the path to
-> 1.0.0.** Representative hardware acceptance and the final distribution audit
-> are incomplete. Do not use this build with important data, production
-> systems, or as your only backup.
+> **This repository contains the `1.0.0-internal-beta` pre-release validation
+> candidate, not the stable 1.0.0 release.** Representative hardware acceptance and the
+> final distribution audit are incomplete. Do not use this build with important
+> data, production systems, or as your only backup.
+
+This is a personally developed open-source project released under the Y-TEC
+name. It is not an internal company, employer, or corporate software project.
+`internal-beta` is the current development identifier and does not describe the
+project's ownership or intended publication model.
 
 The authoritative product specification is currently written in Japanese in
 [DiskClone_Development_Spec.md](DiskClone_Development_Spec.md). Historical
 phase and handover documents are retained as engineering evidence; they do not
 mean that the current product path is complete.
-The similarly named `DiskClone_Development_Spec.docx` is a historical v1.0
-snapshot and is not the current specification.
+The similarly named `DiskClone_Development_Spec.docx` is the current v2.0
+viewing document. The historical v1.0 snapshot is retained at
+`docs/archive/DiskClone_Development_Spec-v1.0-20260729.docx`.
 
 ## Intended 1.0 scope
 

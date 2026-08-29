@@ -178,12 +178,87 @@ execute_prepared_online_tsumugi_backup(
 clonecore::Result<OnlineTsumugiBackupReport>
 execute_windows_online_tsumugi_backup(
     const WindowsOnlineTsumugiBackupRequest& request) {
+  auto source_token = encode_vss_diff_area_source_epoch_token(
+      std::span<const std::byte>(
+          request.prepared.image.locked_source_state_hash));
+  if (!source_token ||
+      !request.prepared.image.revalidate_locked_layout ||
+      !request.diff_area_review_callback) {
+    return clonecore::Result<OnlineTsumugiBackupReport>::failure(
+        source_token
+            ? online_error(
+                  clonecore::ErrorCode::invalid_argument,
+                  ERROR_INVALID_PARAMETER,
+                  L"オンラインTsumugi VSS差分領域監視",
+                  L"固定source epoch、fresh layout probe、またはreview UIがありません")
+            : source_token.error());
+  }
+  const std::wstring expected_source_token = source_token.take_value();
   return execute_prepared_online_tsumugi_backup(
       request.prepared,
-      [&](const TsumugiSnapshotImageRequest& image,
+      [&, expected_source_token](
+          const TsumugiSnapshotImageRequest& image,
           const SnapshotCopyContext& context) {
-        return prepare_tsumugi_snapshot_image_v1_with_windows_apis(
-            image, context, request.callbacks);
+        if (clonecore::disk_operation_cancellation_requested(
+                request.callbacks)) {
+          return clonecore::Result<imageformat::TsumugiStagedImageV1>::failure(
+              online_error(
+                  clonecore::ErrorCode::cancelled,
+                  ERROR_CANCELLED,
+                  L"オンラインTsumugi VSS差分領域初回poll",
+                  L"初回output変更前に取消要求を確認しました"));
+        }
+        auto monitor = make_windows_vss_diff_area_operation_monitor(
+            context,
+            WindowsVssDiffAreaOperationMonitorOptions{
+                .expected_source_identity_token = expected_source_token,
+                .probe_source_identity =
+                    [revalidate = image.revalidate_locked_layout,
+                     expected_source_token](
+                        const VssDiffAreaSnapshotBinding&) {
+                      const auto status = revalidate();
+                      return status
+                          ? clonecore::Result<std::wstring>::success(
+                                expected_source_token)
+                          : clonecore::Result<std::wstring>::failure(
+                                status.error());
+                    },
+                .review_callback = request.diff_area_review_callback,
+                .logger = request.logger,
+            });
+        if (!monitor || !monitor.value()) {
+          return clonecore::Result<imageformat::TsumugiStagedImageV1>::failure(
+              monitor
+                  ? online_error(
+                        clonecore::ErrorCode::internal_error,
+                        ERROR_INVALID_HANDLE,
+                        L"オンラインTsumugi VSS差分領域monitor",
+                        L"製品monitor factoryが空のmonitorを返しました")
+                  : monitor.error());
+        }
+        auto active_monitor = monitor.take_value();
+        auto status = active_monitor->initial_poll();
+        if (!status) {
+          return clonecore::Result<imageformat::TsumugiStagedImageV1>::failure(
+              status.error());
+        }
+        auto prepared = prepare_tsumugi_snapshot_image_v1_with_windows_apis(
+            image,
+            context,
+            active_monitor->callbacks(request.callbacks));
+        if (!prepared) {
+          return prepared;
+        }
+        status = active_monitor->completion_poll();
+        if (status) {
+          status = validate_completed_vss_diff_area_operation_evidence(
+              active_monitor->evidence());
+        }
+        if (!status) {
+          return clonecore::Result<imageformat::TsumugiStagedImageV1>::failure(
+              with_abort_failure(status.error(), prepared.value()));
+        }
+        return prepared;
       },
       [&](SnapshotCopyCallback callback) {
         std::unique_ptr<IWorkflowBackend> backend =

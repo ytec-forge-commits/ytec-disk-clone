@@ -1,6 +1,7 @@
 #include "ytec/windowsapp/online_shrink_image_product.h"
 
 #include "ytec/imageformat/windows_tsumugi_destination.h"
+#include "ytec/windowsapp/online_image_create.h"
 
 #include <Windows.h>
 
@@ -450,12 +451,13 @@ execute_windows_online_shrink_image_create_with_windows_apis(
         vssrequester::OnlineTsumugiBackupReport>::failure(identity.error());
   }
   if (!request.administrator || request.final_path.empty() ||
-      request.log_is_ram_only != request.persistent_log_path.empty()) {
+      request.log_is_ram_only != request.persistent_log_path.empty() ||
+      !request.diff_area_review_callback) {
     return failure<vssrequester::OnlineTsumugiBackupReport>(
         clonecore::ErrorCode::invalid_argument,
         ERROR_INVALID_PARAMETER,
         L"Windows縮小Tsumugi製品要求",
-        L"管理者、保存先、またはRAM／永続ログ指定が不正です");
+        L"管理者、保存先、RAM／永続ログ指定、またはVSS差分領域review UIが不正です");
   }
 
   imageformat::WindowsTsumugiDestinationGuardRequest destination_guard{
@@ -482,6 +484,25 @@ execute_windows_online_shrink_image_create_with_windows_apis(
     return clonecore::Result<
         vssrequester::OnlineTsumugiBackupReport>::failure(analysis.error());
   }
+  auto source_hashes = make_tsumugi_source_identity_hashes(
+      analysis.value().source,
+      analysis.value().physical_sector_size,
+      analysis.value().partition_snapshot);
+  if (!source_hashes) {
+    return clonecore::Result<
+        vssrequester::OnlineTsumugiBackupReport>::failure(
+        source_hashes.error());
+  }
+  auto source_token =
+      vssrequester::encode_vss_diff_area_source_epoch_token(
+          std::span<const std::byte>(source_hashes.value().locked_state));
+  if (!source_token) {
+    return clonecore::Result<
+        vssrequester::OnlineTsumugiBackupReport>::failure(
+        source_token.error());
+  }
+  const auto expected_source_identity = identity.value();
+  const std::wstring expected_source_token = source_token.take_value();
   auto plan = plan_windows_online_shrink_image(
       WindowsOnlineShrinkImagePlanRequest{
           .analysis = analysis.take_value(),
@@ -569,6 +590,53 @@ execute_windows_online_shrink_image_create_with_windows_apis(
                 }
                 return imageformat::validate_windows_tsumugi_destination(
                     current);
+              },
+          .make_diff_area_monitor =
+              [request,
+               expected_source_identity,
+               expected_source_token](
+                  const vssrequester::SnapshotCopyContext& context) {
+                return vssrequester::
+                    make_windows_vss_diff_area_operation_monitor(
+                        context,
+                        vssrequester::
+                            WindowsVssDiffAreaOperationMonitorOptions{
+                            .expected_source_identity_token =
+                                expected_source_token,
+                            .probe_source_identity =
+                                [request,
+                                 expected_source_identity](
+                                    const vssrequester::
+                                        VssDiffAreaSnapshotBinding&) {
+                                  auto observed = analyze_source(
+                                      request,
+                                      expected_source_identity);
+                                  if (!observed) {
+                                    return clonecore::Result<
+                                        std::wstring>::failure(
+                                        observed.error());
+                                  }
+                                  auto hashes =
+                                      make_tsumugi_source_identity_hashes(
+                                          observed.value().source,
+                                          observed.value()
+                                              .physical_sector_size,
+                                          observed.value()
+                                              .partition_snapshot);
+                                  if (!hashes) {
+                                    return clonecore::Result<
+                                        std::wstring>::failure(
+                                        hashes.error());
+                                  }
+                                  return vssrequester::
+                                      encode_vss_diff_area_source_epoch_token(
+                                          std::span<const std::byte>(
+                                              hashes.value().locked_state));
+                                },
+                            .review_callback =
+                                request.diff_area_review_callback,
+                            .logger = request.logger,
+                        });
               },
       });
   if (!execution) {

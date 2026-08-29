@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ytec::winpeapp {
 
@@ -17,6 +18,10 @@ struct DirectImageCreateRequest final {
   // controller converts it to StableDiskIdentity before any source-state
   // transition and never rebuilds the expected identity from a disk number.
   diskmodel::DiskInfo selected_source;
+  // Empty means whole disk. Non-empty values are one-based PartitionNumber
+  // values from selected_source. Exact mode binds the normalized selection to
+  // the manifest and (for persistent creation) the durable resume plan.
+  std::vector<std::uint32_t> selected_partition_numbers;
   std::wstring final_path;
   std::string created_utc;
   std::string app_version;

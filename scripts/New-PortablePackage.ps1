@@ -133,13 +133,42 @@ function Assert-NoMicrosoftPayload {
     }
 }
 
+function Write-NewUtf8File {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'ProductVersion.ps1')
+$productVersion = Read-YtecProductVersion `
+    -Path (Join-Path $repoRoot 'version.json')
 $outputFullPath = Assert-NewExternalPath `
     -RepositoryRoot $repoRoot `
     -CandidatePath $OutputRoot
 $zipPath = Assert-NewExternalPath `
     -RepositoryRoot $repoRoot `
     -CandidatePath ($outputFullPath + '.zip')
+
+$zipSha256Path = Assert-NewExternalPath `
+    -RepositoryRoot $repoRoot `
+    -CandidatePath ($zipPath + '.sha256')
 
 $staticRoot = Join-Path $repoRoot 'out\build\msvc-x64-vm'
 $sources = [ordered]@{
@@ -161,9 +190,11 @@ $sources = [ordered]@{
         'packaging\privacy-and-network.txt'
     securityReporting = Join-Path $repoRoot `
         'packaging\security-reporting.txt'
+    termsOfUse = Join-Path $repoRoot 'packaging\terms-of-use.txt'
     dataReadme = Join-Path $repoRoot 'packaging\data-readme.txt'
     projectLicense = Join-Path $repoRoot 'LICENSE'
     projectNotice = Join-Path $repoRoot 'NOTICE'
+    projectTrademarks = Join-Path $repoRoot 'TRADEMARKS.md'
     notices = Join-Path $repoRoot 'THIRD-PARTY-NOTICES.txt'
     sbom = Join-Path $repoRoot 'SBOM.spdx.json'
     licenseReadme = Join-Path $repoRoot 'licenses\README.md'
@@ -178,24 +209,62 @@ $sources = [ordered]@{
 foreach ($name in @('windowsApp', 'environment', 'winpeCli', 'winpeGui')) {
     Assert-Amd64Pe -Path $sources[$name] -Description $name
 }
+$expectedExecutableMetadata = [ordered]@{
+    windowsApp = [ordered]@{
+        originalFilename = 'ytec-tsumugi-drive.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive'
+    }
+    environment = [ordered]@{
+        originalFilename = 'ytec-winpe-environment.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE Environment'
+    }
+    winpeCli = [ordered]@{
+        originalFilename = 'ytec-winpe-app.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE CLI'
+    }
+    winpeGui = [ordered]@{
+        originalFilename = 'ytec-winpe-gui.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE GUI'
+    }
+}
+$executableVersionInfo = [ordered]@{}
+foreach ($name in $expectedExecutableMetadata.Keys) {
+    $metadata = $expectedExecutableMetadata[$name]
+    $executableVersionInfo[$name] = Assert-YtecExecutableVersionInfo `
+        -Path $sources[$name] `
+        -Version $productVersion `
+        -OriginalFilename $metadata.originalFilename `
+        -FileDescription $metadata.fileDescription
+}
 foreach ($name in @(
         'builderScript', 'readme', 'operationGuide',
         'safetyAndLimitations', 'privacyAndNetwork', 'securityReporting',
-        'dataReadme',
-        'projectLicense', 'projectNotice',
+        'termsOfUse', 'dataReadme',
+        'projectLicense', 'projectNotice', 'projectTrademarks',
         'notices', 'sbom', 'licenseReadme', 'lineSeedLicense',
         'zstandardLicense', 'argon2License')) {
     Assert-RegularFile -Path $sources[$name] -Description $name
 }
+$sbomVersionInfo = Assert-YtecSbomProductVersion `
+    -Path $sources.sbom `
+    -Version $productVersion `
+    -ExpectedPackageName 'ytec-disk-clone' `
+    -ExpectedNamespaceBase `
+        'https://github.com/ytec-forge-commits/ytec-disk-clone/sbom'
 
 $preflight = [ordered]@{
     schemaVersion = 1
     product = 'Y-TEC Tsumugi Drive'
-    version = '0.2.0-dev'
+    version = $productVersion.display
+    fileVersion = $productVersion.file
+    channel = $productVersion.channel
     outputRoot = $outputFullPath
     zipPath = $zipPath
+    zipSha256Path = $zipSha256Path
     buildRequested = [bool]$BuildPackage
     repositoryContainsMicrosoftPayload = $false
+    executables = $executableVersionInfo
+    sbom = $sbomVersionInfo
     files = [ordered]@{}
 }
 foreach ($entry in $sources.GetEnumerator()) {
@@ -242,12 +311,16 @@ Copy-Item -LiteralPath $sources.privacyAndNetwork `
     -Destination (Join-Path $outputFullPath 'プライバシーと通信.txt')
 Copy-Item -LiteralPath $sources.securityReporting `
     -Destination (Join-Path $outputFullPath 'セキュリティ報告.txt')
+Copy-Item -LiteralPath $sources.termsOfUse `
+    -Destination (Join-Path $outputFullPath '利用規約.txt')
 Copy-Item -LiteralPath $sources.dataReadme `
     -Destination (Join-Path $data 'README.txt')
 Copy-Item -LiteralPath $sources.projectLicense `
     -Destination (Join-Path $outputFullPath 'LICENSE')
 Copy-Item -LiteralPath $sources.projectNotice `
     -Destination (Join-Path $outputFullPath 'NOTICE')
+Copy-Item -LiteralPath $sources.projectTrademarks `
+    -Destination (Join-Path $outputFullPath 'TRADEMARKS.md')
 Copy-Item -LiteralPath $sources.notices `
     -Destination (Join-Path $outputFullPath 'THIRD-PARTY-NOTICES.txt')
 Copy-Item -LiteralPath $sources.sbom `
@@ -300,19 +373,36 @@ finally {
     $archive.Dispose()
 }
 Assert-RegularFile -Path $zipPath -Description 'ポータブルZIP'
+$zipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+$zipSha256Line = "$zipSha256 *$([IO.Path]::GetFileName($zipPath))" +
+    [Environment]::NewLine
+Write-NewUtf8File -Path $zipSha256Path -Text $zipSha256Line
+Assert-RegularFile `
+    -Path $zipSha256Path `
+    -Description 'ポータブルZIP外部SHA-256'
 
 $report = [ordered]@{
     schemaVersion = 1
     product = 'Y-TEC Tsumugi Drive'
-    version = '0.2.0-dev'
+    version = $productVersion.display
+    fileVersion = $productVersion.file
+    channel = $productVersion.channel
     outputRoot = $outputFullPath
     zip = [ordered]@{
         path = $zipPath
         length = (Get-Item -LiteralPath $zipPath).Length
-        sha256 = (Get-FileHash -LiteralPath $zipPath `
+        sha256 = $zipSha256
+    }
+    zipSha256File = [ordered]@{
+        path = $zipSha256Path
+        length = (Get-Item -LiteralPath $zipSha256Path).Length
+        zipSha256 = $zipSha256
+        sha256 = (Get-FileHash -LiteralPath $zipSha256Path `
             -Algorithm SHA256).Hash
     }
     repositoryContainsMicrosoftPayload = $false
+    executables = $executableVersionInfo
+    sbom = $sbomVersionInfo
     fileCount = (Get-ChildItem -LiteralPath $outputFullPath `
         -Recurse -File).Count
 }

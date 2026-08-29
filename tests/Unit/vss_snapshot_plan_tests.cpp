@@ -67,6 +67,7 @@ class MemoryReader final : public ytec::clonecore::ISourceDiskReader {
               .message = L"範囲外です",
           });
     }
+    reads_.emplace_back(offset, length);
     const auto first =
         bytes_.begin() + static_cast<std::ptrdiff_t>(offset);
     return ytec::clonecore::Result<std::vector<std::byte>>::success(
@@ -74,8 +75,16 @@ class MemoryReader final : public ytec::clonecore::ISourceDiskReader {
             first, first + static_cast<std::ptrdiff_t>(length)));
   }
 
+  void clear_reads() const { reads_.clear(); }
+
+  [[nodiscard]] const std::vector<std::pair<std::uint64_t, std::size_t>>&
+  reads() const noexcept {
+    return reads_;
+  }
+
  private:
   std::vector<std::byte> bytes_;
+  mutable std::vector<std::pair<std::uint64_t, std::size_t>> reads_;
 };
 
 class GuidGenerator final : public ytec::clonecore::IGuidGenerator {
@@ -512,6 +521,64 @@ void test_gpt_plan_routes_vss_raw_and_recreated_partitions() {
       "Raw GPT ranges should preserve physical partition offsets");
 }
 
+void test_gpt_selected_entries_skip_unselected_partition_payload_reads() {
+  auto fixture = make_gpt_fixture();
+  MemoryReader reader(std::move(fixture.bytes));
+  auto plan_options =
+      options(reader, ytec::imageformat::PartitionTableStyle::gpt);
+  plan_options.selected_partition_entry_indices = {1U, 2U};
+  reader.clear_reads();
+  const auto result = ytec::vssrequester::prepare_gpt_snapshot_image_plan(
+      fixture.layout, reader, binding(2), plan_options);
+  check(result.has_value(), "selected GPT VSS plan should succeed");
+  check(
+      result.value().snapshot_partition_count == 1U &&
+          result.value().recreated_partition_count == 1U &&
+          result.value().raw_partition_count == 0U &&
+          result.value().image_copy.volumes.size() == 1U &&
+          result.value().image_copy.volumes[0].partition_entry_index == 2U &&
+          result.value().image_copy.raw_regions.empty(),
+      "selected GPT plan must contain only MSR recreation and Windows VSS payload");
+  const auto intersects = [](const auto& read,
+                             const std::uint64_t begin,
+                             const std::uint64_t end) {
+    return read.first < end &&
+        read.first + static_cast<std::uint64_t>(read.second) > begin;
+  };
+  const bool read_unselected_payload = std::any_of(
+      reader.reads().begin(), reader.reads().end(), [&](const auto& read) {
+        return intersects(
+                   read,
+                   2048ULL * kSectorSize,
+                   3072ULL * kSectorSize) ||
+            intersects(
+                   read,
+                   18432ULL * kSectorSize,
+                   20480ULL * kSectorSize);
+      });
+  check(
+      !read_unselected_payload,
+      "planner must not probe or copy unselected ESP and Recovery payload sectors");
+}
+
+void test_gpt_selected_entries_reject_noncanonical_or_unknown_values() {
+  auto fixture = make_gpt_fixture();
+  MemoryReader reader(std::move(fixture.bytes));
+  for (const auto selected : {
+           std::vector<std::uint32_t>{2U, 1U},
+           std::vector<std::uint32_t>{2U, 2U},
+           std::vector<std::uint32_t>{2U, 99U}}) {
+    auto plan_options =
+        options(reader, ytec::imageformat::PartitionTableStyle::gpt);
+    plan_options.selected_partition_entry_indices = selected;
+    check(
+        !ytec::vssrequester::prepare_gpt_snapshot_image_plan(
+             fixture.layout, reader, binding(2), plan_options)
+             .has_value(),
+        "noncanonical or unknown selected GPT entry must fail closed");
+  }
+}
+
 void test_mbr_plan_routes_vss_and_raw_partitions() {
   MemoryReader reader(make_mbr_disk());
   const auto parsed = ytec::clonecore::parse_mbr(reader);
@@ -600,6 +667,10 @@ int main() {
        test_metadata_builder_rejects_bitlocker_on_disk_signature},
       {"gpt_plan_routes_vss_raw_and_recreated_partitions",
        test_gpt_plan_routes_vss_raw_and_recreated_partitions},
+      {"gpt_selected_entries_skip_unselected_partition_payload_reads",
+       test_gpt_selected_entries_skip_unselected_partition_payload_reads},
+      {"gpt_selected_entries_reject_noncanonical_or_unknown_values",
+       test_gpt_selected_entries_reject_noncanonical_or_unknown_values},
       {"mbr_plan_routes_vss_and_raw_partitions",
        test_mbr_plan_routes_vss_and_raw_partitions},
       {"missing_or_extra_volume_binding_fails_closed",

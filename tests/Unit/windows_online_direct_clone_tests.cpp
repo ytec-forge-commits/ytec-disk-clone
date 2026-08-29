@@ -46,6 +46,19 @@ void write_little(
   std::memcpy(bytes.data() + offset, &value, sizeof(T));
 }
 
+class TestGuidGenerator final : public ytec::clonecore::IGuidGenerator {
+ public:
+  ytec::clonecore::Result<ytec::clonecore::GptGuid> next_guid() override {
+    ytec::clonecore::GptGuid value;
+    value.bytes[0] = static_cast<std::byte>(++next_);
+    value.bytes[15] = std::byte{0xA5};
+    return ytec::clonecore::Result<ytec::clonecore::GptGuid>::success(value);
+  }
+
+ private:
+  std::uint8_t next_{};
+};
+
 std::vector<std::byte> make_source_mbr() {
   std::vector<std::byte> bytes(
       static_cast<std::size_t>(kSourceSize), std::byte{0});
@@ -70,6 +83,153 @@ std::vector<std::byte> make_source_mbr() {
   return bytes;
 }
 
+std::vector<std::byte> make_source_mbr_exfat() {
+  std::vector<std::byte> bytes(
+      static_cast<std::size_t>(kSourceSize), std::byte{0});
+  write_little<std::uint32_t>(bytes, 440, 0x10203040U);
+  const std::size_t entry = 446;
+  bytes[entry] = std::byte{0};
+  bytes[entry + 4] = std::byte{0x07};
+  write_little(bytes, entry + 8, kFirstLba);
+  write_little(bytes, entry + 12, kPartitionSectors);
+  bytes[510] = std::byte{0x55};
+  bytes[511] = std::byte{0xAA};
+
+  const std::size_t boot = static_cast<std::size_t>(kPartitionOffset);
+  std::fill_n(
+      bytes.begin() + static_cast<std::ptrdiff_t>(boot),
+      static_cast<std::size_t>(kPartitionLength),
+      std::byte{0x6E});
+  std::fill_n(
+      bytes.begin() + static_cast<std::ptrdiff_t>(boot),
+      kSectorSize,
+      std::byte{0});
+  constexpr char signature[] = "EXFAT   ";
+  std::memcpy(bytes.data() + boot + 3, signature, 8);
+  constexpr std::uint32_t fat_offset = 24U;
+  constexpr std::uint32_t fat_length = 32U;
+  constexpr std::uint32_t heap_offset = fat_offset + fat_length;
+  constexpr std::uint32_t sectors_per_cluster = 8U;
+  write_little<std::uint64_t>(bytes, boot + 64, kFirstLba);
+  write_little<std::uint64_t>(bytes, boot + 72, kPartitionSectors);
+  write_little<std::uint32_t>(bytes, boot + 80, fat_offset);
+  write_little<std::uint32_t>(bytes, boot + 84, fat_length);
+  write_little<std::uint32_t>(bytes, boot + 88, heap_offset);
+  write_little<std::uint32_t>(
+      bytes,
+      boot + 92,
+      (kPartitionSectors - heap_offset) / sectors_per_cluster);
+  write_little<std::uint32_t>(bytes, boot + 96, 2U);
+  write_little<std::uint16_t>(bytes, boot + 104, 0x0100U);
+  bytes[boot + 108] = std::byte{9};
+  bytes[boot + 109] = std::byte{3};
+  bytes[boot + 110] = std::byte{1};
+  bytes[boot + 112] = std::byte{0};
+  bytes[boot + 510] = std::byte{0x55};
+  bytes[boot + 511] = std::byte{0xAA};
+  bytes[boot + 100] = std::byte{0xE7};
+  return bytes;
+}
+
+std::vector<std::byte> make_source_mbr_fat32() {
+  std::vector<std::byte> bytes(
+      static_cast<std::size_t>(kSourceSize), std::byte{0});
+  write_little<std::uint32_t>(bytes, 440, 0x10203040U);
+  const std::size_t entry = 446;
+  bytes[entry] = std::byte{0};
+  bytes[entry + 4] = std::byte{0x0C};
+  write_little(bytes, entry + 8, kFirstLba);
+  write_little(bytes, entry + 12, kPartitionSectors);
+  bytes[510] = std::byte{0x55};
+  bytes[511] = std::byte{0xAA};
+
+  const std::size_t boot = static_cast<std::size_t>(kPartitionOffset);
+  std::fill_n(
+      bytes.begin() + static_cast<std::ptrdiff_t>(boot),
+      static_cast<std::size_t>(kPartitionLength),
+      std::byte{0x4F});
+  std::fill_n(
+      bytes.begin() + static_cast<std::ptrdiff_t>(boot),
+      kSectorSize,
+      std::byte{0});
+  constexpr char signature[] = "FAT32   ";
+  std::memcpy(bytes.data() + boot + 82, signature, 8);
+  write_little<std::uint16_t>(bytes, boot + 11, kSectorSize);
+  bytes[boot + 13] = std::byte{8};
+  write_little<std::uint32_t>(bytes, boot + 32, kPartitionSectors);
+  bytes[boot + 510] = std::byte{0x55};
+  bytes[boot + 511] = std::byte{0xAA};
+  bytes[boot + 100] = std::byte{0xF3};
+  return bytes;
+}
+
+std::vector<std::byte> make_source_gpt_basic(const bool exfat) {
+  ytec::clonecore::GptDisk disk;
+  disk.logical_sector_size = kSectorSize;
+  disk.sector_count = kSourceSize / kSectorSize;
+  disk.disk_guid.bytes[0] = std::byte{0x11};
+  disk.first_usable_lba = 34U;
+  disk.last_usable_lba = disk.sector_count - 34U;
+  disk.partition_entry_count = 128U;
+  disk.partition_entry_size = 128U;
+  ytec::clonecore::GptGuid partition_guid;
+  partition_guid.bytes[0] = std::byte{0x22};
+  disk.partitions.push_back(ytec::clonecore::GptPartition{
+      .entry_index = 0U,
+      .type_guid = ytec::clonecore::gpt_type_basic_data(),
+      .unique_guid = partition_guid,
+      .first_lba = kFirstLba,
+      .last_lba = kFirstLba + kPartitionSectors - 1U,
+      .name = u"Data",
+  });
+  TestGuidGenerator guids;
+  const auto metadata = ytec::clonecore::make_gpt_write_plan(
+      disk, kSourceSize, kSectorSize, guids);
+  check(metadata.has_value(), "synthetic GPT metadata should build");
+  std::vector<std::byte> bytes(
+      static_cast<std::size_t>(kSourceSize), std::byte{0});
+  for (const auto& write : metadata.value().writes) {
+    std::copy(
+        write.bytes.begin(),
+        write.bytes.end(),
+        bytes.begin() + static_cast<std::ptrdiff_t>(write.offset));
+  }
+  const std::size_t boot = static_cast<std::size_t>(kPartitionOffset);
+  if (exfat) {
+    constexpr char signature[] = "EXFAT   ";
+    std::memcpy(bytes.data() + boot + 3, signature, 8);
+    constexpr std::uint32_t fat_offset = 24U;
+    constexpr std::uint32_t fat_length = 32U;
+    constexpr std::uint32_t heap_offset = fat_offset + fat_length;
+    constexpr std::uint32_t sectors_per_cluster = 8U;
+    write_little<std::uint64_t>(bytes, boot + 64, kFirstLba);
+    write_little<std::uint64_t>(bytes, boot + 72, kPartitionSectors);
+    write_little<std::uint32_t>(bytes, boot + 80, fat_offset);
+    write_little<std::uint32_t>(bytes, boot + 84, fat_length);
+    write_little<std::uint32_t>(bytes, boot + 88, heap_offset);
+    write_little<std::uint32_t>(
+        bytes,
+        boot + 92,
+        (kPartitionSectors - heap_offset) / sectors_per_cluster);
+    write_little<std::uint32_t>(bytes, boot + 96, 2U);
+    write_little<std::uint16_t>(bytes, boot + 104, 0x0100U);
+    bytes[boot + 108] = std::byte{9};
+    bytes[boot + 109] = std::byte{3};
+    bytes[boot + 110] = std::byte{1};
+    bytes[boot + 112] = std::byte{0};
+  } else {
+    constexpr char signature[] = "FAT32   ";
+    std::memcpy(bytes.data() + boot + 82, signature, 8);
+    write_little<std::uint16_t>(bytes, boot + 11, kSectorSize);
+    bytes[boot + 13] = std::byte{8};
+    write_little<std::uint32_t>(
+        bytes, boot + 32, kPartitionSectors);
+  }
+  bytes[boot + 510] = std::byte{0x55};
+  bytes[boot + 511] = std::byte{0xAA};
+  return bytes;
+}
+
 std::vector<std::byte> make_snapshot_partition() {
   std::vector<std::byte> bytes(
       static_cast<std::size_t>(kPartitionLength), std::byte{0x5A});
@@ -88,8 +248,11 @@ class MemoryReader final : public ytec::clonecore::ISourceDiskReader {
  public:
   MemoryReader(
       std::vector<std::byte> bytes,
-      std::shared_ptr<std::vector<std::uint64_t>> offsets = {})
-      : bytes_(std::move(bytes)), offsets_(std::move(offsets)) {}
+      std::shared_ptr<std::vector<std::uint64_t>> offsets = {},
+      const bool* const retained_volume_lock_alive = nullptr)
+      : bytes_(std::move(bytes)),
+        offsets_(std::move(offsets)),
+        retained_volume_lock_alive_(retained_volume_lock_alive) {}
 
   std::uint64_t size_bytes() const noexcept override {
     return bytes_.size();
@@ -114,6 +277,19 @@ class MemoryReader final : public ytec::clonecore::ISourceDiskReader {
               .message = L"範囲外です",
           });
     }
+    const std::uint64_t end = offset + length;
+    if (retained_volume_lock_alive_ != nullptr &&
+        *retained_volume_lock_alive_ &&
+        offset < kPartitionOffset + kPartitionLength &&
+        kPartitionOffset < end) {
+      return ytec::clonecore::Result<std::vector<std::byte>>::failure(
+          ytec::clonecore::Error{
+              .code = ytec::clonecore::ErrorCode::access_denied,
+              .native_code = ERROR_ACCESS_DENIED,
+              .operation = L"MemoryReader retained Volume lock",
+              .message = L"lock中のパーティションはlock handle以外から読めません",
+          });
+    }
     const auto first =
         bytes_.begin() + static_cast<std::ptrdiff_t>(offset);
     return ytec::clonecore::Result<std::vector<std::byte>>::success(
@@ -124,6 +300,35 @@ class MemoryReader final : public ytec::clonecore::ISourceDiskReader {
  private:
   std::vector<std::byte> bytes_;
   std::shared_ptr<std::vector<std::uint64_t>> offsets_;
+  const bool* retained_volume_lock_alive_{};
+};
+
+class LockLeaseReader final : public ytec::clonecore::ISourceDiskReader {
+ public:
+  LockLeaseReader(std::vector<std::byte> bytes, bool* const lease_alive)
+      : reader_(std::move(bytes)), lease_alive_(lease_alive) {
+    *lease_alive_ = true;
+  }
+
+  ~LockLeaseReader() override { *lease_alive_ = false; }
+
+  std::uint64_t size_bytes() const noexcept override {
+    return reader_.size_bytes();
+  }
+
+  std::uint32_t logical_sector_size() const noexcept override {
+    return reader_.logical_sector_size();
+  }
+
+  ytec::clonecore::Result<std::vector<std::byte>> read(
+      const std::uint64_t offset,
+      const std::size_t length) const override {
+    return reader_.read(offset, length);
+  }
+
+ private:
+  MemoryReader reader_;
+  bool* lease_alive_{};
 };
 
 class MemoryWriter final : public ytec::clonecore::ITargetDiskWriter {
@@ -192,6 +397,12 @@ ytec::clonecore::StableDiskIdentity target_identity() {
   };
 }
 
+ytec::clonecore::StableDiskIdentity exfat_source_identity() {
+  auto identity = source_identity();
+  identity.is_system_disk = false;
+  return identity;
+}
+
 ytec::diskmodel::DiskInfo source_disk() {
   auto disk = ytec::diskmodel::DiskInfo{
       .disk_number = 0,
@@ -250,11 +461,55 @@ ytec::diskmodel::DiskInfo target_disk() {
   return disk;
 }
 
+ytec::diskmodel::DiskInfo exfat_source_disk() {
+  auto disk = source_disk();
+  disk.is_system_disk = false;
+  disk.partitions.front().type = L"exFAT";
+  disk.partitions.front().name = L"Data";
+  return disk;
+}
+
+ytec::diskmodel::DiskInfo fat32_source_disk() {
+  auto disk = source_disk();
+  disk.is_system_disk = false;
+  disk.partitions.front().type = L"FAT32";
+  disk.partitions.front().name = L"Data";
+  return disk;
+}
+
+ytec::diskmodel::DiskInfo gpt_basic_source_disk(const bool exfat) {
+  auto disk = source_disk();
+  disk.partition_style = ytec::diskmodel::PartitionStyle::gpt;
+  disk.is_system_disk = false;
+  disk.partitions.front().style = ytec::diskmodel::PartitionStyle::gpt;
+  disk.partitions.front().type = exfat ? L"exFAT" : L"FAT32";
+  disk.partitions.front().name = L"Data";
+  return disk;
+}
+
 ytec::diskmodel::ReidentifiedPhysicalClone observation() {
   return ytec::diskmodel::ReidentifiedPhysicalClone{
       .source = source_disk(),
       .target = target_disk(),
       .source_identity = source_identity(),
+      .target_identity = target_identity(),
+  };
+}
+
+ytec::diskmodel::ReidentifiedPhysicalClone exfat_observation() {
+  return ytec::diskmodel::ReidentifiedPhysicalClone{
+      .source = exfat_source_disk(),
+      .target = target_disk(),
+      .source_identity = exfat_source_identity(),
+      .target_identity = target_identity(),
+  };
+}
+
+ytec::diskmodel::ReidentifiedPhysicalClone fat32_observation() {
+  return ytec::diskmodel::ReidentifiedPhysicalClone{
+      .source = fat32_source_disk(),
+      .target = target_disk(),
+      .source_identity = exfat_source_identity(),
       .target_identity = target_identity(),
   };
 }
@@ -278,6 +533,46 @@ ytec::windowsapp::OnlineDirectCloneRequest valid_request() {
               .first_step_acknowledged = true,
               .typed_token = L"OK",
           },
+  };
+}
+
+ytec::windowsapp::OnlineDirectCloneRequest valid_exfat_request() {
+  const auto source_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(exfat_source_disk());
+  const auto target_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(target_disk());
+  check(source_layout.has_value() && target_layout.has_value(),
+        "reviewed exFAT clone layouts must hash");
+  return ytec::windowsapp::OnlineDirectCloneRequest{
+      .administrator = true,
+      .expected_source = exfat_source_identity(),
+      .expected_target = target_identity(),
+      .expected_source_layout_hash = source_layout.value(),
+      .expected_target_layout_hash = target_layout.value(),
+      .confirmation = ytec::clonecore::TargetConfirmation{
+          .first_step_acknowledged = true,
+          .typed_token = L"OK",
+      },
+  };
+}
+
+ytec::windowsapp::OnlineDirectCloneRequest valid_fat32_request() {
+  const auto source_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(fat32_source_disk());
+  const auto target_layout = ytec::imageformat::
+      hash_tsumugi_physical_restore_target_layout_v1(target_disk());
+  check(source_layout.has_value() && target_layout.has_value(),
+        "reviewed FAT32 clone layouts must hash");
+  return ytec::windowsapp::OnlineDirectCloneRequest{
+      .administrator = true,
+      .expected_source = exfat_source_identity(),
+      .expected_target = target_identity(),
+      .expected_source_layout_hash = source_layout.value(),
+      .expected_target_layout_hash = target_layout.value(),
+      .confirmation = ytec::clonecore::TargetConfirmation{
+          .first_step_acknowledged = true,
+          .typed_token = L"OK",
+      },
   };
 }
 
@@ -306,6 +601,8 @@ struct DependencyState final {
   int offline_calls{};
   int engine_calls{};
   int boot_finalization_calls{};
+  int vss_calls{};
+  int locked_open_calls{};
   bool fail_final_reidentify{};
   bool fail_workflow_before_callback{};
   bool fail_boot_finalization{};
@@ -318,6 +615,10 @@ struct DependencyState final {
   bool zero_engine_bytes{};
   bool zero_write_digest{};
   bool source_is_system{true};
+  bool source_is_exfat{};
+  bool source_is_fat32{};
+  bool fail_locked_volume_open{};
+  bool lock_alive{};
   bool target_health_failing{};
   bool target_health_failing_on_final_reidentify{};
   std::shared_ptr<std::vector<std::uint64_t>> physical_reads =
@@ -340,7 +641,10 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
           [&](const auto&, const auto&) {
             ++state.reidentify_calls;
             state.events.push_back("reidentify-selection");
-            auto observed = observation();
+            auto observed = state.source_is_fat32
+                ? fat32_observation()
+                : state.source_is_exfat ? exfat_observation()
+                                        : observation();
             if (state.target_health_failing) {
               observed.target.health.state =
                   ytec::diskmodel::DiskHealthState::failing;
@@ -361,7 +665,10 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
                   ytec::diskmodel::ReidentifiedPhysicalClone>::failure(
                   injected_error(L"最終再識別"));
             }
-            auto observed = observation();
+            auto observed = state.source_is_fat32
+                ? fat32_observation()
+                : state.source_is_exfat ? exfat_observation()
+                                        : observation();
             if (state.target_health_failing) {
               observed.target.health.state =
                   ytec::diskmodel::DiskHealthState::failing;
@@ -390,14 +697,23 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
                     .observed =
                         ytec::diskmodel::ReidentifiedReadOnlyDisk{
                     .observed = [&]() {
-                      auto disk = source_disk();
+                      auto disk = state.source_is_fat32
+                          ? fat32_source_disk()
+                          : state.source_is_exfat ? exfat_source_disk()
+                                                  : source_disk();
                       disk.is_system_disk = state.source_is_system;
                       return disk;
                     }(),
                             .identity = expected,
                         },
                     .reader = std::make_unique<MemoryReader>(
-                        make_source_mbr(), state.physical_reads),
+                        state.source_is_fat32
+                            ? make_source_mbr_fat32()
+                            : state.source_is_exfat
+                                ? make_source_mbr_exfat()
+                                : make_source_mbr(),
+                        state.physical_reads,
+                        &state.lock_alive),
                 });
           },
       .query_gpt_bindings =
@@ -425,6 +741,7 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
               const auto&,
               const auto*,
               auto callback) {
+            ++state.vss_calls;
             state.events.push_back("vss-start");
             check(workflow.volumes.size() == 1,
                   "Exactly one NTFS volume should be snapshotted");
@@ -440,9 +757,13 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
                         ytec::vssrequester::SnapshotMapping{
                             .original_volume_guid_path =
                                 workflow.volumes.front().volume_guid_path,
-                            .snapshot_id = L"{snapshot-7}",
+                            .snapshot_id =
+                                L"{00000000-0000-0000-0000-000000000007}",
                             .snapshot_device_path =
                                 L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy7",
+                            .provider_id =
+                                L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+                            .creation_timestamp = 1'007,
                         },
                     },
                 });
@@ -473,6 +794,45 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
                 std::make_unique<MemoryReader>(
                     make_snapshot_partition()));
           },
+      .open_locked_volume =
+          [&](const auto& open) {
+            ++state.locked_open_calls;
+            state.events.push_back("lock-volume");
+            if ((!state.source_is_exfat && !state.source_is_fat32) ||
+                state.fail_locked_volume_open) {
+              return ytec::clonecore::Result<std::unique_ptr<
+                  ytec::clonecore::ISourceDiskReader>>::failure(
+                  injected_error(L"Volume lock"));
+            }
+            check(open.physical_disk_number == 0U &&
+                      open.partition_index == 0U &&
+                      open.disk_offset == kPartitionOffset &&
+                      open.length == kPartitionLength &&
+                      open.logical_sector_size == kSectorSize &&
+                       open.expected_file_system ==
+                           (state.source_is_fat32
+                                ? ytec::windowsapp::
+                                      OnlineDirectLockedFileSystem::fat32
+                                : ytec::windowsapp::
+                                      OnlineDirectLockedFileSystem::exfat),
+                   "FAT32/exFAT lock request must retain disk, extent, sector, and filesystem");
+            std::unique_ptr<ytec::clonecore::ISourceDiskReader> reader =
+                std::make_unique<LockLeaseReader>(
+                    [&]() {
+                       auto disk = state.source_is_fat32
+                           ? make_source_mbr_fat32()
+                           : make_source_mbr_exfat();
+                      return std::vector<std::byte>(
+                          disk.begin() +
+                              static_cast<std::ptrdiff_t>(kPartitionOffset),
+                          disk.begin() + static_cast<std::ptrdiff_t>(
+                              kPartitionOffset + kPartitionLength));
+                    }(),
+                    &state.lock_alive);
+            return ytec::clonecore::Result<std::unique_ptr<
+                ytec::clonecore::ISourceDiskReader>>::success(
+                std::move(reader));
+          },
       .make_snapshot_bitmap_provider =
           [&](auto bindings) {
             state.events.push_back("bitmap");
@@ -490,6 +850,9 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
             state.events.push_back("offline-before-write");
             ++state.offline_calls;
             check(offline, "Target must be offline before the first write");
+             check((!state.source_is_exfat && !state.source_is_fat32) ||
+                       state.lock_alive,
+                   "FAT32/exFAT Volume lock must be retained before target mutation");
             return ytec::clonecore::success_status();
           },
       .set_physical_target_offline =
@@ -552,9 +915,18 @@ ytec::windowsapp::OnlineDirectCloneDependencies dependencies(
                   "Disk metadata must use the physical read-only route");
             const auto snapshot =
                 context.source->read(kPartitionOffset, 512);
-            check(snapshot.has_value() &&
-                      snapshot.value()[100] == std::byte{0xA7},
-                  "NTFS data must use the Snapshot route");
+             const std::byte expected_marker = state.source_is_fat32
+                 ? std::byte{0xF3}
+                 : state.source_is_exfat ? std::byte{0xE7}
+                                         : std::byte{0xA7};
+             check(snapshot.has_value() &&
+                       snapshot.value()[100] == expected_marker,
+                   (state.source_is_exfat || state.source_is_fat32)
+                       ? "FAT32/exFAT data must use the retained Volume lock route"
+                       : "NTFS data must use the Snapshot route");
+            check((!state.source_is_exfat && !state.source_is_fat32) ||
+                      state.lock_alive,
+                  "FAT32/exFAT Volume lock must remain alive through the engine");
             const auto gap = context.source->read(4096, 512);
             check(!gap.has_value(),
                   "Unclassified live physical ranges must fail closed");
@@ -618,6 +990,163 @@ void test_composite_reader_routes_snapshot_and_rejects_crossing() {
         "A read crossing the Snapshot boundary must fail closed");
   check(!reader.value()->read(4096, 512).has_value(),
         "An unclassified physical gap must not be readable");
+}
+
+void test_mbr_0x07_exfat_layout_uses_locked_volume_route() {
+  MemoryReader source(make_source_mbr_exfat());
+  const std::vector<ytec::clonecore::VolumeBitmapBinding> bindings{
+      ytec::clonecore::VolumeBitmapBinding{
+          .partition_entry_index = 0U,
+          .volume_device_path =
+              L"\\\\?\\Volume{11111111-1111-1111-1111-111111111111}\\",
+      },
+  };
+  const auto layout = ytec::windowsapp::build_online_direct_source_layout(
+      exfat_source_disk(), source, bindings);
+  check(layout.has_value(), "MBR 0x07 exFAT should form a locked route");
+  check(layout.value().snapshot_partitions.empty() &&
+            layout.value().locked_partitions.size() == 1U &&
+            layout.value().locked_partitions.front().disk_offset ==
+                kPartitionOffset &&
+            layout.value().locked_partitions.front().length ==
+                kPartitionLength &&
+            layout.value().locked_partitions.front().file_system ==
+                ytec::windowsapp::OnlineDirectLockedFileSystem::exfat,
+        "MBR 0x07 exFAT must not be mislabeled as NTFS/VSS");
+}
+
+void test_gpt_basic_fat32_and_exfat_layouts_use_locked_routes() {
+  const auto run = [](const bool exfat) {
+    MemoryReader source(make_source_gpt_basic(exfat));
+    const std::vector<ytec::clonecore::VolumeBitmapBinding> bindings{
+        ytec::clonecore::VolumeBitmapBinding{
+            .partition_entry_index = 0U,
+            .volume_device_path =
+                L"\\\\?\\Volume{22222222-2222-2222-2222-222222222222}\\",
+        },
+    };
+    const auto layout = ytec::windowsapp::build_online_direct_source_layout(
+        gpt_basic_source_disk(exfat), source, bindings);
+    check(layout.has_value(),
+          exfat ? "GPT basic exFAT should form a locked route"
+                : "GPT basic FAT32 should form a locked route");
+    check(layout.value().partition_style ==
+              ytec::windowsapp::OnlineDirectClonePartitionStyle::gpt &&
+              layout.value().snapshot_partitions.empty() &&
+              layout.value().locked_partitions.size() == 1U &&
+              layout.value().locked_partitions.front().file_system ==
+                  (exfat
+                       ? ytec::windowsapp::OnlineDirectLockedFileSystem::exfat
+                       : ytec::windowsapp::OnlineDirectLockedFileSystem::fat32),
+          "GPT FAT32/exFAT must not be mislabeled as NTFS/VSS");
+  };
+  run(false);
+  run(true);
+}
+
+void test_online_fat32_and_exfat_require_exact_locked_volume_extent() {
+  const auto run = [](const bool exfat) {
+    auto bytes = make_source_gpt_basic(exfat);
+    const std::size_t boot = static_cast<std::size_t>(kPartitionOffset);
+    if (exfat) {
+      write_little<std::uint64_t>(
+          bytes, boot + 72U, kPartitionSectors - 1U);
+      constexpr std::uint32_t heap_offset = 56U;
+      constexpr std::uint32_t sectors_per_cluster = 8U;
+      write_little<std::uint32_t>(
+          bytes,
+          boot + 92U,
+          (kPartitionSectors - 1U - heap_offset) /
+              sectors_per_cluster);
+    } else {
+      write_little<std::uint32_t>(
+          bytes, boot + 32U, kPartitionSectors - 1U);
+    }
+    MemoryReader source(std::move(bytes));
+    const std::vector<ytec::clonecore::VolumeBitmapBinding> bindings{
+        ytec::clonecore::VolumeBitmapBinding{
+            .partition_entry_index = 0U,
+            .volume_device_path =
+                L"\\\\?\\Volume{33333333-3333-3333-3333-333333333333}\\",
+        },
+    };
+    const auto layout = ytec::windowsapp::build_online_direct_source_layout(
+        gpt_basic_source_disk(exfat), source, bindings);
+    check(!layout.has_value(),
+          exfat
+              ? "Online exFAT must reject partition slack outside the locked declared volume"
+              : "Online FAT32 must reject partition slack outside the locked declared volume");
+  };
+  run(false);
+  run(true);
+}
+
+void test_exfat_data_disk_clones_without_vss_under_retained_lock() {
+  DependencyState state;
+  state.source_is_exfat = true;
+  state.source_is_system = false;
+  const auto result = ytec::windowsapp::execute_online_direct_clone(
+      valid_exfat_request(), dependencies(state));
+  check(result.has_value(),
+        "A non-system exFAT disk should clone under an exclusive lock");
+  check(!result.value().used_vss_snapshot &&
+            !result.value().snapshot_backup_completed &&
+            !result.value().snapshots_deleted &&
+            result.value().locked_volume_count == 1U &&
+            result.value().source_consistency_verified &&
+            result.value().target_left_offline &&
+            !result.value().boot_finalization_required &&
+            state.vss_calls == 0 && state.locked_open_calls == 1 &&
+            state.engine_calls == 1 && !state.lock_alive,
+        "exFAT success must prove lock consistency, avoid VSS, and release the lock after copy");
+  const auto locked = std::find(
+      state.events.begin(), state.events.end(), "lock-volume");
+  const auto offline = std::find(
+      state.events.begin(), state.events.end(), "offline-before-write");
+  check(locked != state.events.end() && offline != state.events.end() &&
+            locked < offline,
+        "exFAT lock acquisition must precede every target mutation");
+}
+
+void test_fat32_data_disk_clones_without_vss_under_retained_lock() {
+  DependencyState state;
+  state.source_is_fat32 = true;
+  state.source_is_system = false;
+  const auto result = ytec::windowsapp::execute_online_direct_clone(
+      valid_fat32_request(), dependencies(state));
+  check(result.has_value(),
+        "A non-system FAT32 disk should clone under an exclusive lock");
+  check(!result.value().used_vss_snapshot &&
+            !result.value().snapshot_backup_completed &&
+            !result.value().snapshots_deleted &&
+            result.value().locked_volume_count == 1U &&
+            result.value().source_consistency_verified &&
+            result.value().target_left_offline &&
+            !result.value().boot_finalization_required &&
+            state.vss_calls == 0 && state.locked_open_calls == 1 &&
+            state.engine_calls == 1 && !state.lock_alive,
+        "FAT32 success must prove lock consistency, avoid VSS, and release the lock after copy");
+  const auto locked = std::find(
+      state.events.begin(), state.events.end(), "lock-volume");
+  const auto offline = std::find(
+      state.events.begin(), state.events.end(), "offline-before-write");
+  check(locked != state.events.end() && offline != state.events.end() &&
+            locked < offline,
+        "FAT32 lock acquisition must precede every target mutation");
+}
+
+void test_exfat_lock_failure_stops_before_target_mutation() {
+  DependencyState state;
+  state.source_is_exfat = true;
+  state.source_is_system = false;
+  state.fail_locked_volume_open = true;
+  const auto result = ytec::windowsapp::execute_online_direct_clone(
+      valid_exfat_request(), dependencies(state));
+  check(!result.has_value(), "An unavailable exFAT lock must fail closed");
+  check(state.vss_calls == 0 && state.locked_open_calls == 1 &&
+            state.offline_calls == 0 && state.engine_calls == 0 &&
+            !state.lock_alive,
+        "A failed exFAT lock must precede target offline and writes");
 }
 
 void test_existing_formatted_target_clones_and_stays_offline() {
@@ -934,6 +1463,18 @@ int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"composite_reader_routes_snapshot_and_rejects_crossing",
        test_composite_reader_routes_snapshot_and_rejects_crossing},
+      {"mbr_0x07_exfat_layout_uses_locked_volume_route",
+       test_mbr_0x07_exfat_layout_uses_locked_volume_route},
+      {"gpt_basic_fat32_and_exfat_layouts_use_locked_routes",
+       test_gpt_basic_fat32_and_exfat_layouts_use_locked_routes},
+      {"online_fat32_and_exfat_require_exact_locked_volume_extent",
+       test_online_fat32_and_exfat_require_exact_locked_volume_extent},
+      {"exfat_data_disk_clones_without_vss_under_retained_lock",
+       test_exfat_data_disk_clones_without_vss_under_retained_lock},
+      {"fat32_data_disk_clones_without_vss_under_retained_lock",
+       test_fat32_data_disk_clones_without_vss_under_retained_lock},
+      {"exfat_lock_failure_stops_before_target_mutation",
+       test_exfat_lock_failure_stops_before_target_mutation},
       {"existing_formatted_target_clones_and_stays_offline",
        test_existing_formatted_target_clones_and_stays_offline},
       {"final_identity_change_stops_before_target_offline",

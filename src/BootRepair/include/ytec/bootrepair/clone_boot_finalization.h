@@ -68,13 +68,16 @@ class ICloneBootFinalizationService {
 // Common Windows/WinPE orchestration boundary.  It never trusts a remembered
 // disk number: the stable target is reidentified before mounting and after all
 // temporary roots have been released.  Only exact single-disk Volume GUID
-// mappings are mounted.  The injected boot-repair service must execute the
-// existing transactional BCDBoot boundary.
+// mappings are mounted.  UEFI finalization first classifies the exact ESP
+// Volume GUID read-only and accepts only Microsoft-owned or empty content; the
+// injected boot-repair service must independently recheck that immutable
+// evidence immediately before executing the transactional BCDBoot boundary.
 [[nodiscard]] clonecore::Result<CloneBootFinalizationReport>
 finalize_cloned_windows_boot(
     const CloneBootFinalizationRequest& request,
     diskmodel::IDiskInventoryProvider& inventory,
     ICloneBootFinalizationVolumeProvider& volume_provider,
+    IEfiBootOwnershipInspector& efi_ownership_inspector,
     ISystemVolumeMountApi& mount_api,
     IStandaloneBootRepairService& boot_repair_service);
 

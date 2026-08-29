@@ -2,7 +2,9 @@ add_library(
   MediaBuilder
   STATIC
     src/adk_detection.cpp
+    src/driver_selection.cpp
     src/windows_adk_environment.cpp
+    src/windows_driver_inventory.cpp
 )
 
 target_include_directories(
@@ -18,7 +20,9 @@ target_link_libraries(
   PRIVATE
     ytec::boot_repair
     Advapi32
+    bcrypt
     Msi
+    setupapi
     Version
 )
 

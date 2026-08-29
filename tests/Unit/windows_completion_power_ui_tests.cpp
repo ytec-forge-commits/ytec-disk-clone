@@ -97,6 +97,8 @@ ready_clone_report() {
   clone.partition_table_committed = true;
   clone.snapshot_backup_completed = true;
   clone.snapshots_deleted = true;
+  clone.used_vss_snapshot = true;
+  clone.source_consistency_verified = true;
   clone.target_left_offline = true;
   clone.boot_finalization_required = true;
   clone.boot_finalization_completed = true;
@@ -140,14 +142,28 @@ ready_direct_shrink_clone_report() {
   execution.boot.boot_files_read_back_verified = true;
   execution.boot.recovery_configuration_verified = true;
   execution.boot.target_offline = true;
+  execution.boot.target_only_reconstruction = true;
+  execution.boot.exact_target_volume_extents = true;
+  execution.boot.legacy_bios = false;
+  execution.boot.real_boot_not_claimed = true;
   execution.final_commit.committed_layout_hash[0] = std::byte{0xB4};
   execution.final_commit.aggregate_write_digest =
       execution.aggregate_write_digest;
+  execution.final_commit.source_reidentified = true;
+  execution.final_commit.source_layout_unchanged = true;
   execution.final_commit.target_reidentified = true;
   execution.final_commit.staging_identity_reverified = true;
   execution.final_commit.checkpoint_reverified = true;
   execution.final_commit.staging_removed = true;
   execution.final_commit.checkpoint_retired = true;
+  execution.final_commit.checkpoint_retirement_pending = false;
+  execution.final_commit.construction_layout_non_bootable = true;
+  execution.final_commit.checkpoint_retained_through_extensions_and_boot =
+      true;
+  execution.final_commit.boot_completed_before_final_layout_publication =
+      true;
+  execution.final_commit.final_layout_published_before_checkpoint_retirement =
+      true;
   execution.final_commit.hidden_final_layout_published_and_read_back = true;
   execution.final_commit.extended_ntfs_partition_count = 1U;
   execution.final_commit.every_required_ntfs_extension_verified = true;
@@ -155,6 +171,10 @@ ready_direct_shrink_clone_report() {
   execution.final_commit.every_write_read_back = true;
   execution.final_commit.primary_layout_committed_last = true;
   execution.final_commit.target_offline = true;
+  execution.precomputed_retired_completion_hash[0] = std::byte{0xC1};
+  execution.precomputed_pending_completion_hash[0] = std::byte{0xC2};
+  execution.selected_completion_hash =
+      execution.precomputed_retired_completion_hash;
   execution.every_payload_captured_and_applied_inside_snapshot_callback = true;
   execution.snapshots_deleted_before_final_layout_commit = true;
   execution.target_left_offline = true;
@@ -285,6 +305,24 @@ void every_product_success_requires_concrete_verification() {
       ytec::windowsapp::plan_windows_completion_power_prompt(proof)
           .prompt_allowed,
       "A fully verified normal clone must be eligible");
+  auto locked_clone = ready_clone_report();
+  locked_clone.clone->snapshot_backup_completed = false;
+  locked_clone.clone->snapshots_deleted = false;
+  locked_clone.clone->used_vss_snapshot = false;
+  locked_clone.clone->locked_volume_count = 1U;
+  proof = ytec::windowsapp::make_clone_completion_power_proof(
+      locked_clone, SleepPreventionReleaseState::released, kBinding);
+  check(
+      ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+          .prompt_allowed,
+      "A clone with retained FAT/exFAT lock evidence must be eligible");
+  locked_clone.clone->locked_volume_count = 0U;
+  proof = ytec::windowsapp::make_clone_completion_power_proof(
+      locked_clone, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "A non-VSS clone without lock evidence must not prompt");
   clone.clone->target_left_offline = false;
   proof = ytec::windowsapp::make_clone_completion_power_proof(
       clone, SleepPreventionReleaseState::released, kBinding);
@@ -389,6 +427,73 @@ void direct_shrink_completion_requires_full_mandatory_evidence() {
           .prompt_allowed,
       "A fully verified direct shrink clone must be eligible");
 
+  report.execution->final_commit.final_partition_style =
+      ytec::migrationcore::MigrationPartitionStyle::mbr;
+  report.execution->final_commit.source_mbr_sector0_unchanged = true;
+  report.execution->final_commit.source_mbr_bootstrap_unchanged = true;
+  report.execution->final_commit.target_mbr_signature_collision_free = true;
+  report.execution->final_commit.final_mbr_sector0_read_back_verified = true;
+  report.execution->final_commit.final_mbr_disk_signature = 0x50607080U;
+  report.execution->final_commit.final_mbr_active_partition_count = 1U;
+  report.execution->boot.legacy_bios = true;
+  proof = ytec::windowsapp::make_direct_shrink_clone_completion_power_proof(
+      report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+          .prompt_allowed,
+      "A verified MBR/Legacy BIOS sector0-last report must be eligible");
+
+  report.execution->final_commit.source_mbr_bootstrap_unchanged = false;
+  proof = ytec::windowsapp::make_direct_shrink_clone_completion_power_proof(
+      report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "MBR completion without unchanged source bootstrap must fail closed");
+
+  report = ready_direct_shrink_clone_report();
+
+  report.execution->final_commit.checkpoint_retired = false;
+  report.execution->final_commit.checkpoint_retirement_pending = true;
+  report.execution->selected_completion_hash =
+      report.execution->precomputed_pending_completion_hash;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+          .prompt_allowed,
+      "A verified final layout with only checkpoint cleanup pending must remain eligible");
+
+  report.execution->final_commit.checkpoint_retired = true;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Conflicting retired and cleanup-pending evidence must fail closed");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->selected_completion_hash = {};
+  proof = ytec::windowsapp::make_direct_shrink_clone_completion_power_proof(
+      report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "A zero precomputed completion hash must fail the power prompt closed");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->selected_completion_hash =
+      report.execution->precomputed_pending_completion_hash;
+  proof = ytec::windowsapp::make_direct_shrink_clone_completion_power_proof(
+      report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "A completion hash for the opposite checkpoint outcome must fail the power prompt closed");
+
+  report = ready_direct_shrink_clone_report();
   report.execution->final_commit.primary_layout_committed_last = false;
   proof = ytec::windowsapp::
       make_direct_shrink_clone_completion_power_proof(
@@ -427,6 +532,69 @@ void direct_shrink_completion_requires_full_mandatory_evidence() {
       !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
            .prompt_allowed,
       "A system direct shrink clone must retain required boot proof");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.source_reidentified = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink without fresh source identity proof must not prompt");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.source_layout_unchanged = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink without unchanged source layout proof must not prompt");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.construction_layout_non_bootable = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink must prove the pre-publication construction layout was non-bootable");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.
+      checkpoint_retained_through_extensions_and_boot = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink must retain its checkpoint through extent and boot preparation");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.
+      boot_completed_before_final_layout_publication = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink must finish boot preparation before final GPT publication");
+
+  report = ready_direct_shrink_clone_report();
+  report.execution->final_commit.
+      final_layout_published_before_checkpoint_retirement = false;
+  proof = ytec::windowsapp::
+      make_direct_shrink_clone_completion_power_proof(
+          report, SleepPreventionReleaseState::released, kBinding);
+  check(
+      !ytec::windowsapp::plan_windows_completion_power_prompt(proof)
+           .prompt_allowed,
+      "Direct shrink must publish and verify the final GPT before checkpoint retirement");
 
   for (const auto [release, binding] : {
            std::pair{SleepPreventionReleaseState::release_failed, kBinding},

@@ -1,83 +1,83 @@
-﻿{
-    "spdxVersion":  "SPDX-2.3",
-    "dataLicense":  "CC0-1.0",
-    "SPDXID":  "SPDXRef-DOCUMENT",
-    "name":  "ytec-disk-clone-0.2.0-dev",
-    "documentNamespace":  "https://github.com/ytec-forge-commits/ytec-disk-clone/sbom/0.2.0-dev",
-    "creationInfo":  {
-                         "created":  "2026-08-20T00:00:00Z",
-                         "creators":  [
-                                          "Organization: Y-TEC",
-                                          "Tool: scripts/generate-sbom.ps1"
-                                      ]
-                     },
-    "packages":  [
-                     {
-                         "name":  "ytec-disk-clone",
-                         "SPDXID":  "SPDXRef-Package-ytec-disk-clone",
-                         "versionInfo":  "0.2.0-dev",
-                         "downloadLocation":  "https://github.com/ytec-forge-commits/ytec-disk-clone",
-                         "filesAnalyzed":  false,
-                         "licenseConcluded":  "Apache-2.0",
-                         "licenseDeclared":  "Apache-2.0",
-                         "copyrightText":  "Copyright 2026 Y-TEC",
-                         "supplier":  "Organization: Y-TEC",
-                         "primaryPackagePurpose":  "APPLICATION"
-                     },
-                     {
-                         "name":  "LINE Seed JP",
-                         "SPDXID":  "SPDXRef-Package-LINE-Seed-JP",
-                         "versionInfo":  "LINESeedJP_20241105",
-                         "downloadLocation":  "https://seed.line.me/src/images/fonts/LINE_Seed_JP.zip",
-                         "filesAnalyzed":  false,
-                         "licenseConcluded":  "OFL-1.1",
-                         "licenseDeclared":  "OFL-1.1",
-                         "copyrightText":  "Copyright 2020-2022 LY Corporation",
-                         "primaryPackagePurpose":  "FONT"
-                     },
-                     {
-                         "name":  "Zstandard",
-                         "SPDXID":  "SPDXRef-Package-Zstandard",
-                         "versionInfo":  "1.5.7",
-                         "downloadLocation":  "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
-                         "filesAnalyzed":  false,
-                         "licenseConcluded":  "BSD-3-Clause",
-                         "licenseDeclared":  "BSD-3-Clause",
-                         "copyrightText":  "Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.",
-                         "primaryPackagePurpose":  "LIBRARY"
-                     },
-                     {
-                         "name":  "Argon2",
-                         "SPDXID":  "SPDXRef-Package-Argon2",
-                         "versionInfo":  "20190702",
-                         "downloadLocation":  "https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz",
-                         "filesAnalyzed":  false,
-                         "licenseConcluded":  "Apache-2.0",
-                         "licenseDeclared":  "Apache-2.0",
-                         "copyrightText":  "Copyright 2015 Daniel Dinu, Dmitry Khovratovich, Jean-Philippe Aumasson, and Samuel Neves",
-                         "primaryPackagePurpose":  "LIBRARY"
-                     }
-                 ],
-    "relationships":  [
-                          {
-                              "spdxElementId":  "SPDXRef-DOCUMENT",
-                              "relationshipType":  "DESCRIBES",
-                              "relatedSpdxElement":  "SPDXRef-Package-ytec-disk-clone"
-                          },
-                          {
-                              "spdxElementId":  "SPDXRef-Package-ytec-disk-clone",
-                              "relationshipType":  "DEPENDS_ON",
-                              "relatedSpdxElement":  "SPDXRef-Package-LINE-Seed-JP"
-                          },
-                          {
-                              "spdxElementId":  "SPDXRef-Package-ytec-disk-clone",
-                              "relationshipType":  "DEPENDS_ON",
-                              "relatedSpdxElement":  "SPDXRef-Package-Zstandard"
-                          },
-                          {
-                              "spdxElementId":  "SPDXRef-Package-ytec-disk-clone",
-                              "relationshipType":  "DEPENDS_ON",
-                              "relatedSpdxElement":  "SPDXRef-Package-Argon2"
-                          }
-                      ]
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "ytec-disk-clone-1.0.0-internal-beta",
+  "documentNamespace": "https://github.com/ytec-forge-commits/ytec-disk-clone/sbom/1.0.0-internal-beta",
+  "creationInfo": {
+    "created": "2026-08-20T00:00:00Z",
+    "creators": [
+      "Organization: Y-TEC",
+      "Tool: scripts/generate-sbom.ps1"
+    ]
+  },
+  "packages": [
+    {
+      "name": "ytec-disk-clone",
+      "SPDXID": "SPDXRef-Package-ytec-disk-clone",
+      "versionInfo": "1.0.0-internal-beta",
+      "downloadLocation": "https://github.com/ytec-forge-commits/ytec-disk-clone",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright 2026 Y-TEC",
+      "supplier": "Organization: Y-TEC",
+      "primaryPackagePurpose": "APPLICATION"
+    },
+    {
+      "name": "LINE Seed JP",
+      "SPDXID": "SPDXRef-Package-LINE-Seed-JP",
+      "versionInfo": "LINESeedJP_20241105",
+      "downloadLocation": "https://seed.line.me/src/images/fonts/LINE_Seed_JP.zip",
+      "filesAnalyzed": false,
+      "licenseConcluded": "OFL-1.1",
+      "licenseDeclared": "OFL-1.1",
+      "copyrightText": "Copyright 2020-2022 LY Corporation",
+      "primaryPackagePurpose": "FONT"
+    },
+    {
+      "name": "Zstandard",
+      "SPDXID": "SPDXRef-Package-Zstandard",
+      "versionInfo": "1.5.7",
+      "downloadLocation": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.",
+      "primaryPackagePurpose": "LIBRARY"
+    },
+    {
+      "name": "Argon2",
+      "SPDXID": "SPDXRef-Package-Argon2",
+      "versionInfo": "20190702",
+      "downloadLocation": "https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "Copyright 2015 Daniel Dinu, Dmitry Khovratovich, Jean-Philippe Aumasson, and Samuel Neves",
+      "primaryPackagePurpose": "LIBRARY"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-ytec-disk-clone"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-ytec-disk-clone",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-LINE-Seed-JP"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-ytec-disk-clone",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-Zstandard"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-ytec-disk-clone",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-Argon2"
+    }
+  ]
 }

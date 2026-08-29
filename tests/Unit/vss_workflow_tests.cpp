@@ -38,6 +38,11 @@ std::wstring volume_path(const wchar_t suffix) {
          std::wstring(11, L'0') + suffix + L"}\\";
 }
 
+std::wstring guid_value(const wchar_t suffix) {
+  return std::wstring(L"{00000000-0000-0000-0000-") +
+         std::wstring(11, L'0') + suffix + L"}";
+}
+
 ytec::vssrequester::WorkflowRequest valid_request() {
   return ytec::vssrequester::WorkflowRequest{
       .administrator = true,
@@ -123,10 +128,14 @@ class MockBackend final : public ytec::vssrequester::IWorkflowBackend {
       for (std::size_t index = 0; index < volumes.size(); ++index) {
         mappings.push_back(ytec::vssrequester::SnapshotMapping{
             .original_volume_guid_path = volumes[index].volume_guid_path,
-            .snapshot_id = L"snapshot-" + std::to_wstring(index + 1U),
+            .snapshot_id = guid_value(
+                static_cast<wchar_t>(L'1' + index)),
             .snapshot_device_path =
                 L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy" +
                 std::to_wstring(index + 1),
+            .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+            .creation_timestamp =
+                static_cast<std::int64_t>(1'000U + index),
         });
       }
     }
@@ -338,9 +347,11 @@ void test_wrong_snapshot_mapping_prevents_copy() {
   backend.mappings = {
       ytec::vssrequester::SnapshotMapping{
           .original_volume_guid_path = volume_path(L'1'),
-          .snapshot_id = L"snapshot-1",
+          .snapshot_id = guid_value(L'1'),
           .snapshot_device_path =
               L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1",
+          .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+          .creation_timestamp = 1'001,
       },
   };
   const auto result =
@@ -357,15 +368,19 @@ void test_duplicate_snapshot_id_prevents_copy() {
   backend.mappings = {
       ytec::vssrequester::SnapshotMapping{
           .original_volume_guid_path = volume_path(L'1'),
-          .snapshot_id = L"snapshot-duplicate",
+          .snapshot_id = guid_value(L'9'),
           .snapshot_device_path =
               L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1",
+          .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+          .creation_timestamp = 1'001,
       },
       ytec::vssrequester::SnapshotMapping{
           .original_volume_guid_path = volume_path(L'2'),
-          .snapshot_id = L"snapshot-duplicate",
+          .snapshot_id = guid_value(L'9'),
           .snapshot_device_path =
               L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy2",
+          .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+          .creation_timestamp = 1'002,
       },
   };
   const auto result =

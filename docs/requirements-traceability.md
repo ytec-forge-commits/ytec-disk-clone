@@ -1,6 +1,6 @@
 # Y-TEC Tsumugi Drive v2 要件トレーサビリティ
 
-更新日: 2026-08-11
+更新日: 2026-08-28
 
 最上位仕様: `DiskClone_Development_Spec.md` v2.0
 
@@ -59,12 +59,12 @@
 | RSC-002 | 救出モードの有限前後・小ブロック再試行 | RescueEngine | Windows／PE合成・製品VM接続 | 再試行上限、進捗、取消、所有一時領域の書込み読戻し・封印・破棄を合成PASS。Windows／PEのlossless救出作成・復元をNIC無効VMでPASS。故障媒体／実媒体は未完了 |
 | RSC-003 | 欠損をゼロ埋め＋Map化し「一部欠損」とする | RescueEngine／Result | Windows／PE合成・製品VM接続 | Bad range、試行証跡、専用結果、単一`.tsumugi`確定を合成PASS。lossless救出分類保持をVMでPASS。実故障媒体は未完了 |
 | RSC-004 | システム救出はPE限定、縮小・変換禁止 | Planning | Windows／PE合成・製品VM接続 | Windowsのsystem拒否・事前保護済みdata限定、Windows／PEの512バイト論理セクター限定、Source最終再読込なしを合成PASS。PE救出作成・全ディスク／個別復元をVMでPASS。4Kn／実媒体は未完了 |
-| BCD-001 | ディスク選択だけでWindows／ESP／方式を自動診断 | BootDiscovery | 要拡張 | 既存1 Windows＋1 ESPのGPT、既存MBR、複数Windows拒否、候補不明拒否 |
-| BCD-002 | BCD新規再構築の退避／ロールバック | BootRepair | 再利用 | UEFI／BIOS、BCDBoot失敗、BCD欠損 |
-| BCD-003 | ESP／システム領域の安全な新規作成 | BootRepair Planner | 新規 | 縮小可能／不可、容量、追加確認 |
-| BCD-004 | 第三者EFIローダー保持／削除選択 | BootDiscovery／UI | 要拡張 | 読取り専用検出と開始拒否、保持／削除選択、未知EFI |
-| BCD-005 | このPC向けだけNVRAM修復 | BootRepair | 新規 | 同PC／他PC、BootOrder保持、失敗 |
-| BCD-006 | WinRE特定不能時は部分修復 | BootRepair | 要拡張 | Winre.wimあり／なし／複数／改ざん |
+| BCD-001 | ディスク選択だけでWindows／ESP／方式を自動診断 | BootDiscovery | WinPE製品非物理接続済み | GPT／MBR、全Windows優先順または1件選択、候補不明拒否を合成PASS。VM／実媒体を残す |
+| BCD-002 | BCD新規再構築の退避／ロールバック | BootRepair | WinPE製品非物理接続済み | UEFI／BIOS、固定BCDBoot `/c`、退避・読戻し・exact rollbackを合成PASS。実起動を残す |
+| BCD-003 | ESP／システム領域の安全な新規作成 | BootRepair Planner／VDS Adapter | WinPE製品非物理接続済み | GPT 260 MiB ESP／MBR 100 MiB Active、追加確認、完全再識別、縮小失敗分類、raw cleanup、rollbackを合成PASS。実NTFS縮小を残す |
+| BCD-004 | 第三者EFIローダー保持／削除選択 | BootDiscovery／UI／EfiDeleteTransaction | WinPE製品非物理接続済み | 保持既定、専用削除確認、immutable manifest、quarantine／rollback、未知EFI拒否を合成PASS。実ESP共存を残す |
+| BCD-005 | このPC向けだけNVRAM修復 | BootRepair／NvramRepair | WinPE製品非物理接続済み | 他PCは不変、このPCの明示時だけexact ESPへ条件付き更新、BootOrder保持、rollbackを合成PASS。実firmwareを残す |
+| BCD-006 | WinRE特定不能時は部分修復 | BootRepair／WinReRegistration | WinPE製品非物理接続済み | 署名済み診断、候補Hash・lock、再登録・再診断・rollback、特定不能時の通常起動のみ部分結果を合成PASS。実WinRE起動を残す |
 | MED-001 | Microsoft媒体を製品・Repo・Webへ同梱しない | Packaging／MediaBuilder | 再利用 | Repo／ZIP／公開物監査 |
 | MED-002 | 同意後に固定Microsoft公式URLから自動取得 | AdkAcquisition | 新規 | 同意なし通信0、URL、TLS、Redirect |
 | MED-003 | Authenticode／版／SHA-256を検証 | AdkAcquisition | 要拡張 | 改ざん、版違い、署名者違い |
@@ -73,6 +73,7 @@
 | MED-006 | 4GiB FAT32＋残りNTFS／exFAT | MediaBuilder | 要置換 | 8／16GiB、BIOS／UEFI、USB Hash |
 | MED-007 | 検証済み既存媒体をデータ保持更新 | MediaBuilder | 新規 | データ前後Hash、未知媒体拒否 |
 | MED-008 | 起動USB全体を他の書込み先から除外 | DiskModel／PE | 新規 | Clone／Restore／Rescue候補0件 |
+| MED-009 | 現PCの署名済みx64ストレージ／USBドライバーを収集・一覧表示し、他PC用メーカーINFを任意指定 | MediaBuilder／WindowsApp | 製品モジュール接続中 | PnP／DriverStoreと任意フォルダーをread-only列挙し、通常ファイル・非reparse・amd64・INFカタログ署名・パッケージ全体SHA-256をfail-closed評価。明示選択だけのimmutable DISM計画を合成PASS。Windows UIと既存WIMマウントtransactionへの実行接続を残す |
 | UI-001 | 3～4段階ウィザード、日本語UI | WindowsApp／WinPEApp | host／製品VM受入済み | Windows 6画面、WinPE 5画面、救出・復元製品VMをPASS。残る全異常文言と実機固有表示を確認する |
 | UI-002 | 1280×720、1024×600、125～200% DPI | UiSupport | host受入済み | Windows／WinPEの1024×600～1280×720、100～200%をPASS。実WinPE端末固有表示は実機で確認する |
 | UI-003 | Tab／Enter／Esc／見えるFocus | UiSupport | host受入済み | Windows／WinPEでTab focus、Enter navigation、Esc終了をPASS。破壊操作のキーボード完走は実媒体前に再確認する |
@@ -83,7 +84,7 @@
 | NET-002 | 更新確認は手動、固定Y-TEC HTTPS、表示のみ | UpdateCheck | 新規 | 起動時通信0、不正JSON、巨大応答 |
 | LIC-001 | Zstd／LINE Seed／Argon2を固定しSBOM・通知一致 | Licensing | 要拡張 | Hash、版、License、配布内容 |
 | LIC-002 | Visual Studio／MSVC使用資格を記録 | Release | リリースゲート | 使用資格、Toolchain、静的CRT証跡 |
-| REL-001 | Win10 22H2＋Win11 24H2／25H2 x64 VM回帰 | Validation | リリースゲート | NICなし、直列、合成データ。26H1 Arm64は非対応 |
+| REL-001 | Win10 22H2＋Win11 25H2 x64 VM回帰 | Validation | リリースゲート | NICなし、直列、合成データ。24H2は将来の未検証回帰対象、26H1 Arm64は非対応 |
 | REL-002 | 代表実機受入まで正式公開しない | Validation | リリースゲート | Clone／Shrink／PE／Image／USB |
 | REL-003 | 開発版ソースと非物理証跡を公開GitHubへpush | Git／Release | リリースゲート | Apache-2.0、Clean tree、commit、remote確認、正式版との区別 |
 | REL-004 | Y-TEC公式Portable ZIPは未署名、Y-TECサイトだけで公開 | Packaging／Web | リリースゲート | SHA-256、再DL一致、SmartScreen説明、第三者ビルドとの区別 |
@@ -105,7 +106,7 @@
 
 - Windows上のシステムディスク直接クローン完結
 - ジョブなしのWinPE直接クローン／イメージ作成／復元
-- `.tsumugi` v1のGolden／Fuzz／VM、個別復元の未割当領域配置のVM／実媒体検証
+- `.tsumugi` v1のGolden／Fuzzは2026-08-28にPASS。正式OS VM／実媒体検証は継続
 - 1件の中断再開、救出モード、自動BootDiscovery
 - ADK公式取得／quiet導入／offline layout／アンインストール
 - EXE隣`data`への完全移行と手動更新確認
@@ -118,6 +119,7 @@
 - `CLN-001`と`CLN-002`が新しい直接製品経路で合格する。
 - `IMG-001`～`IMG-009`の形式・暗号・復元安全試験が合格する。
 - `MED-001`～`MED-008`がADK未導入クリーンVMと媒体試験で合格する。
-- 全安全境界、静的解析、ASan、Fuzz、ライセンス、SBOM検査が合格する。
+- 全安全境界、静的解析、ASan、Fuzz、ライセンス、SBOM、Codex Security差分監査は
+  2026-08-28に合格。以後の差分では再実行する。
 - 正式OS VMマトリクス、UIマトリクス、代表実機受入が合格する。
 - Portable ZIPと公開ページのSHA-256が一致する。

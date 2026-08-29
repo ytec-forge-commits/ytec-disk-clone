@@ -2,6 +2,7 @@
 
 #include "ytec/vssrequester/tsumugi_snapshot.h"
 #include "ytec/vssrequester/windows_backend.h"
+#include "ytec/vssrequester/windows_diff_area_observer.h"
 #include "ytec/vssrequester/workflow.h"
 
 #include <functional>
@@ -47,6 +48,7 @@ struct WindowsOnlineTsumugiBackupRequest final {
   PreparedOnlineTsumugiBackup prepared;
   AsyncWaitOptions async_wait;
   clonecore::DiskOperationCallbacks callbacks;
+  VssDiffAreaReviewCallback diff_area_review_callback;
   const clonecore::Logger* logger{};
 };
 

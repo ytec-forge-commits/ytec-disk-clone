@@ -29,8 +29,9 @@ enum class ShrinkFileSystemDisposition : std::uint8_t {
 };
 
 enum class ShrinkSurplusAllocation : std::uint8_t {
-  automatic_proportional,
-  leave_unallocated,
+  automatic_proportional = 0,
+  leave_unallocated = 1,
+  selected_data_partition = 2,
 };
 
 enum class MigrationPartitionRole : std::uint8_t {
@@ -77,6 +78,9 @@ struct ShrinkMigrationRequest final {
   bool bitlocker_fully_decrypted{};
   ShrinkSurplusAllocation surplus_allocation{
       ShrinkSurplusAllocation::automatic_proportional};
+  // Required only for selected_data_partition. It is the immutable source
+  // partition-table index, never a transient UI row position.
+  std::optional<std::uint32_t> surplus_target_source_table_index;
   std::vector<ShrinkSourcePartition> source_partitions;
 };
 
@@ -101,6 +105,7 @@ struct ShrinkMigrationPlan final {
   std::uint64_t minimum_target_size_bytes{};
   std::uint64_t target_size_bytes{};
   std::uint64_t unallocated_tail_bytes{};
+  std::optional<std::uint32_t> surplus_target_source_table_index;
   bool source_remains_unchanged{true};
   bool boot_finalization_required{};
   std::vector<ShrinkPlannedPartition> target_partitions;

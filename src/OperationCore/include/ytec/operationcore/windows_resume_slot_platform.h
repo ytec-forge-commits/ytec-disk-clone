@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ytec::operationcore {
 
@@ -41,12 +42,27 @@ struct WindowsResumeOwnedPartial final {
   ResumeOwnedPartialBinding binding{};
 };
 
+struct WindowsResumeOwnedObject final {
+  std::wstring canonical_path;
+  ResumeOwnedObjectBinding binding{};
+};
+
 // Opens a caller-selected .partial and derives its binding from the regular,
 // non-reparse, single-link file object.  The caller supplies operation and
 // engine identities; this helper supplies only the opened file-object hash.
 [[nodiscard]] clonecore::Result<WindowsResumeOwnedPartial>
 bind_windows_resume_owned_partial(
     const std::wstring& path,
+    const OperationId& operation_id,
+    const ResumeIdentityBinding& identities);
+
+// Schema-v3 counterpart of bind_windows_resume_owned_partial(). The role is
+// included in the file-object digest domain so one file cannot be rebound as a
+// different transaction object.
+[[nodiscard]] clonecore::Result<WindowsResumeOwnedObject>
+bind_windows_resume_owned_object(
+    const std::wstring& path,
+    ResumeOwnedObjectRole role,
     const OperationId& operation_id,
     const ResumeIdentityBinding& identities);
 
@@ -61,6 +77,10 @@ struct WindowsResumeSlotPlatformOptions final {
   // persisted slot carries its authenticated partial path and can therefore
   // be inspected/discarded after process restart without this value.
   std::optional<WindowsResumeOwnedPartial> owned_partial_for_create;
+
+  // Required while creating a schema-v3 multi-object slot. The canonical
+  // vector is role-sorted and must exactly match ResumeSlotRecord::owned_objects.
+  std::vector<WindowsResumeOwnedObject> owned_objects_for_create;
 };
 
 // Creates the production Win32 adapter.  The EXE parent and its existing data
@@ -75,6 +95,7 @@ make_windows_resume_slot_platform(
 make_current_executable_windows_resume_slot_platform(
     WindowsResumeDataBackingProbe prove_data_backing_separation,
     std::optional<WindowsResumeOwnedPartial> owned_partial_for_create =
-        std::nullopt);
+        std::nullopt,
+    std::vector<WindowsResumeOwnedObject> owned_objects_for_create = {});
 
 }  // namespace ytec::operationcore

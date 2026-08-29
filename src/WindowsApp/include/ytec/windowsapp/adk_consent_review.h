@@ -2,9 +2,12 @@
 
 #include "ytec/windowsapp/adk_acquisition.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -73,11 +76,101 @@ struct AdkConsentReviewAcknowledgement final {
   bool explicit_acceptance{};
 };
 
+// In-memory only result of the pre-consent bootstrap verification.  The
+// Microsoft document is never added to the repository or product package and
+// the owned staging area must already have been removed before this value can
+// be presented.
+struct AdkVerifiedEulaDocument final {
+  AdkEulaDocumentReceipt receipt;
+  std::vector<std::byte> rtf_document;
+  bool staging_removed{};
+};
+
+struct AdkConsentDocumentPreparationRequest final {
+  AdkAcquisitionSource source{AdkAcquisitionSource::official_download};
+  std::filesystem::path offline_layout_root;
+
+  // This is consent to retrieve or locally stage the exact pinned bootstrap
+  // solely to display its ADK-specific EULA.  It is not EULA acceptance and
+  // does not authorize an installer.
+  bool explicit_eula_retrieval_confirmed{};
+};
+
+using AdkVerifiedEulaExtractor = std::function<
+    clonecore::Result<AdkVerifiedEulaDocument>(
+        const AdkPinnedPayload&,
+        const AdkVerifiedPayload&,
+        const AdkEmbeddedEulaPin&)>;
+
+// Acquires only the pinned Deployment Tools bootstrap, verifies its complete
+// identity, extracts the bounded EULA member through the supplied audited
+// extractor, validates the in-memory document, and removes staging.  It never
+// inspects or launches an installer.  The complete release gate is checked
+// before a path or platform method is observed.
+[[nodiscard]] clonecore::Result<AdkVerifiedEulaDocument>
+prepare_adk_consent_document(
+    const AdkReleaseManifest& manifest,
+    const AdkConsentDocumentPreparationRequest& request,
+    IAdkAcquisitionPlatform& platform,
+    const AdkVerifiedEulaExtractor& extractor);
+
+struct AdkConsentPresentationFacts final {
+  bool official_sources_presented{};
+  bool acquired_components_presented{};
+  bool eula_body_opened{};
+  bool eula_body_end_reached{};
+  bool explicit_acceptance{};
+};
+
+struct AdkConsentDialogLayout final {
+  int client_width{};
+  int client_height{};
+  int summary_left{};
+  int summary_top{};
+  int summary_width{};
+  int summary_height{};
+  int eula_left{};
+  int eula_top{};
+  int eula_width{};
+  int eula_height{};
+  int acceptance_left{};
+  int acceptance_top{};
+  int acceptance_width{};
+  int acceptance_height{};
+  int accept_left{};
+  int accept_top{};
+  int accept_width{};
+  int accept_height{};
+  int cancel_left{};
+  int cancel_top{};
+  int cancel_width{};
+  int cancel_height{};
+  bool bounded{};
+};
+
+// Validates that the exact verified RTF bytes, receipt, and removed staging
+// still bind to the current manifest before the RichEdit product UI sees them.
+[[nodiscard]] clonecore::Status validate_adk_eula_document_for_presentation(
+    const AdkReleaseManifest& manifest,
+    const AdkVerifiedEulaDocument& document);
+
+[[nodiscard]] AdkConsentDialogLayout calculate_adk_consent_dialog_layout(
+    int available_width,
+    int available_height) noexcept;
+
+// Converts only observed product-UI facts into the acknowledgement consumed
+// by the existing consent contract.  Merely opening the dialog or checking a
+// box before the end of the verified document never grants consent.
+[[nodiscard]] clonecore::Result<AdkConsentReviewAcknowledgement>
+complete_adk_consent_presentation(
+    const AdkReleaseManifest& manifest,
+    const AdkVerifiedEulaDocument& document,
+    const AdkConsentPresentationFacts& facts);
+
 // Produces display-ready, exact source/component rows only when both the
 // release manifest and a bounded ADK-specific EULA receipt are verified.
-// The bounded Windows extractor can produce the receipt, but current 1.0.0
-// still has no product UI that presents the complete returned RTF before
-// consent. A missing receipt remains a hard stop.
+// The bounded Windows extractor and product RichEdit review can produce and
+// present the complete returned RTF. A missing receipt remains a hard stop.
 [[nodiscard]] AdkConsentReviewView build_adk_consent_review(
     const AdkReleaseManifest* manifest,
     const AdkEulaDocumentReceipt* eula_receipt);

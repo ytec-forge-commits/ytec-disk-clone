@@ -44,6 +44,11 @@ make_tsumugi_source_identity_hashes(
 
 struct OnlineImageCreateRequest final {
   diskmodel::DiskInfo selected_source;
+  // Empty preserves the legacy whole-disk path. Non-empty values are
+  // one-based PartitionNumber values from selected_source and are normalized
+  // again after stable reidentification. Required Windows regions are forced
+  // by DiskModel and cannot be omitted by a caller.
+  std::vector<std::uint32_t> selected_partition_numbers;
   std::wstring final_path;
   bool administrator{};
   std::uint32_t windows_major{};
@@ -58,6 +63,7 @@ struct OnlineImageCreateRequest final {
   bool replace_existing{};
   vssrequester::AsyncWaitOptions async_wait;
   clonecore::DiskOperationCallbacks callbacks;
+  vssrequester::VssDiffAreaReviewCallback diff_area_review_callback;
   const clonecore::Logger* logger{};
 };
 
@@ -68,12 +74,14 @@ using OnlineImageReadOnlyDiskOpener = std::function<clonecore::Result<
 using OnlineImageGptVolumeBindingQuery = std::function<clonecore::Result<
     std::vector<clonecore::VolumeBitmapBinding>>(
     const diskmodel::DiskInfo&,
-    const clonecore::GptDisk&)>;
+    const clonecore::GptDisk&,
+    std::span<const std::uint32_t>)>;
 
 using OnlineImageMbrVolumeBindingQuery = std::function<clonecore::Result<
     std::vector<clonecore::VolumeBitmapBinding>>(
     const diskmodel::DiskInfo&,
-    const clonecore::MbrDisk&)>;
+    const clonecore::MbrDisk&,
+    std::span<const std::uint32_t>)>;
 
 using OnlineImageDestinationFileSystemQuery = std::function<clonecore::Result<
     imageformat::TsumugiImageStorageFileSystem>(const std::wstring&)>;

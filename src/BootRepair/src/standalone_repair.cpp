@@ -1045,7 +1045,7 @@ clonecore::Status validate_boot_repair_efi_ownership(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"UEFI NVRAM修復方針",
-        L"現在PCのNVRAM変更は未接続のため実行しません"));
+        L"現在PCのNVRAM変更は専用の条件付きtransactionが所有するため、BCD transactionでは実行しません"));
   }
   if (request.firmware != BcdBootFirmware::uefi) {
     if (request.require_efi_ownership_recheck ||
@@ -1088,7 +1088,7 @@ clonecore::Status validate_boot_repair_efi_ownership(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"UEFI第三者EFI削除方針",
-        L"第三者EFI削除トランザクションは未接続のため実行しません"));
+        L"第三者EFI削除は専用のimmutable-manifest transactionが所有するため、BCD transactionでは実行しません"));
   }
   switch (observed.state) {
     case EfiBootOwnershipState::microsoft_only_or_empty:

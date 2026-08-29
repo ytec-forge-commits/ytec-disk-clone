@@ -82,7 +82,7 @@ void standard_and_compact_layouts_fit() {
   layout_fits(1024, 600);
 }
 
-void ui_state_requires_review_and_exact_ok() {
+void ui_state_requires_review_without_destructive_ok_token() {
   using ytec::winpeapp::WinPeImageCreateUiInput;
   auto view = ytec::winpeapp::build_winpe_image_create_ui_view({
       .inventory_ready = true,
@@ -104,9 +104,9 @@ void ui_state_requires_review_and_exact_ok() {
       .reviewed = true,
       .confirmation_text = L"ok",
   });
-  check(view.confirmation_visible && view.execute_visible &&
-            !view.execute_enabled,
-        "review should reveal but not enable execution before OK");
+  check(!view.confirmation_visible && !view.confirmation_enabled &&
+            view.execute_visible && view.execute_enabled,
+        "source-to-file review should enable execution without a destructive-target OK token");
 
   view = ytec::winpeapp::build_winpe_image_create_ui_view({
       .inventory_ready = true,
@@ -117,8 +117,8 @@ void ui_state_requires_review_and_exact_ok() {
       .reviewed = true,
       .confirmation_text = L"OK ",
   });
-  check(!view.execute_enabled,
-        "confirmation must reject whitespace around uppercase OK");
+  check(view.execute_enabled && !view.confirmation_visible,
+        "legacy confirmation text must not gate source-to-file execution");
 
   view = ytec::winpeapp::build_winpe_image_create_ui_view({
       .inventory_ready = true,
@@ -129,8 +129,8 @@ void ui_state_requires_review_and_exact_ok() {
       .reviewed = true,
       .confirmation_text = L"OK",
   });
-  check(view.execute_enabled,
-        "the reviewed operation should execute after exact OK");
+  check(view.execute_enabled && !view.confirmation_visible,
+        "a reviewed source-to-file operation should remain executable without OK");
 
   view = ytec::winpeapp::build_winpe_image_create_ui_view({
       .inventory_ready = true,
@@ -175,7 +175,7 @@ void progress_locks_selection_and_exposes_safe_cancel() {
 int main() {
   try {
     standard_and_compact_layouts_fit();
-    ui_state_requires_review_and_exact_ok();
+    ui_state_requires_review_without_destructive_ok_token();
     progress_locks_selection_and_exposes_safe_cancel();
     std::cout << "winpe image create ui tests: PASS\n";
     return EXIT_SUCCESS;

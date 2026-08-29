@@ -1,4 +1,5 @@
 #include "ytec/imageformat/tsumugi_stream.h"
+#include "ytec/imageformat/tsumugi_create_resume.h"
 
 #include "ytec/clonecore/unique_handle.h"
 #include "ytec/imageformat/compression.h"
@@ -903,6 +904,7 @@ class OwnedPartial final {
   OwnedPartial& operator=(OwnedPartial&&) = delete;
 
   [[nodiscard]] clonecore::Status create(const std::wstring& path);
+  [[nodiscard]] clonecore::Status open_existing(const std::wstring& path);
   [[nodiscard]] HANDLE get() const noexcept;
   [[nodiscard]] const FileIdentity& identity() const noexcept;
   [[nodiscard]] clonecore::Status flush() const;
@@ -935,7 +937,8 @@ clonecore::Result<std::vector<std::byte>> decode_chunk(
     const TsumugiKey* key);
 
 clonecore::Result<ValidatedBuild> validate_build_request(
-    const TsumugiStreamBuildRequest& request);
+    const TsumugiStreamBuildRequest& request,
+    bool allow_existing_owned_partial = false);
 
 clonecore::Result<CommitResult> commit_partial(
     OwnedPartial& partial,
@@ -1092,6 +1095,1515 @@ clonecore::Result<T> fail_and_cleanup(
 }  // namespace ytec::imageformat
 
 namespace ytec::imageformat {
+namespace {
+
+constexpr std::array<std::byte, 8U> kResumeJournalMagic{
+    std::byte{'Y'}, std::byte{'T'}, std::byte{'R'}, std::byte{'J'},
+    std::byte{'N'}, std::byte{'L'}, std::byte{'1'}, std::byte{0}};
+constexpr std::array<std::byte, 8U> kResumeJournalFrameMagic{
+    std::byte{'Y'}, std::byte{'T'}, std::byte{'R'}, std::byte{'F'},
+    std::byte{'R'}, std::byte{'M'}, std::byte{'1'}, std::byte{0}};
+constexpr std::uint16_t kResumeJournalMajor = 1U;
+constexpr std::uint16_t kResumeJournalMinor = 0U;
+constexpr std::uint32_t kResumeJournalHeaderBytes = 512U;
+constexpr std::uint32_t kResumeJournalFrameBytes = 240U;
+constexpr std::uint32_t kResumeJournalEncrypted = 0x01U;
+constexpr std::size_t kResumeJournalChainRootOffset = 400U;
+constexpr std::size_t kResumeJournalHeaderHashOffset = 432U;
+constexpr std::size_t kResumeJournalFrameChainOffset = 200U;
+constexpr std::string_view kResumeJournalRootDomain =
+    "YTEC-TSUMUGI-CREATE-RESUME-ROOT-V1";
+constexpr std::string_view kResumeJournalHeaderDomain =
+    "YTEC-TSUMUGI-CREATE-RESUME-HEADER-V1";
+constexpr std::string_view kResumeJournalFrameDomain =
+    "YTEC-TSUMUGI-CREATE-RESUME-FRAME-V1";
+constexpr std::string_view kResumeJournalEmptyDomain =
+    "YTEC-TSUMUGI-CREATE-RESUME-EMPTY-V1";
+
+clonecore::Result<Sha256Digest> resume_domain_hash(
+    const std::string_view domain,
+    const std::span<const std::byte> bytes) {
+  std::vector<std::byte> canonical;
+  canonical.reserve(domain.size() + bytes.size());
+  for (const char value : domain) {
+    canonical.push_back(static_cast<std::byte>(value));
+  }
+  canonical.insert(canonical.end(), bytes.begin(), bytes.end());
+  return sha256(canonical);
+}
+
+std::array<std::byte, kTsumugiChunkRecordSize> serialize_resume_record(
+    const TsumugiChunkRecord& record) noexcept {
+  std::array<std::byte, kTsumugiChunkRecordSize> result{};
+  const auto bytes = std::span<std::byte>(result);
+  write_little(bytes, 0U, record.logical_offset);
+  write_little(bytes, 8U, record.logical_length);
+  write_little(bytes, 16U, record.stored_offset);
+  write_little(bytes, 24U, record.stored_length);
+  write_little(bytes, 32U, raw_flags(record.flags));
+  write_little(
+      bytes, 36U, static_cast<std::uint16_t>(record.compression));
+  write_little(bytes, 40U, record.nonce_counter);
+  std::copy(
+      record.plaintext_hash.begin(),
+      record.plaintext_hash.end(),
+      bytes.begin() + 48U);
+  std::copy(
+      record.authentication_tag.begin(),
+      record.authentication_tag.end(),
+      bytes.begin() + 80U);
+  return result;
+}
+
+TsumugiChunkRecord parse_resume_record(
+    const std::span<const std::byte, kTsumugiChunkRecordSize> bytes) {
+  TsumugiChunkRecord record{};
+  record.logical_offset = read_little<std::uint64_t>(bytes, 0U);
+  record.logical_length = read_little<std::uint64_t>(bytes, 8U);
+  record.stored_offset = read_little<std::uint64_t>(bytes, 16U);
+  record.stored_length = read_little<std::uint64_t>(bytes, 24U);
+  record.flags = static_cast<TsumugiChunkFlags>(
+      read_little<std::uint32_t>(bytes, 32U));
+  record.compression = static_cast<ImageCompression>(
+      read_little<std::uint16_t>(bytes, 36U));
+  record.nonce_counter = read_little<std::uint64_t>(bytes, 40U);
+  std::copy_n(bytes.begin() + 48U, 32U, record.plaintext_hash.begin());
+  std::copy_n(
+      bytes.begin() + 80U, 16U, record.authentication_tag.begin());
+  return record;
+}
+
+clonecore::Result<std::vector<std::byte>> serialize_resume_header(
+    TsumugiCreateResumeJournalHeaderV1& header) {
+  std::vector<std::byte> bytes(
+      kResumeJournalHeaderBytes, std::byte{0});
+  auto output = std::span<std::byte>(bytes);
+  std::copy(kResumeJournalMagic.begin(), kResumeJournalMagic.end(),
+            output.begin());
+  write_little(output, 8U, kResumeJournalMajor);
+  write_little(output, 10U, kResumeJournalMinor);
+  write_little(output, 12U, kResumeJournalHeaderBytes);
+  write_little(output, 16U, kEndianMarker);
+  write_little(
+      output, 20U, header.encrypted ? kResumeJournalEncrypted : 0U);
+  write_little(
+      output, 24U, static_cast<std::uint16_t>(header.payload_kind));
+  write_little(
+      output, 26U, static_cast<std::uint16_t>(header.compression));
+  write_little(
+      output,
+      28U,
+      static_cast<std::uint8_t>(header.verification_mode));
+  write_little(output, 32U, header.source_disk_size);
+  write_little(output, 40U, header.expected_logical_bytes);
+  write_little(output, 48U, header.chunk_count);
+  write_little(output, 56U, std::uint64_t{0U});
+  // manifest length is derivable from metadata length and chunk count. The
+  // field remains reserved zero in v1 to prevent two competing declarations.
+  write_little(output, 64U, header.metadata_length);
+  write_little(output, 72U, header.payload_offset);
+  write_little(output, 80U, header.logical_sector_size);
+  write_little(output, 84U, header.physical_sector_size);
+  write_little(output, 88U, header.chunk_size);
+  write_little(output, 92U, header.argon2.memory_kib);
+  write_little(output, 96U, header.argon2.iterations);
+  write_little(output, 100U, header.argon2.parallelism);
+  std::copy(header.binding.operation_id.begin(),
+            header.binding.operation_id.end(), output.begin() + 104U);
+  std::copy(header.binding.plan_hash.begin(), header.binding.plan_hash.end(),
+            output.begin() + 120U);
+  std::copy(header.binding.source_identity_hash.begin(),
+            header.binding.source_identity_hash.end(), output.begin() + 152U);
+  std::copy(header.binding.source_state_hash.begin(),
+            header.binding.source_state_hash.end(), output.begin() + 184U);
+  std::copy(header.binding.destination_storage_identity_hash.begin(),
+            header.binding.destination_storage_identity_hash.end(),
+            output.begin() + 216U);
+  std::copy(header.binding.output_identity_hash.begin(),
+            header.binding.output_identity_hash.end(), output.begin() + 248U);
+  std::copy(header.final_path_hash.begin(), header.final_path_hash.end(),
+            output.begin() + 280U);
+  std::copy(header.manifest_hash.begin(), header.manifest_hash.end(),
+            output.begin() + 312U);
+  std::copy(header.image_id.begin(), header.image_id.end(),
+            output.begin() + 344U);
+  std::copy(header.argon2.salt.begin(), header.argon2.salt.end(),
+            output.begin() + 360U);
+  std::copy(header.base_nonce.begin(), header.base_nonce.end(),
+            output.begin() + 376U);
+
+  auto root = resume_domain_hash(kResumeJournalRootDomain, bytes);
+  if (!root) {
+    return clonecore::Result<std::vector<std::byte>>::failure(root.error());
+  }
+  header.chain_root = root.value();
+  std::copy(header.chain_root.begin(), header.chain_root.end(),
+            output.begin() + kResumeJournalChainRootOffset);
+  auto header_hash = resume_domain_hash(kResumeJournalHeaderDomain, bytes);
+  if (!header_hash) {
+    return clonecore::Result<std::vector<std::byte>>::failure(
+        header_hash.error());
+  }
+  std::copy(header_hash.value().begin(), header_hash.value().end(),
+            output.begin() + kResumeJournalHeaderHashOffset);
+  return clonecore::Result<std::vector<std::byte>>::success(std::move(bytes));
+}
+
+clonecore::Result<std::vector<std::byte>> serialize_resume_frame(
+    TsumugiCreateResumeJournalChunkV1& chunk) {
+  std::vector<std::byte> bytes(kResumeJournalFrameBytes, std::byte{0});
+  auto output = std::span<std::byte>(bytes);
+  std::copy(kResumeJournalFrameMagic.begin(), kResumeJournalFrameMagic.end(),
+            output.begin());
+  write_little(output, 8U, kResumeJournalMajor);
+  write_little(output, 10U, kResumeJournalMinor);
+  write_little(output, 12U, kResumeJournalFrameBytes);
+  write_little(output, 16U, chunk.chunk_index);
+  const auto record = serialize_resume_record(chunk.record);
+  std::copy(record.begin(), record.end(), output.begin() + 24U);
+  std::copy(chunk.stored_bytes_hash.begin(), chunk.stored_bytes_hash.end(),
+            output.begin() + 136U);
+  std::copy(chunk.previous_chain_hash.begin(),
+            chunk.previous_chain_hash.end(), output.begin() + 168U);
+  auto chain = resume_domain_hash(kResumeJournalFrameDomain, bytes);
+  if (!chain) {
+    return clonecore::Result<std::vector<std::byte>>::failure(chain.error());
+  }
+  chunk.chain_hash = chain.value();
+  std::copy(chunk.chain_hash.begin(), chunk.chain_hash.end(),
+            output.begin() + kResumeJournalFrameChainOffset);
+  return clonecore::Result<std::vector<std::byte>>::success(std::move(bytes));
+}
+
+bool resume_binding_valid(
+    const TsumugiCreateResumeBindingV1& binding) noexcept {
+  return !all_zero(binding.operation_id) && !all_zero(binding.plan_hash) &&
+      !all_zero(binding.source_identity_hash) &&
+      !all_zero(binding.source_state_hash) &&
+      !all_zero(binding.destination_storage_identity_hash) &&
+      !all_zero(binding.output_identity_hash);
+}
+
+bool resume_phase_known(const TsumugiCreateResumePhaseV1 phase) noexcept {
+  return phase == TsumugiCreateResumePhaseV1::preparing ||
+      phase == TsumugiCreateResumePhaseV1::prepared ||
+      phase == TsumugiCreateResumePhaseV1::commit_ready;
+}
+
+}  // namespace
+
+clonecore::Result<TsumugiCreateResumeJournalInspectionV1>
+inspect_tsumugi_create_resume_journal_v1(
+    const std::span<const std::byte> journal_bytes) {
+  try {
+  if (journal_bytes.size() < kResumeJournalHeaderBytes ||
+      journal_bytes.size() > kTsumugiCreateResumeJournalMaximumBytes) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal寸法",
+        L"journal寸法が固定上限またはheader下限の範囲外です"));
+  }
+  const auto header_bytes = journal_bytes.first(kResumeJournalHeaderBytes);
+  if (!std::equal(kResumeJournalMagic.begin(), kResumeJournalMagic.end(),
+                  header_bytes.begin()) ||
+      read_little<std::uint16_t>(header_bytes, 8U) != kResumeJournalMajor ||
+      read_little<std::uint16_t>(header_bytes, 10U) != kResumeJournalMinor ||
+      read_little<std::uint32_t>(header_bytes, 12U) !=
+          kResumeJournalHeaderBytes ||
+      read_little<std::uint32_t>(header_bytes, 16U) != kEndianMarker) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal版",
+        L"magic、major/minor、header寸法またはendianが未対応です"));
+  }
+  const std::uint32_t flags =
+      read_little<std::uint32_t>(header_bytes, 20U);
+  if ((flags & ~kResumeJournalEncrypted) != 0U ||
+      std::any_of(header_bytes.begin() + 29U, header_bytes.begin() + 32U,
+                  [](const std::byte value) { return value != std::byte{0}; }) ||
+      read_little<std::uint64_t>(header_bytes, 56U) != 0U ||
+      std::any_of(header_bytes.begin() + 388U, header_bytes.begin() + 400U,
+                  [](const std::byte value) { return value != std::byte{0}; }) ||
+      std::any_of(header_bytes.begin() + 464U, header_bytes.end(),
+                  [](const std::byte value) { return value != std::byte{0}; })) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal flags",
+        L"unknown flagsまたはreserved領域が非zeroです"));
+  }
+
+  std::vector<std::byte> canonical_root(header_bytes.begin(),
+                                         header_bytes.end());
+  std::fill(canonical_root.begin() + kResumeJournalChainRootOffset,
+            canonical_root.begin() + kResumeJournalChainRootOffset + 32U,
+            std::byte{0});
+  std::fill(canonical_root.begin() + kResumeJournalHeaderHashOffset,
+            canonical_root.begin() + kResumeJournalHeaderHashOffset + 32U,
+            std::byte{0});
+  auto calculated_root =
+      resume_domain_hash(kResumeJournalRootDomain, canonical_root);
+  Sha256Digest stored_root{};
+  std::copy_n(header_bytes.begin() + kResumeJournalChainRootOffset, 32U,
+              stored_root.begin());
+  std::vector<std::byte> canonical_header(header_bytes.begin(),
+                                           header_bytes.end());
+  std::fill(canonical_header.begin() + kResumeJournalHeaderHashOffset,
+            canonical_header.begin() + kResumeJournalHeaderHashOffset + 32U,
+            std::byte{0});
+  auto calculated_header =
+      resume_domain_hash(kResumeJournalHeaderDomain, canonical_header);
+  Sha256Digest stored_header{};
+  std::copy_n(header_bytes.begin() + kResumeJournalHeaderHashOffset, 32U,
+              stored_header.begin());
+  if (!calculated_root || !calculated_header ||
+      calculated_root.value() != stored_root ||
+      calculated_header.value() != stored_header) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(verification_error(
+        L"Tsumugi resume journal header Hash",
+        L"chain rootまたはheader Hashが一致しません"));
+  }
+
+  TsumugiCreateResumeJournalInspectionV1 inspection{};
+  auto& header = inspection.header;
+  const auto copy_digest = [&](const std::size_t offset,
+                               Sha256Digest& output) {
+    std::copy_n(header_bytes.begin() +
+                    static_cast<std::ptrdiff_t>(offset),
+                output.size(), output.begin());
+  };
+  std::copy_n(header_bytes.begin() + 104U, 16U,
+              header.binding.operation_id.begin());
+  copy_digest(120U, header.binding.plan_hash);
+  copy_digest(152U, header.binding.source_identity_hash);
+  copy_digest(184U, header.binding.source_state_hash);
+  copy_digest(216U, header.binding.destination_storage_identity_hash);
+  copy_digest(248U, header.binding.output_identity_hash);
+  copy_digest(280U, header.final_path_hash);
+  copy_digest(312U, header.manifest_hash);
+  std::copy_n(header_bytes.begin() + 344U, 16U, header.image_id.begin());
+  std::copy_n(header_bytes.begin() + 360U, 16U,
+              header.argon2.salt.begin());
+  std::copy_n(header_bytes.begin() + 376U, kTsumugiGcmNonceBytes,
+              header.base_nonce.begin());
+  header.chain_root = stored_root;
+  header.payload_kind = static_cast<TsumugiPayloadKind>(
+      read_little<std::uint16_t>(header_bytes, 24U));
+  header.compression = static_cast<ImageCompression>(
+      read_little<std::uint16_t>(header_bytes, 26U));
+  header.verification_mode = static_cast<TsumugiCreateVerificationMode>(
+      read_little<std::uint8_t>(header_bytes, 28U));
+  header.source_disk_size = read_little<std::uint64_t>(header_bytes, 32U);
+  header.expected_logical_bytes =
+      read_little<std::uint64_t>(header_bytes, 40U);
+  header.chunk_count = read_little<std::uint64_t>(header_bytes, 48U);
+  header.metadata_length = read_little<std::uint64_t>(header_bytes, 64U);
+  header.payload_offset = read_little<std::uint64_t>(header_bytes, 72U);
+  header.logical_sector_size = read_little<std::uint32_t>(header_bytes, 80U);
+  header.physical_sector_size = read_little<std::uint32_t>(header_bytes, 84U);
+  header.chunk_size = read_little<std::uint32_t>(header_bytes, 88U);
+  header.argon2.memory_kib = read_little<std::uint32_t>(header_bytes, 92U);
+  header.argon2.iterations = read_little<std::uint32_t>(header_bytes, 96U);
+  header.argon2.parallelism = read_little<std::uint32_t>(header_bytes, 100U);
+  header.encrypted = (flags & kResumeJournalEncrypted) != 0U;
+
+  std::uint64_t records_bytes{};
+  std::uint64_t expected_payload{};
+  if (!resume_binding_valid(header.binding) ||
+      all_zero(header.final_path_hash) || all_zero(header.manifest_hash) ||
+      all_zero(header.chain_root) || all_zero(header.image_id) ||
+      header.payload_kind != TsumugiPayloadKind::exact_disk ||
+      !valid_compression(header.compression) ||
+      !is_supported_tsumugi_create_verification_mode(
+          header.verification_mode) ||
+      header.source_disk_size == 0U ||
+      header.expected_logical_bytes == 0U ||
+      header.expected_logical_bytes > header.source_disk_size ||
+      header.chunk_count == 0U ||
+      header.chunk_count > kTsumugiCreateResumeJournalMaximumRecords ||
+      !is_supported_sector_size_pair(
+          header.logical_sector_size, header.physical_sector_size) ||
+      !valid_chunk_size(header.chunk_size) ||
+      !checked_multiply(
+          header.chunk_count, kTsumugiChunkRecordSize, records_bytes) ||
+      header.metadata_length < kTsumugiMetadataHeaderSize + records_bytes ||
+      header.metadata_length > kTsumugiMaximumMetadataBytes ||
+      !checked_add(
+          kTsumugiHeaderSize, header.metadata_length, expected_payload) ||
+      expected_payload != header.payload_offset ||
+      (header.encrypted &&
+       (header.argon2.memory_kib != kTsumugiArgon2MemoryKiB ||
+        header.argon2.iterations != kTsumugiArgon2Iterations ||
+        header.argon2.parallelism != kTsumugiArgon2Parallelism ||
+        all_zero(header.argon2.salt) || all_zero(header.base_nonce))) ||
+      (!header.encrypted &&
+       (header.argon2.memory_kib != 0U ||
+        header.argon2.iterations != 0U ||
+        header.argon2.parallelism != 0U ||
+        !all_zero(header.argon2.salt) || !all_zero(header.base_nonce)))) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal header構造",
+        L"束縛、形式上限、セクション寸法、または非秘密暗号parameterが不正です"));
+  }
+  const std::size_t frames_bytes =
+      journal_bytes.size() - kResumeJournalHeaderBytes;
+  if (frames_bytes % kResumeJournalFrameBytes != 0U) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal frame寸法",
+        L"truncateされたか余分なframe byteがあります"));
+  }
+  const std::uint64_t frame_count =
+      frames_bytes / kResumeJournalFrameBytes;
+  if (frame_count > header.chunk_count ||
+      frame_count > kTsumugiCreateResumeJournalMaximumRecords ||
+      frame_count > (std::numeric_limits<std::size_t>::max)()) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal frame件数",
+        L"frame件数が宣言数またはallocation上限を超えます"));
+  }
+  inspection.chunks.reserve(static_cast<std::size_t>(frame_count));
+  auto empty_stored_hash = sha256(std::span<const std::byte>{});
+  if (!empty_stored_hash) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(
+        empty_stored_hash.error());
+  }
+  Sha256Digest expected_previous = header.chain_root;
+  std::uint64_t expected_stored_offset = header.payload_offset;
+  std::uint64_t previous_logical_end{};
+  std::uint64_t settled_logical{};
+  for (std::uint64_t index = 0U; index < frame_count; ++index) {
+    const std::size_t offset = kResumeJournalHeaderBytes +
+        static_cast<std::size_t>(index) * kResumeJournalFrameBytes;
+    const auto frame = journal_bytes.subspan(offset, kResumeJournalFrameBytes);
+    if (!std::equal(kResumeJournalFrameMagic.begin(),
+                    kResumeJournalFrameMagic.end(), frame.begin()) ||
+        read_little<std::uint16_t>(frame, 8U) != kResumeJournalMajor ||
+        read_little<std::uint16_t>(frame, 10U) != kResumeJournalMinor ||
+        read_little<std::uint32_t>(frame, 12U) !=
+            kResumeJournalFrameBytes ||
+        read_little<std::uint64_t>(frame, 16U) != index ||
+        !all_zero(frame.subspan(20U, 4U)) ||
+        !all_zero(frame.subspan(24U + 38U, 2U)) ||
+        !all_zero(frame.subspan(24U + 96U, 16U)) ||
+        std::any_of(frame.begin() + 232U, frame.end(),
+                    [](const std::byte value) {
+                      return value != std::byte{0};
+                    })) {
+      return clonecore::Result<
+          TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+          L"Tsumugi resume journal frame構造",
+          L"frame版、寸法、index、reservedまたは一意性が不正です"));
+    }
+    TsumugiCreateResumeJournalChunkV1 chunk{};
+    chunk.chunk_index = index;
+    std::array<std::byte, kTsumugiChunkRecordSize> record_bytes{};
+    std::copy_n(frame.begin() + 24U, record_bytes.size(),
+                record_bytes.begin());
+    chunk.record = parse_resume_record(record_bytes);
+    std::copy_n(frame.begin() + 136U, 32U,
+                chunk.stored_bytes_hash.begin());
+    std::copy_n(frame.begin() + 168U, 32U,
+                chunk.previous_chain_hash.begin());
+    std::copy_n(frame.begin() + 200U, 32U, chunk.chain_hash.begin());
+    std::vector<std::byte> canonical_frame(frame.begin(), frame.end());
+    std::fill(canonical_frame.begin() + kResumeJournalFrameChainOffset,
+              canonical_frame.begin() +
+                  kResumeJournalFrameChainOffset + 32U,
+              std::byte{0});
+    auto calculated_chain =
+        resume_domain_hash(kResumeJournalFrameDomain, canonical_frame);
+    const bool zero = chunk_is_zero(chunk.record.flags);
+    const bool nonzero_tag = std::any_of(
+        chunk.record.authentication_tag.begin(),
+        chunk.record.authentication_tag.end(),
+        [](const std::byte value) { return value != std::byte{0}; });
+    std::uint64_t logical_end{};
+    std::uint64_t stored_end{};
+    if (!calculated_chain ||
+        chunk.previous_chain_hash != expected_previous ||
+        chunk.chain_hash != calculated_chain.value() ||
+        all_zero(chunk.stored_bytes_hash) ||
+        all_zero(chunk.record.plaintext_hash) ||
+        !valid_chunk_flags(chunk.record.flags) ||
+        chunk_is_unreadable(chunk.record.flags) ||
+        chunk.record.logical_length == 0U ||
+        chunk.record.logical_length > header.chunk_size ||
+        chunk.record.logical_offset % header.logical_sector_size != 0U ||
+        chunk.record.logical_length % header.logical_sector_size != 0U ||
+        !checked_add(chunk.record.logical_offset,
+                     chunk.record.logical_length, logical_end) ||
+        logical_end > header.source_disk_size ||
+        (index != 0U && chunk.record.logical_offset < previous_logical_end) ||
+        chunk.record.stored_offset != expected_stored_offset ||
+        chunk.record.stored_length > chunk.record.logical_length ||
+        chunk.record.stored_length > kTsumugiMaximumCryptBytes ||
+        !checked_add(chunk.record.stored_offset,
+                     chunk.record.stored_length, stored_end) ||
+        (zero && (chunk.record.stored_length != 0U ||
+                  chunk.record.compression != ImageCompression::none ||
+                  chunk.record.nonce_counter != 0U || nonzero_tag)) ||
+        (!zero && (chunk.record.stored_length == 0U ||
+                   !valid_compression(chunk.record.compression))) ||
+        (header.encrypted && !zero &&
+         (chunk.record.nonce_counter != index + 1U || !nonzero_tag)) ||
+        (!header.encrypted &&
+         (chunk.record.nonce_counter != 0U || nonzero_tag)) ||
+        !checked_add(settled_logical,
+                     chunk.record.logical_length, settled_logical)) {
+      return clonecore::Result<
+          TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+          L"Tsumugi resume journal chunk",
+          L"chain、record境界、offset、暗号状態、または長さが不正です"));
+    }
+    if (zero && empty_stored_hash.value() != chunk.stored_bytes_hash) {
+      return clonecore::Result<
+          TsumugiCreateResumeJournalInspectionV1>::failure(
+          verification_error(
+              L"Tsumugi resume journal zero格納Hash",
+              L"zero chunkの格納Hashが空byte列SHA-256と一致しません"));
+    }
+    expected_previous = chunk.chain_hash;
+    expected_stored_offset = stored_end;
+    previous_logical_end = logical_end;
+    inspection.chunks.push_back(chunk);
+  }
+  if (settled_logical > header.expected_logical_bytes ||
+      (frame_count == header.chunk_count &&
+       settled_logical != header.expected_logical_bytes)) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(data_error(
+        L"Tsumugi resume journal進捗",
+        L"検証済み論理byteが宣言上限を超えます"));
+  }
+  inspection.journal_length = journal_bytes.size();
+  inspection.header_hash = stored_header;
+  inspection.verified_prefix_hash = expected_previous;
+  return clonecore::Result<
+      TsumugiCreateResumeJournalInspectionV1>::success(
+      std::move(inspection));
+  } catch (const std::bad_alloc&) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(stream_error(
+        clonecore::ErrorCode::io_failed,
+        ERROR_NOT_ENOUGH_MEMORY,
+        L"Tsumugi resume journal有界parse",
+        L"固定上限内のparseメモリを確保できませんでした"));
+  } catch (...) {
+    return clonecore::Result<
+        TsumugiCreateResumeJournalInspectionV1>::failure(stream_error(
+        clonecore::ErrorCode::internal_error,
+        ERROR_UNHANDLED_EXCEPTION,
+        L"Tsumugi resume journal例外境界",
+        L"untrusted journalのparseをfail-closedで停止しました"));
+  }
+}
+
+}  // namespace ytec::imageformat
+
+namespace ytec::imageformat {
+
+namespace {
+
+constexpr std::string_view kResumeFinalPathDomain =
+    "YTEC-TSUMUGI-CREATE-RESUME-FINAL-PATH-V1";
+
+void wipe_resume_bytes(std::vector<std::byte>& bytes) noexcept {
+  if (!bytes.empty()) {
+    SecureZeroMemory(bytes.data(), bytes.size());
+  }
+}
+
+template <typename Callback, typename... Arguments>
+clonecore::Status invoke_resume_checkpoint_hook(
+    const Callback& callback,
+    const std::wstring_view operation,
+    const Arguments&... arguments) noexcept {
+  if (!callback) {
+    return clonecore::Status::failure(argument_error(
+        std::wstring(operation), L"必須のcheckpoint callbackがありません"));
+  }
+  try {
+    return callback(arguments...);
+  } catch (const std::bad_alloc&) {
+    return clonecore::Status::failure(stream_error(
+        clonecore::ErrorCode::io_failed,
+        ERROR_NOT_ENOUGH_MEMORY,
+        std::wstring(operation),
+        L"checkpoint callbackで有界メモリを確保できませんでした"));
+  } catch (...) {
+    return clonecore::Status::failure(stream_error(
+        clonecore::ErrorCode::internal_error,
+        ERROR_UNHANDLED_EXCEPTION,
+        std::wstring(operation),
+        L"checkpoint callbackが例外を返したため安全に停止します"));
+  }
+}
+
+clonecore::Result<Sha256Digest> hash_resume_final_path(
+    const std::wstring& canonical_path) {
+  const auto characters = std::span<const wchar_t>(
+      canonical_path.data(), canonical_path.size());
+  return resume_domain_hash(kResumeFinalPathDomain, std::as_bytes(characters));
+}
+
+struct PreparedResumeJournalHeader final {
+  TsumugiCreateResumeJournalHeaderV1 header;
+  std::vector<std::byte> bytes;
+};
+
+clonecore::Result<PreparedResumeJournalHeader>
+build_expected_resume_journal_header(
+    const TsumugiCreateResumeRequestV1& request,
+    const ValidatedBuild& validated) {
+  std::uint64_t expected_logical_bytes{};
+  for (const auto& chunk : request.stream.chunks) {
+    if (!checked_add(
+            expected_logical_bytes,
+            chunk.logical_length,
+            expected_logical_bytes)) {
+      return clonecore::Result<PreparedResumeJournalHeader>::failure(
+          argument_error(
+              L"Tsumugi resume論理長",
+              L"チャンク論理長の合計が64bit上限を超えます"));
+    }
+  }
+  std::uint64_t frames_bytes{};
+  std::uint64_t journal_bytes{};
+  if (request.stream.chunks.empty() ||
+      request.stream.chunks.size() >
+          kTsumugiCreateResumeJournalMaximumRecords ||
+      !checked_multiply(
+          request.stream.chunks.size(),
+          kResumeJournalFrameBytes,
+          frames_bytes) ||
+      !checked_add(kResumeJournalHeaderBytes, frames_bytes, journal_bytes) ||
+      journal_bytes > kTsumugiCreateResumeJournalMaximumBytes) {
+    return clonecore::Result<PreparedResumeJournalHeader>::failure(
+        argument_error(
+            L"Tsumugi resume journal上限",
+            L"通常画像のチャンク数またはjournal寸法が固定上限を超えます"));
+  }
+  auto final_path_hash = hash_resume_final_path(validated.canonical_final);
+  auto manifest_hash = sha256(request.stream.manifest);
+  if (!final_path_hash || !manifest_hash) {
+    return clonecore::Result<PreparedResumeJournalHeader>::failure(
+        final_path_hash ? manifest_hash.error() : final_path_hash.error());
+  }
+  std::uint64_t payload_offset{};
+  if (!checked_add(
+          kTsumugiHeaderSize, validated.metadata_length, payload_offset)) {
+    return clonecore::Result<PreparedResumeJournalHeader>::failure(
+        argument_error(
+            L"Tsumugi resume payload offset",
+            L"固定領域寸法が64bit上限を超えます"));
+  }
+
+  TsumugiCreateResumeJournalHeaderV1 header{};
+  header.binding = request.binding;
+  header.final_path_hash = final_path_hash.value();
+  header.manifest_hash = manifest_hash.value();
+  header.payload_kind = request.stream.payload_kind;
+  header.compression = request.stream.compression;
+  header.verification_mode = request.stream.verification_mode;
+  header.source_disk_size = request.stream.source_disk_size;
+  header.expected_logical_bytes = expected_logical_bytes;
+  header.chunk_count = request.stream.chunks.size();
+  header.metadata_length = validated.metadata_length;
+  header.payload_offset = payload_offset;
+  header.logical_sector_size = request.stream.logical_sector_size;
+  header.physical_sector_size = request.stream.physical_sector_size;
+  header.chunk_size = request.stream.chunk_size;
+  header.image_id = request.stream.image_id;
+  header.encrypted = request.stream.encryption.has_value();
+  if (request.stream.encryption.has_value()) {
+    header.argon2 = request.stream.encryption->argon2;
+    header.base_nonce = request.stream.encryption->base_nonce;
+  } else {
+    header.argon2 = TsumugiArgon2Parameters{
+        .memory_kib = 0U,
+        .iterations = 0U,
+        .parallelism = 0U,
+        .salt = {},
+    };
+    header.base_nonce = {};
+  }
+  auto bytes = serialize_resume_header(header);
+  if (!bytes) {
+    return clonecore::Result<PreparedResumeJournalHeader>::failure(
+        bytes.error());
+  }
+  if (all_zero(header.chain_root) || all_zero(header.manifest_hash) ||
+      all_zero(header.final_path_hash)) {
+    return clonecore::Result<PreparedResumeJournalHeader>::failure(
+        verification_error(
+            L"Tsumugi resume journal header Hash",
+            L"永続束縛Hashがzero値となったため安全に停止します"));
+  }
+  return clonecore::Result<PreparedResumeJournalHeader>::success(
+      PreparedResumeJournalHeader{
+          .header = std::move(header),
+          .bytes = bytes.take_value(),
+      });
+}
+
+bool equal_resume_argon2(
+    const TsumugiArgon2Parameters& left,
+    const TsumugiArgon2Parameters& right) noexcept {
+  return left.memory_kib == right.memory_kib &&
+      left.iterations == right.iterations &&
+      left.parallelism == right.parallelism && left.salt == right.salt;
+}
+
+bool equal_resume_journal_headers(
+    const TsumugiCreateResumeJournalHeaderV1& left,
+    const TsumugiCreateResumeJournalHeaderV1& right) noexcept {
+  return left.binding == right.binding &&
+      left.final_path_hash == right.final_path_hash &&
+      left.manifest_hash == right.manifest_hash &&
+      left.chain_root == right.chain_root &&
+      left.payload_kind == right.payload_kind &&
+      left.compression == right.compression &&
+      left.verification_mode == right.verification_mode &&
+      left.source_disk_size == right.source_disk_size &&
+      left.expected_logical_bytes == right.expected_logical_bytes &&
+      left.chunk_count == right.chunk_count &&
+      left.metadata_length == right.metadata_length &&
+      left.payload_offset == right.payload_offset &&
+      left.logical_sector_size == right.logical_sector_size &&
+      left.physical_sector_size == right.physical_sector_size &&
+      left.chunk_size == right.chunk_size && left.image_id == right.image_id &&
+      left.encrypted == right.encrypted &&
+      equal_resume_argon2(left.argon2, right.argon2) &&
+      left.base_nonce == right.base_nonce;
+}
+
+clonecore::Result<std::uint64_t> resume_file_length(
+    const HANDLE handle,
+    const std::wstring_view operation) {
+  auto identity = identity_from_handle(handle, operation);
+  if (!identity) {
+    return clonecore::Result<std::uint64_t>::failure(identity.error());
+  }
+  return clonecore::Result<std::uint64_t>::success(identity.value().size);
+}
+
+clonecore::Status verify_resume_read_back(
+    const HANDLE handle,
+    const std::uint64_t offset,
+    const std::span<const std::byte> expected,
+    const std::wstring_view operation) {
+  auto actual = read_exact(handle, offset, expected.size(), operation);
+  if (!actual) {
+    return clonecore::Status::failure(actual.error());
+  }
+  if (!std::equal(expected.begin(), expected.end(), actual.value().begin())) {
+    return clonecore::Status::failure(verification_error(
+        std::wstring(operation), L"flush後の読戻し内容が一致しません"));
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status initialize_resume_owned_files(
+    OwnedPartial& partial,
+    OwnedPartial& journal,
+    const PreparedResumeJournalHeader& prepared_header) {
+  auto status = set_file_length(partial.get(), 0U);
+  if (!status) {
+    return status;
+  }
+  status = set_file_length(journal.get(), 0U);
+  if (!status) {
+    return status;
+  }
+
+  constexpr std::size_t kReservationBlock = 1024U * 1024U;
+  const std::vector<std::byte> zeroes(kReservationBlock, std::byte{0});
+  std::uint64_t offset{};
+  while (offset < prepared_header.header.payload_offset) {
+    const std::size_t length = static_cast<std::size_t>(
+        std::min<std::uint64_t>(
+            prepared_header.header.payload_offset - offset, zeroes.size()));
+    status = write_exact(
+        partial.get(),
+        offset,
+        std::span<const std::byte>(zeroes.data(), length),
+        L"Tsumugi resume固定領域予約");
+    if (!status) {
+      return status;
+    }
+    offset += length;
+  }
+  status = partial.flush();
+  if (!status) {
+    return status;
+  }
+  offset = 0U;
+  while (offset < prepared_header.header.payload_offset) {
+    const std::size_t length = static_cast<std::size_t>(
+        std::min<std::uint64_t>(
+            prepared_header.header.payload_offset - offset, zeroes.size()));
+    auto actual = read_exact(
+        partial.get(), offset, length, L"Tsumugi resume固定領域読戻し");
+    if (!actual) {
+      return clonecore::Status::failure(actual.error());
+    }
+    if (!all_zero(actual.value())) {
+      return clonecore::Status::failure(verification_error(
+          L"Tsumugi resume固定領域読戻し",
+          L"予約領域がzeroで読戻せませんでした"));
+    }
+    offset += length;
+  }
+
+  status = write_exact(
+      journal.get(),
+      0U,
+      prepared_header.bytes,
+      L"Tsumugi resume journal header書込み");
+  if (!status) {
+    return status;
+  }
+  status = journal.flush();
+  if (!status) {
+    return status;
+  }
+  status = verify_resume_read_back(
+      journal.get(),
+      0U,
+      prepared_header.bytes,
+      L"Tsumugi resume journal header読戻し");
+  if (!status) {
+    return status;
+  }
+  auto inspected = inspect_tsumugi_create_resume_journal_v1(
+      prepared_header.bytes);
+  if (!inspected ||
+      !equal_resume_journal_headers(
+          inspected.value().header, prepared_header.header)) {
+    return inspected
+        ? clonecore::Status::failure(verification_error(
+              L"Tsumugi resume journal header照合",
+              L"読戻しheaderが作成要求と一致しません"))
+        : clonecore::Status::failure(inspected.error());
+  }
+  return clonecore::success_status();
+}
+
+template <typename T>
+clonecore::Result<T> fail_before_resume_slot_is_durable(
+    clonecore::Error primary,
+    OwnedPartial& partial,
+    OwnedPartial& journal) {
+  const auto journal_cleanup = journal.cleanup();
+  const auto partial_cleanup = partial.cleanup();
+  if (!journal_cleanup || !partial_cleanup) {
+    const auto& cleanup =
+        journal_cleanup ? partial_cleanup.error() : journal_cleanup.error();
+    return clonecore::Result<T>::failure(stream_error(
+        cleanup.code,
+        cleanup.native_code,
+        L"Tsumugi resume初回slot前cleanup",
+        L"active checkpoint未確定時のowned object cleanupに失敗しました: " +
+            cleanup.message));
+  }
+  return clonecore::Result<T>::failure(std::move(primary));
+}
+
+class ResumeOwnedFilesRetention final {
+ public:
+  ResumeOwnedFilesRetention(
+      OwnedPartial& partial,
+      OwnedPartial& journal) noexcept
+      : partial_(partial), journal_(journal) {}
+  ~ResumeOwnedFilesRetention() {
+    if (retain_) {
+      journal_.release_after_rename();
+      partial_.release_after_rename();
+    }
+  }
+
+  ResumeOwnedFilesRetention(const ResumeOwnedFilesRetention&) = delete;
+  ResumeOwnedFilesRetention& operator=(const ResumeOwnedFilesRetention&) =
+      delete;
+
+  void retain() noexcept { retain_ = true; }
+
+ private:
+  OwnedPartial& partial_;
+  OwnedPartial& journal_;
+  bool retain_{};
+};
+
+bool resume_record_matches_planned_chunk(
+    const TsumugiChunkRecord& record,
+    const TsumugiStreamBuildChunk& planned) noexcept {
+  return record.logical_offset == planned.logical_offset &&
+      record.logical_length == planned.logical_length &&
+      record.flags == planned.flags &&
+      !record.rescue_read_evidence.has_value() &&
+      !planned.rescue_read_evidence.has_value();
+}
+
+struct VerifiedResumePrefix final {
+  TsumugiCreateResumeJournalInspectionV1 inspection;
+  std::uint64_t verified_logical_bytes{};
+  std::uint64_t primary_output_length{};
+};
+
+clonecore::Result<VerifiedResumePrefix> verify_resume_prefix(
+    const TsumugiCreateResumeRequestV1& request,
+    const PreparedResumeJournalHeader& prepared_header,
+    const std::uint64_t journal_length,
+    const HANDLE partial_handle,
+    const HANDLE journal_handle,
+    const TsumugiKey* const key) {
+  if (journal_length < kResumeJournalHeaderBytes ||
+      journal_length > kTsumugiCreateResumeJournalMaximumBytes ||
+      journal_length > (std::numeric_limits<std::size_t>::max)()) {
+    return clonecore::Result<VerifiedResumePrefix>::failure(data_error(
+        L"Tsumugi resume journal checkpoint長",
+        L"checkpointのjournal長が固定上限外です"));
+  }
+  auto journal_bytes = read_exact(
+      journal_handle,
+      0U,
+      static_cast<std::size_t>(journal_length),
+      L"Tsumugi resume journal有界読取り");
+  if (!journal_bytes) {
+    return clonecore::Result<VerifiedResumePrefix>::failure(
+        journal_bytes.error());
+  }
+  auto inspected = inspect_tsumugi_create_resume_journal_v1(
+      journal_bytes.value());
+  if (!inspected) {
+    return clonecore::Result<VerifiedResumePrefix>::failure(
+        inspected.error());
+  }
+  if (!equal_resume_journal_headers(
+          inspected.value().header, prepared_header.header)) {
+    return clonecore::Result<VerifiedResumePrefix>::failure(
+        verification_error(
+            L"Tsumugi resume journal作成要求照合",
+            L"source、plan、出力、形式、暗号parameterまたはmanifestが一致しません"));
+  }
+
+  std::uint64_t logical_bytes{};
+  std::uint64_t primary_length = prepared_header.header.payload_offset;
+  for (std::size_t index = 0U;
+       index < inspected.value().chunks.size(); ++index) {
+    const auto& chunk = inspected.value().chunks[index];
+    if (index >= request.stream.chunks.size() ||
+        !resume_record_matches_planned_chunk(
+            chunk.record, request.stream.chunks[index])) {
+      return clonecore::Result<VerifiedResumePrefix>::failure(
+          verification_error(
+              L"Tsumugi resume chunk plan照合",
+              L"journalの検証済みchunkが現在のplanと一致しません"));
+    }
+    if (!checked_add(
+            logical_bytes,
+            chunk.record.logical_length,
+            logical_bytes) ||
+        !checked_add(
+            chunk.record.stored_offset,
+            chunk.record.stored_length,
+            primary_length)) {
+      return clonecore::Result<VerifiedResumePrefix>::failure(data_error(
+          L"Tsumugi resume chunk長",
+          L"検証済みprefixの長さが64bit上限を超えます"));
+    }
+    if (chunk_is_zero(chunk.record.flags)) {
+      auto stored_hash = sha256(std::span<const std::byte>{});
+      auto plaintext_hash = sha256_zeroes(chunk.record.logical_length);
+      if (!stored_hash || !plaintext_hash ||
+          stored_hash.value() != chunk.stored_bytes_hash ||
+          plaintext_hash.value() != chunk.record.plaintext_hash) {
+        return clonecore::Result<VerifiedResumePrefix>::failure(
+            verification_error(
+                L"Tsumugi resume zero chunk Hash",
+                L"zero chunkの格納Hashまたは論理Hashが一致しません"));
+      }
+      continue;
+    }
+    auto stored = read_exact(
+        partial_handle,
+        chunk.record.stored_offset,
+        static_cast<std::size_t>(chunk.record.stored_length),
+        L"Tsumugi resume検証済みpayload読戻し");
+    if (!stored) {
+      return clonecore::Result<VerifiedResumePrefix>::failure(stored.error());
+    }
+    auto stored_hash = sha256(stored.value());
+    if (!stored_hash || stored_hash.value() != chunk.stored_bytes_hash) {
+      wipe_resume_bytes(stored.value());
+      return clonecore::Result<VerifiedResumePrefix>::failure(
+          stored_hash
+              ? verification_error(
+                    L"Tsumugi resume格納chunk Hash",
+                    L"partial上の格納byteがjournal Hashと一致しません")
+              : stored_hash.error());
+    }
+    const auto verified = verify_immediate_chunk_read_back(
+        stored.value(),
+        chunk.record,
+        index,
+        request.stream.image_id,
+        request.stream.encryption ? &*request.stream.encryption : nullptr,
+        key);
+    wipe_resume_bytes(stored.value());
+    if (!verified) {
+      return clonecore::Result<VerifiedResumePrefix>::failure(
+          verified.error());
+    }
+  }
+  return clonecore::Result<VerifiedResumePrefix>::success(
+      VerifiedResumePrefix{
+          .inspection = inspected.take_value(),
+          .verified_logical_bytes = logical_bytes,
+          .primary_output_length = primary_length,
+      });
+}
+
+clonecore::Status validate_preparing_resume_progress(
+    const TsumugiCreateResumeProgressV1& progress,
+    const PreparedResumeJournalHeader& prepared_header) {
+  if (progress.phase != TsumugiCreateResumePhaseV1::preparing ||
+      progress.verified_logical_bytes != 0U ||
+      progress.verified_chunk_count != 0U ||
+      progress.primary_output_length != 0U ||
+      progress.journal_length != 0U ||
+      progress.verified_prefix_hash != prepared_header.header.chain_root) {
+    return clonecore::Status::failure(verification_error(
+        L"Tsumugi resume preparing checkpoint",
+        L"preparing checkpointが現在のexact planと一致しません"));
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status validate_verified_resume_progress(
+    const TsumugiCreateResumeProgressV1& progress,
+    const VerifiedResumePrefix& verified,
+    const TsumugiCreateResumePhaseV1 expected_phase,
+    const bool compare_chain_hash) {
+  if (progress.phase != expected_phase ||
+      progress.verified_chunk_count != verified.inspection.chunks.size() ||
+      progress.verified_logical_bytes != verified.verified_logical_bytes ||
+      progress.journal_length != verified.inspection.journal_length ||
+      (expected_phase == TsumugiCreateResumePhaseV1::prepared &&
+       progress.primary_output_length != verified.primary_output_length) ||
+      (compare_chain_hash &&
+       progress.verified_prefix_hash !=
+           verified.inspection.verified_prefix_hash)) {
+    return clonecore::Status::failure(verification_error(
+        L"Tsumugi resume checkpoint prefix照合",
+        L"checkpointの件数、長さ、Hashまたはphaseが検証済みprefixと一致しません"));
+  }
+  return clonecore::success_status();
+}
+
+struct ResumeFinalizationResult final {
+  TsumugiStreamBuildReport report;
+  Sha256Digest global_hash{};
+  std::uint64_t final_length{};
+};
+
+clonecore::Result<ResumeFinalizationResult> finalize_resume_partial(
+    const TsumugiCreateResumeRequestV1& request,
+    const ValidatedBuild& validated,
+    const TsumugiCreateResumeJournalInspectionV1& journal,
+    OwnedPartial& partial,
+    const TsumugiKey* const key,
+    const clonecore::DiskOperationCallbacks& callbacks) {
+  std::vector<TsumugiChunkRecord> records;
+  records.reserve(journal.chunks.size());
+  std::uint64_t zero_filled_bytes{};
+  for (const auto& journal_chunk : journal.chunks) {
+    records.push_back(journal_chunk.record);
+    if (chunk_is_zero(journal_chunk.record.flags) &&
+        !checked_add(
+            zero_filled_bytes,
+            journal_chunk.record.logical_length,
+            zero_filled_bytes)) {
+      return clonecore::Result<ResumeFinalizationResult>::failure(
+          data_error(
+              L"Tsumugi resume zero論理長",
+              L"zero論理長が64bit上限を超えます"));
+    }
+  }
+  auto metadata = build_metadata(request.stream.manifest, records);
+  if (!metadata) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        metadata.error());
+  }
+  if (metadata.value().size() != validated.metadata_length ||
+      journal.chunks.size() != request.stream.chunks.size()) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        verification_error(
+            L"Tsumugi resume最終metadata",
+            L"journalと最終metadataの件数または長さが一致しません"));
+  }
+  std::uint64_t payload_end = journal.header.payload_offset;
+  if (!journal.chunks.empty() &&
+      !checked_add(
+          journal.chunks.back().record.stored_offset,
+          journal.chunks.back().record.stored_length,
+          payload_end)) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(data_error(
+        L"Tsumugi resume payload完成長",
+        L"payload完成長が64bit上限を超えます"));
+  }
+  const std::uint64_t stored_data_bytes =
+      payload_end - journal.header.payload_offset;
+
+  const bool encrypted = request.stream.encryption.has_value();
+  if (encrypted != (key != nullptr)) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(stream_error(
+        clonecore::ErrorCode::internal_error,
+        ERROR_INVALID_STATE,
+        L"Tsumugi resume暗号鍵状態",
+        L"暗号設定と再入力から導出した鍵の状態が一致しません"));
+  }
+  TsumugiHeader header{};
+  header.major_version = kTsumugiMajorVersion;
+  header.minor_version = kTsumugiMinorVersion;
+  header.required_features = encrypted ? kFeatureEncrypted : 0U;
+  header.payload_kind = request.stream.payload_kind;
+  header.compression = request.stream.compression;
+  header.source_disk_size = request.stream.source_disk_size;
+  header.logical_sector_size = request.stream.logical_sector_size;
+  header.physical_sector_size = request.stream.physical_sector_size;
+  header.chunk_size = request.stream.chunk_size;
+  header.chunk_count = records.size();
+  header.metadata = ImageSection{
+      .offset = kTsumugiHeaderSize,
+      .length = validated.metadata_length,
+  };
+  header.data = ImageSection{
+      .offset = journal.header.payload_offset,
+      .length = stored_data_bytes,
+  };
+  header.footer = ImageSection{
+      .offset = payload_end,
+      .length = kTsumugiFooterSize,
+  };
+  header.image_id = request.stream.image_id;
+  if (encrypted) {
+    header.argon2 = request.stream.encryption->argon2;
+    header.base_nonce = request.stream.encryption->base_nonce;
+  } else {
+    header.argon2 = TsumugiArgon2Parameters{
+        .memory_kib = 0U,
+        .iterations = 0U,
+        .parallelism = 0U,
+        .salt = {},
+    };
+  }
+
+  auto header_bytes = serialize_header(header);
+  if (encrypted) {
+    auto nonce = nonce_for_counter(header.base_nonce, 0U);
+    if (!nonce) {
+      wipe_resume_bytes(metadata.value());
+      return clonecore::Result<ResumeFinalizationResult>::failure(
+          nonce.error());
+    }
+    const auto aad = canonical_metadata_aad(header_bytes);
+    auto encrypted_metadata = encrypt_tsumugi_aes256_gcm(
+        *key, nonce.value(), aad, metadata.value());
+    wipe_resume_bytes(metadata.value());
+    if (!encrypted_metadata) {
+      return clonecore::Result<ResumeFinalizationResult>::failure(
+          encrypted_metadata.error());
+    }
+    metadata.value() = std::move(encrypted_metadata.value().ciphertext);
+    header.metadata_tag = encrypted_metadata.value().tag;
+    header_bytes = serialize_header(header);
+  }
+  auto header_hash = calculate_header_hash(header_bytes);
+  if (!header_hash) {
+    wipe_resume_bytes(metadata.value());
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        header_hash.error());
+  }
+  header.header_hash = header_hash.value();
+  header_bytes = serialize_header(header);
+
+  auto status = write_exact(
+      partial.get(), 0U, header_bytes, L"Tsumugi resume最終header書戻し");
+  if (status) {
+    status = write_exact(
+        partial.get(),
+        header.metadata.offset,
+        metadata.value(),
+        L"Tsumugi resume最終metadata書戻し");
+  }
+  wipe_resume_bytes(metadata.value());
+  if (!status) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        status.error());
+  }
+  status = set_file_length(partial.get(), header.footer.offset);
+  if (status) {
+    status = partial.flush();
+  }
+  if (!status) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        status.error());
+  }
+
+  std::uint64_t global_verified{};
+  std::uint64_t verified_blocks{};
+  auto global_hash = sha256_from_reader(
+      header.footer.offset,
+      request.stream.verification_block_bytes,
+      [&](const std::uint64_t offset, const std::size_t length) {
+        if (clonecore::disk_operation_cancellation_requested(callbacks)) {
+          return clonecore::Result<std::vector<std::byte>>::failure(
+              cancelled_error(L"Tsumugi resume完成前全体Hash"));
+        }
+        auto bytes = read_exact(
+            partial.get(),
+            offset,
+            length,
+            L"Tsumugi resume完成前全体Hash読戻し");
+        if (!bytes) {
+          return bytes;
+        }
+        global_verified += length;
+        ++verified_blocks;
+        const auto boundary = stop_at_safe_boundary(
+            callbacks,
+            clonecore::DiskOperationSafeBoundary{
+                .kind = clonecore::DiskOperationSafeBoundaryKind::
+                    read_only_block,
+                .stage = clonecore::DiskOperationStage::verifying_final,
+                .completed_bytes = global_verified,
+                .completed_units = verified_blocks,
+            },
+            L"Tsumugi resume全体Hash安全境界");
+        if (!boundary) {
+          wipe_resume_bytes(bytes.value());
+          return clonecore::Result<std::vector<std::byte>>::failure(
+              boundary.error());
+        }
+        return bytes;
+      });
+  if (!global_hash) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        global_hash.error());
+  }
+
+  std::uint64_t final_length{};
+  if (!checked_add(
+          header.footer.offset, kTsumugiFooterSize, final_length)) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(data_error(
+        L"Tsumugi resume完成長",
+        L"完成長が64bit上限を超えます"));
+  }
+  std::array<std::byte, kTsumugiFooterSize> footer{};
+  auto footer_bytes = std::span<std::byte>(footer);
+  std::copy(kFooterMagic.begin(), kFooterMagic.end(), footer_bytes.begin());
+  write_little(footer_bytes, 8U, final_length);
+  std::copy(global_hash.value().begin(), global_hash.value().end(),
+            footer_bytes.begin() + 16U);
+  std::copy(request.stream.image_id.begin(), request.stream.image_id.end(),
+            footer_bytes.begin() + 48U);
+  status = write_exact(
+      partial.get(),
+      header.footer.offset,
+      footer,
+      L"Tsumugi resume footer書込み");
+  if (status) {
+    status = set_file_length(partial.get(), final_length);
+  }
+  if (status) {
+    status = partial.flush();
+  }
+  if (!status) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        status.error());
+  }
+
+  std::optional<std::string_view> password;
+  if (encrypted) {
+    password = request.stream.encryption->password;
+  }
+  auto fully_verified = verify_open_handle(
+      partial.get(),
+      final_length,
+      password,
+      request.stream.verification_block_bytes,
+      callbacks);
+  if (!fully_verified) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        fully_verified.error());
+  }
+  if (fully_verified.value().inspection.header.image_id !=
+          request.stream.image_id ||
+      fully_verified.value().inspection.manifest != request.stream.manifest ||
+      fully_verified.value().inspection.records.size() != records.size() ||
+      fully_verified.value().inspection.global_hash != global_hash.value() ||
+      !fully_verified.value().inspection.header_hash_verified ||
+      !fully_verified.value().inspection.all_chunks_verified ||
+      !fully_verified.value().inspection.global_hash_verified) {
+    return clonecore::Result<ResumeFinalizationResult>::failure(
+        verification_error(
+            L"Tsumugi resume完成partial完全検証",
+            L"同一handleの完全検証結果が作成要求と一致しません"));
+  }
+
+  return clonecore::Result<ResumeFinalizationResult>::success(
+      ResumeFinalizationResult{
+          .report = TsumugiStreamBuildReport{
+              .final_path = validated.canonical_final,
+              .image_length = final_length,
+              .stored_data_bytes = stored_data_bytes,
+              .zero_filled_bytes = zero_filled_bytes,
+              .chunk_count = records.size(),
+              .all_chunks_read_back_verified = true,
+              .all_chunks_authenticated_and_hashed = true,
+              .global_hash_read_back_verified = true,
+              .final_metadata_read_back_verified = true,
+              .final_complete_scan_performed = true,
+              .verification_mode = request.stream.verification_mode,
+              .committed = false,
+          },
+          .global_hash = global_hash.value(),
+          .final_length = final_length,
+      });
+}
+
+clonecore::Result<TsumugiCreateResumeJournalChunkV1>
+append_verified_resume_chunk(
+    const TsumugiCreateResumeRequestV1& request,
+    const std::uint64_t index,
+    const TsumugiCreateResumeProgressV1& progress,
+    OwnedPartial& partial,
+    OwnedPartial& journal,
+    const TsumugiKey* const key) {
+  if (index >= request.stream.chunks.size()) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        argument_error(
+            L"Tsumugi resume append index",
+            L"append対象chunkがplan範囲外です"));
+  }
+  auto partial_length = resume_file_length(
+      partial.get(), L"Tsumugi resume append前partial長");
+  auto journal_length = resume_file_length(
+      journal.get(), L"Tsumugi resume append前journal長");
+  if (!partial_length || !journal_length) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        partial_length ? journal_length.error() : partial_length.error());
+  }
+  if (partial_length.value() != progress.primary_output_length ||
+      journal_length.value() != progress.journal_length) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        verification_error(
+            L"Tsumugi resume append前長さ",
+            L"owned object長がcheckpoint確定prefixと一致しません"));
+  }
+
+  const auto& planned =
+      request.stream.chunks[static_cast<std::size_t>(index)];
+  TsumugiChunkRecord record{};
+  record.logical_offset = planned.logical_offset;
+  record.logical_length = planned.logical_length;
+  record.stored_offset = progress.primary_output_length;
+  record.flags = planned.flags;
+
+  Sha256Digest stored_hash{};
+  if (chunk_is_zero(planned.flags)) {
+    auto plaintext_hash = sha256_zeroes(planned.logical_length);
+    auto empty_hash = sha256(std::span<const std::byte>{});
+    if (!plaintext_hash || !empty_hash) {
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          plaintext_hash ? empty_hash.error() : plaintext_hash.error());
+    }
+    record.plaintext_hash = plaintext_hash.value();
+    stored_hash = empty_hash.value();
+  } else {
+    auto source_bytes = planned.source->read(
+        planned.source_offset,
+        static_cast<std::size_t>(planned.logical_length));
+    if (!source_bytes) {
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          source_bytes.error());
+    }
+    if (source_bytes.value().size() != planned.logical_length) {
+      wipe_resume_bytes(source_bytes.value());
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          verification_error(
+              L"Tsumugi resume source読取り長",
+              L"Sourceが計画chunk長を正確に返しませんでした"));
+    }
+    auto plaintext_hash = sha256(source_bytes.value());
+    if (!plaintext_hash) {
+      wipe_resume_bytes(source_bytes.value());
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          plaintext_hash.error());
+    }
+    record.plaintext_hash = plaintext_hash.value();
+    std::vector<std::byte> stored = source_bytes.value();
+    if (request.stream.compression == ImageCompression::zstandard) {
+      auto compressed = compress_zstandard_image_chunk_v1(
+          source_bytes.value());
+      if (!compressed) {
+        wipe_resume_bytes(source_bytes.value());
+        wipe_resume_bytes(stored);
+        return clonecore::Result<
+            TsumugiCreateResumeJournalChunkV1>::failure(compressed.error());
+      }
+      if (compressed.value().size() < stored.size()) {
+        wipe_resume_bytes(stored);
+        stored = compressed.take_value();
+        record.compression = ImageCompression::zstandard;
+      } else {
+        wipe_resume_bytes(compressed.value());
+      }
+    }
+    record.stored_length = stored.size();
+    if (request.stream.encryption.has_value()) {
+      if (key == nullptr) {
+        wipe_resume_bytes(source_bytes.value());
+        wipe_resume_bytes(stored);
+        return clonecore::Result<
+            TsumugiCreateResumeJournalChunkV1>::failure(stream_error(
+            clonecore::ErrorCode::internal_error,
+            ERROR_INVALID_STATE,
+            L"Tsumugi resume chunk暗号鍵",
+            L"再入力passwordから導出した鍵がありません"));
+      }
+      record.nonce_counter = index + 1U;
+      auto nonce = nonce_for_counter(
+          request.stream.encryption->base_nonce, record.nonce_counter);
+      if (!nonce) {
+        wipe_resume_bytes(source_bytes.value());
+        wipe_resume_bytes(stored);
+        return clonecore::Result<
+            TsumugiCreateResumeJournalChunkV1>::failure(nonce.error());
+      }
+      const auto aad = build_chunk_aad(
+          request.stream.image_id, index, record);
+      auto encrypted = encrypt_tsumugi_aes256_gcm(
+          *key, nonce.value(), aad, stored);
+      wipe_resume_bytes(stored);
+      if (!encrypted) {
+        wipe_resume_bytes(source_bytes.value());
+        return clonecore::Result<
+            TsumugiCreateResumeJournalChunkV1>::failure(encrypted.error());
+      }
+      stored = std::move(encrypted.value().ciphertext);
+      record.authentication_tag = encrypted.value().tag;
+      record.stored_length = stored.size();
+    }
+    auto status = write_exact(
+        partial.get(),
+        record.stored_offset,
+        stored,
+        L"Tsumugi resume payload suffix書込み");
+    if (status) {
+      status = partial.flush();
+    }
+    if (!status) {
+      wipe_resume_bytes(source_bytes.value());
+      wipe_resume_bytes(stored);
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          status.error());
+    }
+    auto read_back = read_exact(
+        partial.get(),
+        record.stored_offset,
+        stored.size(),
+        L"Tsumugi resume payload suffix読戻し");
+    if (!read_back) {
+      wipe_resume_bytes(source_bytes.value());
+      wipe_resume_bytes(stored);
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          read_back.error());
+    }
+    if (!std::equal(
+            stored.begin(), stored.end(), read_back.value().begin())) {
+      wipe_resume_bytes(source_bytes.value());
+      wipe_resume_bytes(stored);
+      wipe_resume_bytes(read_back.value());
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          verification_error(
+              L"Tsumugi resume payload suffix読戻し",
+              L"flush後の格納byteが書込み内容と一致しません"));
+    }
+    auto hashed_stored = sha256(read_back.value());
+    if (!hashed_stored) {
+      wipe_resume_bytes(source_bytes.value());
+      wipe_resume_bytes(stored);
+      wipe_resume_bytes(read_back.value());
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          hashed_stored.error());
+    }
+    stored_hash = hashed_stored.value();
+    status = verify_immediate_chunk_read_back(
+        read_back.value(),
+        record,
+        index,
+        request.stream.image_id,
+        request.stream.encryption ? &*request.stream.encryption : nullptr,
+        key);
+    wipe_resume_bytes(source_bytes.value());
+    wipe_resume_bytes(stored);
+    wipe_resume_bytes(read_back.value());
+    if (!status) {
+      return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+          status.error());
+    }
+  }
+
+  TsumugiCreateResumeJournalChunkV1 journal_chunk{
+      .chunk_index = index,
+      .record = record,
+      .stored_bytes_hash = stored_hash,
+      .previous_chain_hash = progress.verified_prefix_hash,
+  };
+  auto frame = serialize_resume_frame(journal_chunk);
+  if (!frame) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        frame.error());
+  }
+  std::uint64_t next_journal_length{};
+  if (!checked_add(
+          progress.journal_length, frame.value().size(), next_journal_length) ||
+      next_journal_length > kTsumugiCreateResumeJournalMaximumBytes) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        data_error(
+            L"Tsumugi resume journal append長",
+            L"journal appendが固定上限を超えます"));
+  }
+  auto status = write_exact(
+      journal.get(),
+      progress.journal_length,
+      frame.value(),
+      L"Tsumugi resume journal frame書込み");
+  if (status) {
+    status = journal.flush();
+  }
+  if (status) {
+    status = verify_resume_read_back(
+        journal.get(),
+        progress.journal_length,
+        frame.value(),
+        L"Tsumugi resume journal frame読戻し");
+  }
+  if (!status) {
+    return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::failure(
+        status.error());
+  }
+  return clonecore::Result<TsumugiCreateResumeJournalChunkV1>::success(
+      std::move(journal_chunk));
+}
+
+}  // namespace
 
 class TsumugiStagedFileV1::Impl final {
  public:
@@ -1765,6 +3277,497 @@ prepare_verified_tsumugi_file_v1(
       TsumugiStagedFileV1(std::move(impl)));
 }
 
+clonecore::Result<TsumugiCreateResumePreparedV1>
+prepare_resumable_tsumugi_file_v1(
+    const TsumugiCreateResumeRequestV1& request,
+    const clonecore::DiskOperationCallbacks& callbacks) {
+  try {
+    const bool resumed = request.expected_progress.has_value();
+    auto validated_result = validate_build_request(request.stream, resumed);
+    if (!validated_result) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          validated_result.error());
+    }
+    ValidatedBuild validated = validated_result.take_value();
+    if (request.stream.payload_kind != TsumugiPayloadKind::exact_disk ||
+        validated.has_unreadable || !resume_binding_valid(request.binding) ||
+        !request.checkpoint.create_before_first_mutation ||
+        !request.checkpoint.prove_existing_before_resume ||
+        !request.checkpoint.replace_after_verified_prefix) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          argument_error(
+              L"Tsumugi resume通常画像契約",
+              L"exact通常画像、完全な非zero束縛、3つのcheckpoint callbackが必要です"));
+    }
+    auto prepared_header_result = build_expected_resume_journal_header(
+        request, validated);
+    if (!prepared_header_result) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          prepared_header_result.error());
+    }
+    PreparedResumeJournalHeader prepared_header =
+        prepared_header_result.take_value();
+    const TsumugiCreateResumeOwnedPathsV1 paths{
+        .image_partial_path = validated.partial_path,
+        .journal_path =
+            validated.canonical_final + L".resume-journal.partial",
+    };
+
+    if (request.expected_progress.has_value() &&
+        (!resume_phase_known(request.expected_progress->phase) ||
+         all_zero(request.expected_progress->verified_prefix_hash) ||
+         request.expected_progress->verified_chunk_count >
+             request.stream.chunks.size() ||
+         request.expected_progress->verified_logical_bytes >
+             prepared_header.header.expected_logical_bytes ||
+         request.expected_progress->journal_length >
+             kTsumugiCreateResumeJournalMaximumBytes ||
+         request.expected_progress->primary_output_length >
+             validated.maximum_image_length)) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          data_error(
+              L"Tsumugi resume checkpoint上限",
+              L"phase、件数、長さ、またはprefix Hashが固定範囲外です"));
+    }
+
+    std::optional<TsumugiKey> key;
+    if (request.stream.encryption.has_value()) {
+      auto derived = derive_tsumugi_key_argon2id(
+          request.stream.encryption->password,
+          request.stream.encryption->argon2);
+      if (!derived) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            derived.error());
+      }
+      key.emplace(derived.take_value());
+    }
+    if (clonecore::disk_operation_cancellation_requested(callbacks) &&
+        !resumed) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          cancelled_error(L"Tsumugi resume新規開始前"));
+    }
+
+    OwnedPartial partial;
+    OwnedPartial journal;
+    ResumeOwnedFilesRetention retention(partial, journal);
+    TsumugiCreateResumeProgressV1 progress{};
+    std::uint64_t reused_chunks{};
+
+    if (!resumed) {
+      auto status = partial.create(paths.image_partial_path);
+      if (status) {
+        status = journal.create(paths.journal_path);
+      }
+      if (!status) {
+        return fail_before_resume_slot_is_durable<
+            TsumugiCreateResumePreparedV1>(
+            status.error(), partial, journal);
+      }
+      progress = TsumugiCreateResumeProgressV1{
+          .phase = TsumugiCreateResumePhaseV1::preparing,
+          .verified_prefix_hash = prepared_header.header.chain_root,
+      };
+      // A durable create can report an ambiguous failure after its write (for
+      // example, if the adapter's post-write readback fails). From the first
+      // callback invocation onward, never delete objects that a slot may bind.
+      retention.retain();
+      status = invoke_resume_checkpoint_hook(
+          request.checkpoint.create_before_first_mutation,
+          L"Tsumugi resume checkpoint初回永続化",
+          paths,
+          request.binding,
+          progress);
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      status = initialize_resume_owned_files(
+          partial, journal, prepared_header);
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      const TsumugiCreateResumeProgressV1 prepared{
+          .phase = TsumugiCreateResumePhaseV1::prepared,
+          .primary_output_length = prepared_header.header.payload_offset,
+          .journal_length = kResumeJournalHeaderBytes,
+          .verified_prefix_hash = prepared_header.header.chain_root,
+      };
+      status = invoke_resume_checkpoint_hook(
+          request.checkpoint.replace_after_verified_prefix,
+          L"Tsumugi resume固定領域checkpoint更新",
+          progress,
+          prepared);
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      progress = prepared;
+    } else {
+      retention.retain();
+      auto status = partial.open_existing(paths.image_partial_path);
+      if (status) {
+        status = journal.open_existing(paths.journal_path);
+      }
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      progress = *request.expected_progress;
+      status = invoke_resume_checkpoint_hook(
+          request.checkpoint.prove_existing_before_resume,
+          L"Tsumugi resume既存束縛再証明",
+          paths,
+          request.binding,
+          progress);
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      auto actual_partial_length = resume_file_length(
+          partial.get(), L"Tsumugi resume既存partial長");
+      auto actual_journal_length = resume_file_length(
+          journal.get(), L"Tsumugi resume既存journal長");
+      if (!actual_partial_length || !actual_journal_length) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            actual_partial_length
+                ? actual_journal_length.error()
+                : actual_partial_length.error());
+      }
+      if (actual_partial_length.value() > validated.maximum_image_length ||
+          actual_journal_length.value() >
+              kTsumugiCreateResumeJournalMaximumBytes ||
+          actual_partial_length.value() < progress.primary_output_length ||
+          actual_journal_length.value() < progress.journal_length) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            verification_error(
+                L"Tsumugi resume owned object長",
+                L"owned objectがcheckpointより短いか固定上限を超えます"));
+      }
+
+      if (progress.phase == TsumugiCreateResumePhaseV1::preparing) {
+        status = validate_preparing_resume_progress(
+            progress, prepared_header);
+        if (!status) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              status.error());
+        }
+        status = initialize_resume_owned_files(
+            partial, journal, prepared_header);
+        if (!status) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              status.error());
+        }
+        const TsumugiCreateResumeProgressV1 prepared{
+            .phase = TsumugiCreateResumePhaseV1::prepared,
+            .primary_output_length = prepared_header.header.payload_offset,
+            .journal_length = kResumeJournalHeaderBytes,
+            .verified_prefix_hash = prepared_header.header.chain_root,
+        };
+        status = invoke_resume_checkpoint_hook(
+            request.checkpoint.replace_after_verified_prefix,
+            L"Tsumugi resume preparing回復checkpoint更新",
+            progress,
+            prepared);
+        if (!status) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              status.error());
+        }
+        progress = prepared;
+      } else {
+        auto verified = verify_resume_prefix(
+            request,
+            prepared_header,
+            progress.journal_length,
+            partial.get(),
+            journal.get(),
+            key ? &*key : nullptr);
+        if (!verified) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              verified.error());
+        }
+        reused_chunks = verified.value().inspection.chunks.size();
+        if (progress.phase == TsumugiCreateResumePhaseV1::commit_ready) {
+          status = validate_verified_resume_progress(
+              progress,
+              verified.value(),
+              TsumugiCreateResumePhaseV1::commit_ready,
+              false);
+          if (!status || reused_chunks != request.stream.chunks.size() ||
+              verified.value().verified_logical_bytes !=
+                  prepared_header.header.expected_logical_bytes ||
+              actual_partial_length.value() !=
+                  progress.primary_output_length ||
+              actual_journal_length.value() != progress.journal_length) {
+            return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+                status
+                    ? verification_error(
+                          L"Tsumugi resume commit-ready長",
+                          L"commit-ready stateが全chunkまたはexact object長を証明できません")
+                    : status.error());
+          }
+          std::optional<std::string_view> password;
+          if (request.stream.encryption.has_value()) {
+            password = request.stream.encryption->password;
+          }
+          auto complete = verify_open_handle(
+              partial.get(),
+              progress.primary_output_length,
+              password,
+              request.stream.verification_block_bytes,
+              callbacks);
+          if (!complete) {
+            return clonecore::Result<
+                TsumugiCreateResumePreparedV1>::failure(complete.error());
+          }
+          std::uint64_t zero_filled{};
+          for (const auto& record : complete.value().inspection.records) {
+            if (chunk_is_zero(record.flags) &&
+                !checked_add(
+                    zero_filled,
+                    record.logical_length,
+                    zero_filled)) {
+              return clonecore::Result<
+                  TsumugiCreateResumePreparedV1>::failure(data_error(
+                  L"Tsumugi resume commit-ready zero長",
+                  L"zero論理長が64bit上限を超えます"));
+            }
+          }
+          if (complete.value().inspection.global_hash !=
+                  progress.verified_prefix_hash ||
+              complete.value().inspection.header.image_id !=
+                  request.stream.image_id ||
+              complete.value().inspection.manifest !=
+                  request.stream.manifest ||
+              complete.value().inspection.records.size() !=
+                  request.stream.chunks.size() ||
+              !complete.value().inspection.header_hash_verified ||
+              !complete.value().inspection.all_chunks_verified ||
+              !complete.value().inspection.global_hash_verified) {
+            return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+                verification_error(
+                    L"Tsumugi resume commit-ready完全検証",
+                    L"完成partialがcheckpointのglobal Hashまたはplanと一致しません"));
+          }
+          const auto& header = complete.value().inspection.header;
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::success(
+              TsumugiCreateResumePreparedV1{
+                  .stream = TsumugiStreamBuildReport{
+                      .final_path = validated.canonical_final,
+                      .image_length = progress.primary_output_length,
+                      .stored_data_bytes = header.data.length,
+                      .zero_filled_bytes = zero_filled,
+                      .chunk_count = request.stream.chunks.size(),
+                      .all_chunks_read_back_verified = true,
+                      .all_chunks_authenticated_and_hashed = true,
+                      .global_hash_read_back_verified = true,
+                      .final_metadata_read_back_verified = true,
+                      .final_complete_scan_performed = true,
+                      .verification_mode = request.stream.verification_mode,
+                      .committed = false,
+                  },
+                  .owned_paths = paths,
+                  .progress = progress,
+                  .reused_verified_chunk_count = reused_chunks,
+                  .appended_chunk_count = 0U,
+                  .resumed = true,
+                  .complete_partial_verified = true,
+                  .commit_ready = true,
+              });
+        }
+        status = validate_verified_resume_progress(
+            progress,
+            verified.value(),
+            TsumugiCreateResumePhaseV1::prepared,
+            true);
+        if (!status) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              status.error());
+        }
+        if (actual_partial_length.value() > progress.primary_output_length) {
+          status = set_file_length(
+              partial.get(), progress.primary_output_length);
+          if (status) {
+            status = partial.flush();
+          }
+        }
+        if (status &&
+            actual_journal_length.value() > progress.journal_length) {
+          status = set_file_length(journal.get(), progress.journal_length);
+          if (status) {
+            status = journal.flush();
+          }
+        }
+        if (!status) {
+          return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+              status.error());
+        }
+      }
+    }
+
+    const std::uint64_t first_append = progress.verified_chunk_count;
+    for (std::uint64_t index = first_append;
+         index < request.stream.chunks.size(); ++index) {
+      if (clonecore::disk_operation_cancellation_requested(callbacks)) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            cancelled_error(L"Tsumugi resume payload suffix開始前"));
+      }
+      auto appended = append_verified_resume_chunk(
+          request,
+          index,
+          progress,
+          partial,
+          journal,
+          key ? &*key : nullptr);
+      if (!appended) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            appended.error());
+      }
+      TsumugiCreateResumeProgressV1 next = progress;
+      if (!checked_add(
+              next.verified_logical_bytes,
+              appended.value().record.logical_length,
+              next.verified_logical_bytes) ||
+          !checked_add(
+              next.primary_output_length,
+              appended.value().record.stored_length,
+              next.primary_output_length) ||
+          !checked_add(
+              next.journal_length,
+              kResumeJournalFrameBytes,
+              next.journal_length)) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            data_error(
+                L"Tsumugi resume progress加算",
+                L"検証済みprefix長が64bit上限を超えます"));
+      }
+      ++next.verified_chunk_count;
+      next.verified_prefix_hash = appended.value().chain_hash;
+      auto status = invoke_resume_checkpoint_hook(
+          request.checkpoint.replace_after_verified_prefix,
+          L"Tsumugi resume chunk checkpoint更新",
+          progress,
+          next);
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+      progress = next;
+      clonecore::report_disk_operation_progress(
+          callbacks,
+          clonecore::DiskOperationProgress{
+              .stage = clonecore::DiskOperationStage::copying_data,
+              .total_read_bytes =
+                  prepared_header.header.expected_logical_bytes,
+              .total_write_bytes =
+                  prepared_header.header.expected_logical_bytes,
+              .total_verify_bytes =
+                  prepared_header.header.expected_logical_bytes,
+              .read_bytes = progress.verified_logical_bytes,
+              .written_bytes = progress.primary_output_length -
+                  prepared_header.header.payload_offset,
+              .verified_bytes = progress.verified_logical_bytes,
+              .cancellation_allowed = true,
+              .pause_allowed = true,
+          });
+      status = stop_at_safe_boundary(
+          callbacks,
+          clonecore::DiskOperationSafeBoundary{
+              .kind = clonecore::DiskOperationSafeBoundaryKind::
+                  verified_chunk,
+              .stage = clonecore::DiskOperationStage::copying_data,
+              .completed_bytes = progress.verified_logical_bytes,
+              .completed_units = progress.verified_chunk_count,
+          },
+          L"Tsumugi resume durable chunk境界");
+      if (!status) {
+        return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+            status.error());
+      }
+    }
+
+    auto complete_prefix = verify_resume_prefix(
+        request,
+        prepared_header,
+        progress.journal_length,
+        partial.get(),
+        journal.get(),
+        key ? &*key : nullptr);
+    if (!complete_prefix) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          complete_prefix.error());
+    }
+    auto status = validate_verified_resume_progress(
+        progress,
+        complete_prefix.value(),
+        TsumugiCreateResumePhaseV1::prepared,
+        true);
+    if (!status || progress.verified_chunk_count !=
+            request.stream.chunks.size() ||
+        progress.verified_logical_bytes !=
+            prepared_header.header.expected_logical_bytes) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          status
+              ? verification_error(
+                    L"Tsumugi resume payload完成prefix",
+                    L"全chunkがdurable checkpointへ確定していません")
+              : status.error());
+    }
+
+    auto finalized = finalize_resume_partial(
+        request,
+        validated,
+        complete_prefix.value().inspection,
+        partial,
+        key ? &*key : nullptr,
+        callbacks);
+    if (!finalized) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          finalized.error());
+    }
+    TsumugiCreateResumeProgressV1 commit_ready = progress;
+    commit_ready.phase = TsumugiCreateResumePhaseV1::commit_ready;
+    commit_ready.primary_output_length = finalized.value().final_length;
+    commit_ready.verified_prefix_hash = finalized.value().global_hash;
+    status = invoke_resume_checkpoint_hook(
+        request.checkpoint.replace_after_verified_prefix,
+        L"Tsumugi resume commit-ready checkpoint更新",
+        progress,
+        commit_ready);
+    if (!status) {
+      return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+          status.error());
+    }
+    progress = commit_ready;
+    return clonecore::Result<TsumugiCreateResumePreparedV1>::success(
+        TsumugiCreateResumePreparedV1{
+            .stream = std::move(finalized.value().report),
+            .owned_paths = paths,
+            .progress = progress,
+            .reused_verified_chunk_count = reused_chunks,
+            .appended_chunk_count =
+                progress.verified_chunk_count - first_append,
+            .resumed = resumed,
+            .complete_partial_verified = true,
+            .commit_ready = true,
+        });
+  } catch (const std::bad_alloc&) {
+    return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+        stream_error(
+            clonecore::ErrorCode::io_failed,
+            ERROR_NOT_ENOUGH_MEMORY,
+            L"Tsumugi resume有界処理",
+            L"固定上限内のメモリを確保できませんでした"));
+  } catch (...) {
+    return clonecore::Result<TsumugiCreateResumePreparedV1>::failure(
+        stream_error(
+            clonecore::ErrorCode::internal_error,
+            ERROR_UNHANDLED_EXCEPTION,
+            L"Tsumugi resume例外境界",
+            L"予期しない例外をfail-closedで停止しました"));
+  }
+}
+
 TsumugiStagedFileV1::TsumugiStagedFileV1(
     std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -2190,7 +4193,8 @@ namespace ytec::imageformat {
 namespace {
 
 clonecore::Result<ValidatedBuild> validate_build_request(
-    const TsumugiStreamBuildRequest& request) {
+    const TsumugiStreamBuildRequest& request,
+    const bool allow_existing_owned_partial) {
   if (!is_supported_tsumugi_create_verification_mode(
           request.verification_mode)) {
     return clonecore::Result<ValidatedBuild>::failure(argument_error(
@@ -2349,7 +4353,8 @@ clonecore::Result<ValidatedBuild> validate_build_request(
     return clonecore::Result<ValidatedBuild>::failure(
         partial_observation.error());
   }
-  if (partial_observation.value().exists) {
+  if (partial_observation.value().exists &&
+      !allow_existing_owned_partial) {
     return clonecore::Result<ValidatedBuild>::failure(stream_error(
         clonecore::ErrorCode::confirmation_required,
         ERROR_FILE_EXISTS,
@@ -2482,6 +4487,78 @@ clonecore::Status OwnedPartial::create(const std::wstring& path) {
         sizeof(disposition)));
     handle_.reset();
     return clonecore::Status::failure(identity.error());
+  }
+  path_ = path;
+  identity_ = identity.take_value();
+  owns_ = true;
+  return clonecore::success_status();
+}
+
+clonecore::Status OwnedPartial::open_existing(const std::wstring& path) {
+  if (owns_ || handle_) {
+    return clonecore::Status::failure(argument_error(
+        L"Tsumugi再開未完了ファイル",
+        L"同じowned handleを再利用できません"));
+  }
+  handle_.reset(CreateFileW(
+      extended_path(path).c_str(),
+      GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr));
+  if (!handle_) {
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::identity_mismatch,
+        L"Tsumugi再開未完了ファイルopen",
+        GetLastError()));
+  }
+  FILE_ATTRIBUTE_TAG_INFO tag{};
+  FILE_STANDARD_INFO standard{};
+  if (!GetFileInformationByHandleEx(
+          handle_.get(), FileAttributeTagInfo, &tag, sizeof(tag)) ||
+      !GetFileInformationByHandleEx(
+          handle_.get(), FileStandardInfo, &standard, sizeof(standard))) {
+    const DWORD native_code = GetLastError();
+    handle_.reset();
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::query_failed,
+        L"Tsumugi再開未完了ファイル属性",
+        native_code));
+  }
+  if ((tag.FileAttributes &
+       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0U ||
+      standard.NumberOfLinks != 1U) {
+    handle_.reset();
+    return clonecore::Status::failure(unsupported_error(
+        L"Tsumugi再開未完了ファイル形状",
+        L"通常ファイル、reparseなし、hard link数1を証明できません"));
+  }
+  auto identity = identity_from_handle(
+      handle_.get(), L"Tsumugi再開未完了ファイル識別");
+  if (!identity) {
+    handle_.reset();
+    return clonecore::Status::failure(identity.error());
+  }
+  // GetFinalPathNameByHandleW may expand an 8.3 spelling even when both names
+  // identify the same local file. The open handle denies delete sharing, so
+  // the path cannot be relinked while a second path observation is compared by
+  // volume/File ID instead of by an alias-sensitive string.
+  auto path_observation = observe_path(
+      path, L"Tsumugi再開未完了ファイルpath再識別");
+  if (!path_observation || !path_observation.value().exists ||
+      !path_observation.value().identity.has_value() ||
+      !same_file_id(
+          identity.value(), path_observation.value().identity.value())) {
+    handle_.reset();
+    return path_observation
+        ? clonecore::Status::failure(stream_error(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_FILE_INVALID,
+              L"Tsumugi再開未完了ファイルpath再識別",
+              L"open handleと固定pathのFile IDが一致しません"))
+        : clonecore::Status::failure(path_observation.error());
   }
   path_ = path;
   identity_ = identity.take_value();

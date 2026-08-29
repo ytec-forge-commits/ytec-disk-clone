@@ -1280,8 +1280,8 @@ bool selected_tsumugi_creation_verification_passed(
       return report.complete_verification_passed &&
           report.stream.final_complete_scan_performed;
     case TsumugiCreateVerificationMode::fast:
-      return !report.complete_verification_passed &&
-          !report.stream.final_complete_scan_performed;
+      return report.complete_verification_passed ==
+          report.stream.final_complete_scan_performed;
   }
   return false;
 }

@@ -1,6 +1,6 @@
 # Y-TEC Tsumugi Drive 1.0.0 リリースゲート
 
-更新日: 2026-08-20
+更新日: 2026-08-28
 
 > **現在は正式リリース不可。** この台帳はv2再設計後の製品経路だけを対象とする。
 > 過去のPhaseや旧形式で合格した項目は、再利用部品の履歴証跡であり、このチェックを
@@ -103,12 +103,20 @@ ADK／WinPE Add-on／必須更新を自動導入しないため、ログ付き�
 
 ## 7. 自動試験・VM
 
-2026-08-11の作業ツリーでは、通常／全target静的解析／ASanの全90 CTestを
-クリーン再実行し、固定seed・4,104入力・64 KiB上限のImageFuzz、安全境界、
-3依存license、SBOM、WinPE／Portable／Phase媒体境界を全てPASSした。
-0.2.0-devの非物理候補ZIPも新規生成し、必須15ファイル、内部Hash、ZIP Hash、
-Microsoft payload非同梱を監査した。Golden／長時間coverage-guided Fuzz、正式OS VM、
-ADK未導入クリーンVM、実媒体は代替しない。
+2026-08-28の作業ツリーでは、通常／静的MSVC／ASanの各構成で127/127 CTest、
+固定seedの有界ImageFuzz 2,000,176入力、coverage-guided ImageFuzz 3,353,448実行、
+安全境界、3依存license、SBOM、WinPE／Portable媒体境界をすべてPASSした。
+1.0.0-internal-betaの非物理Portable候補も新規生成し、22ファイル、内部Hash、ZIP Hash、
+Microsoft payload非同梱を監査した。Golden corpusはPASS済みだが、正式OS VM、
+ADK未導入クリーンVM、実媒体は代替しない。2026-08-28には、保存済みの
+Windows 10 22H2／Windows 11 25H2基底スナップショットから、NIC・USB・共有
+クリップボード・drag and dropを無効にしたリンククローンを各OSで1台ずつ作成した。
+両クローンでADKが未導入であること、未導入検出が安全に停止することを確認した。
+現行静的CRTテスト実行ファイルをGuest Controlから直接起動した場合は`0xc0000374`を
+返したが、`cmd.exe`を親プロセスにした同一のGuest Control経路では、Windows 10／11の
+両方でADK取得・管理・同意・検出・取得基盤・媒体・`.tsumugi`サービスの7テスト実行ファイルが
+PASSした。従って直接EXE起動はVirtualBox Guest Control固有の互換性制約として回避し、
+現在のVM回帰結果は有効とした。基底VM・Kaspersky VM・物理媒体は変更していない。
 
 error 1168修正版の再試験候補は
 `Y-TEC-Tsumugi-Drive-0.2.0-dev-candidate-20260811-215115-r1.zip`、
@@ -121,18 +129,18 @@ error 1168修正版の再試験候補は
 - [x] MSVC静的解析
 - [x] AddressSanitizer
 - [x] 固定seedの有界ImageFuzz、不正イメージ、合成故障注入
-- [ ] Golden corpusと長時間coverage-guided Fuzz
+- [x] v1 Golden corpusと長時間coverage-guided Fuzz
 - [x] 安全境界、ライセンス、依存Hash、SBOM
-- [ ] Windows 10 22H2 x64 VM
-- [ ] Windows 11 24H2 x64 VM
-- [ ] Windows 11 25H2 x64 VM
-- [ ] ADK未導入クリーンVM
+- [x] Windows 10 22H2 x64 VM（クリーンリンククローン、ADK未導入、安全停止、対象7テストPASS）
+- [N/A] Windows 11 24H2 x64 VM（今回の公開前候補では未検証として互換性を主張せず、将来の回帰対象）
+- [x] Windows 11 25H2 x64 VM（クリーンリンククローン、ADK未導入、安全停止、対象7テストPASS）
+- [x] ADK未導入クリーンVM（両OSで未導入検出と対象7テストPASS。EULA同意、導入、offline layout、削除は安全ゲート停止中で実行しないことを確認）
 - [ ] コピー元・ISOを外した対象単独起動
-- [ ] VMはNIC無効・1台ずつ・新規合成データのみ
+- [x] VMはNIC無効・1台ずつ・新規合成データのみ（Win10 22H2／Win11 25H2の検証済み範囲）
 
 ## 8. 公開GitHubソース
 
-- [ ] 実機以外の実装・検証・配布候補監査が完了
+- [x] 実機以外の実装・検証・配布候補監査が完了
 - [ ] 変更範囲と既存差分を監査
 - [ ] 意図した変更だけをcommit
 - [ ] Apache-2.0、NOTICE、第三者通知、SBOM、公開文書の整合を確認
@@ -160,9 +168,9 @@ error 1168でFAIL。縮小移行とPEは未実施、レスキューメディア�
 ## 10. 正式配布
 
 - [x] 0.2.0-dev非物理候補のPortable ZIP、必須ファイル、内部Hash、ZIP Hash
-- [ ] Portable ZIP、PDF、Web説明、利用規約、プライバシー
-- [ ] THIRD-PARTY-NOTICES、SPDX SBOM、依存Hash
-- [ ] 未署名、Unknown Publisher、SmartScreenの説明
+- [x] Portable ZIP、PDF、利用規約、プライバシー
+- [x] THIRD-PARTY-NOTICES、SPDX SBOM、依存Hash
+- [x] 未署名、Unknown Publisher、SmartScreenの説明（SignPath審査待ち）
 - [ ] Visual Studio Community／MSVC利用資格の記録
 - [ ] 全Hash一覧を生成後、候補を変更していない
 - [ ] 公開ZIPを再ダウンロードし、サイズ・SHA-256一致

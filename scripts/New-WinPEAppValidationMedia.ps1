@@ -5,7 +5,7 @@
     [ValidateSet('2011CA', '2023CA')]
     [string]$CertificateGeneration = '2023CA',
 
-    [ValidateSet('Inventory', 'StandaloneBootRepair')]
+    [ValidateSet('Inventory')]
     [string]$ValidationScenario = 'Inventory',
 
     [string]$DiagnosticPath = '',
@@ -2050,17 +2050,19 @@ $winpeGui = if ([string]::IsNullOrWhiteSpace($WinPEGuiPath)) {
 } else {
     [IO.Path]::GetFullPath($WinPEGuiPath)
 }
-$coreDependencies = @(
-    'ADVAPI32.dll', 'bcrypt.dll', 'CRYPT32.dll', 'KERNEL32.dll',
-    'ole32.dll', 'SETUPAPI.dll', 'WINTRUST.dll')
+$cliDependencies = @(
+    'ADVAPI32.dll', 'bcrypt.dll', 'KERNEL32.dll', 'SETUPAPI.dll')
+$guiDependencies = @(
+    'ADVAPI32.dll', 'bcrypt.dll', 'COMCTL32.dll', 'COMDLG32.dll',
+    'CRYPT32.dll', 'GDI32.dll', 'KERNEL32.dll', 'ole32.dll',
+    'POWRPROF.dll', 'SETUPAPI.dll', 'USER32.dll', 'WINTRUST.dll')
 $appReport = Get-WinPEAppPeReport `
     -Path $winpeApp `
-    -AllowedDependencies $coreDependencies `
+    -AllowedDependencies $cliDependencies `
     -Description 'WinPE CLI'
 $guiReport = Get-WinPEAppPeReport `
     -Path $winpeGui `
-    -AllowedDependencies ($coreDependencies + @(
-        'COMDLG32.dll', 'GDI32.dll', 'USER32.dll')) `
+    -AllowedDependencies $guiDependencies `
     -Description 'WinPE GUI'
 $guiReport['dynamicallyLoadedSystemDlls'] = @()
 $projectLicense = Join-Path $repoRoot 'LICENSE'
@@ -2203,11 +2205,7 @@ $sourcesRoot = Join-Path $mediaRoot 'sources'
 $mountRoot = Join-Path $workingRoot 'mount'
 $bootBinsRoot = Join-Path $workingRoot 'bootbins'
 $bootWim = Join-Path $sourcesRoot 'boot.wim'
-$isoBaseName = if ($ValidationScenario -eq 'StandaloneBootRepair') {
-    'YDC-Standalone-Boot-Repair'
-} else {
-    'YDC-WinPEApp'
-}
+$isoBaseName = 'YDC-WinPEApp'
 $isoPath = Join-Path $outputFullPath `
     "$isoBaseName-amd64-$CertificateGeneration.iso"
 $manifestPath = Join-Path $outputFullPath 'winpe-app-media-manifest.json'
@@ -2437,8 +2435,6 @@ try {
     $mountedData = Join-Path $payloadRoot 'data'
     $mountedDataReadme = Join-Path $mountedData 'README.txt'
     $launchScript = Join-Path $payloadRoot 'launch.cmd'
-    $uefiDiskPart = Join-Path $payloadRoot 'assign-uefi.txt'
-    $biosDiskPart = Join-Path $payloadRoot 'assign-bios.txt'
     $winpeshl = Join-Path $mountRoot 'Windows\System32\winpeshl.ini'
     foreach ($reserved in @($payloadRoot, $winpeshl)) {
         if (Test-Path -LiteralPath $reserved) {
@@ -2456,113 +2452,19 @@ try {
             [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'WIM内のEXE隣dataは通常フォルダーである必要があります。'
     }
-    if ($ValidationScenario -eq 'StandaloneBootRepair') {
-        @(
-            'select disk 0',
-            'select partition 1',
-            'assign letter=W noerr',
-            'select partition 2',
-            'assign letter=S noerr',
-            'exit'
-        ) | Set-Content -LiteralPath $uefiDiskPart -Encoding ascii
-        @(
-            'select disk 0',
-            'select partition 1',
-            'assign letter=W noerr',
-            'exit'
-        ) | Set-Content -LiteralPath $biosDiskPart -Encoding ascii
-        @(
-            '@echo off',
-            'setlocal EnableExtensions',
-            'chcp 65001 >nul',
-            'wpeutil UpdateBootInfo',
-            'set "YTEC_PEFW="',
-            'for /f "tokens=3" %%F in (''reg query HKLM\System\CurrentControlSet\Control /v PEFirmwareType 2^>nul ^| find "PEFirmwareType"'') do set "YTEC_PEFW=%%F"',
-            'if /i "%YTEC_PEFW%"=="0x2" goto uefi',
-            'if /i "%YTEC_PEFW%"=="0x1" goto bios',
-            'echo YDC_STANDALONE_BOOT_REPAIR_FAIL stage=firmware',
-            'goto failed_no_volume',
-            ':uefi',
-            'diskpart /s %SYSTEMDRIVE%\YtecDiskClone\assign-uefi.txt',
-            'set "YTEC_FIRMWARE=uefi"',
-            'set "YTEC_SYSTEM_ROOT=S:\"',
-            'goto mapped',
-            ':bios',
-            'diskpart /s %SYSTEMDRIVE%\YtecDiskClone\assign-bios.txt',
-            'set "YTEC_FIRMWARE=bios"',
-            'set "YTEC_SYSTEM_ROOT=W:\"',
-            ':mapped',
-            'if not exist W:\Windows\System32\ntoskrnl.exe goto failed_no_volume',
-            'set "YTEC_EVIDENCE=W:\YtecValidation\StandaloneBootRepair"',
-            'if not exist "%YTEC_EVIDENCE%" mkdir "%YTEC_EVIDENCE%"',
-            'if not exist "%YTEC_EVIDENCE%" goto failed_no_volume',
-            'icacls "%YTEC_EVIDENCE%" /grant *S-1-1-0:(OI)(CI)F >nul',
-            'if exist "%YTEC_EVIDENCE%\break.request" goto break_boot',
-            'if exist "%YTEC_EVIDENCE%\confirmation.txt" goto repair_boot',
-            ':preflight',
-            '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe --boot-repair-preflight --disk 0 --windows-root W:\ --system-root %YTEC_SYSTEM_ROOT% --firmware %YTEC_FIRMWARE% --json > "%YTEC_EVIDENCE%\preflight.json" 2> "%YTEC_EVIDENCE%\preflight.err.txt"',
-            'if errorlevel 1 goto failed',
-            'echo PREFLIGHT_PASS> "%YTEC_EVIDENCE%\stage.txt"',
-            'echo YDC_STANDALONE_BOOT_REPAIR_PREFLIGHT_PASS firmware=%YTEC_FIRMWARE%',
-            'goto shutdown',
-            ':break_boot',
-            'if /i "%YTEC_FIRMWARE%"=="uefi" goto break_uefi',
-            'if not exist W:\Boot\BCD goto failed',
-            'if exist W:\Boot\BCD.ytec-broken goto failed',
-            'ren W:\Boot\BCD BCD.ytec-broken',
-            'if exist W:\Boot\BCD goto failed',
-            'goto broken',
-            ':break_uefi',
-            'if not exist S:\EFI\Microsoft\Boot\BCD goto failed',
-            'if exist S:\EFI\Microsoft\Boot\BCD.ytec-broken goto failed',
-            'ren S:\EFI\Microsoft\Boot\BCD BCD.ytec-broken',
-            'if exist S:\EFI\Microsoft\Boot\BCD goto failed',
-            ':broken',
-            'del /q "%YTEC_EVIDENCE%\break.request"',
-            'echo BOOT_STORE_BROKEN> "%YTEC_EVIDENCE%\stage.txt"',
-            'echo YDC_STANDALONE_BOOT_REPAIR_BREAK_PASS firmware=%YTEC_FIRMWARE%',
-            'goto shutdown',
-            ':repair_boot',
-            'set "YTEC_CONFIRMATION="',
-            'set /p "YTEC_CONFIRMATION="< "%YTEC_EVIDENCE%\confirmation.txt"',
-            'if not defined YTEC_CONFIRMATION goto failed',
-            '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe --boot-repair-execute --disk 0 --windows-root W:\ --system-root %YTEC_SYSTEM_ROOT% --firmware %YTEC_FIRMWARE% --acknowledge-boot-files-change --confirmation "%YTEC_CONFIRMATION%" --json > "%YTEC_EVIDENCE%\repair.json" 2> "%YTEC_EVIDENCE%\repair.err.txt"',
-            'if errorlevel 1 goto failed',
-            'echo REPAIR_PASS> "%YTEC_EVIDENCE%\stage.txt"',
-            'echo YDC_STANDALONE_BOOT_REPAIR_PASS firmware=%YTEC_FIRMWARE%',
-            'goto shutdown',
-            ':failed',
-            'echo FAIL> "%YTEC_EVIDENCE%\stage.txt"',
-            'echo YDC_STANDALONE_BOOT_REPAIR_FAIL firmware=%YTEC_FIRMWARE%',
-            'goto shutdown',
-            ':failed_no_volume',
-            'echo YDC_STANDALONE_BOOT_REPAIR_FAIL stage=volume-mapping',
-            ':shutdown',
-            'wpeutil shutdown'
-        ) | Set-Content -LiteralPath $launchScript -Encoding ascii
-    } else {
-        @(
-            '@echo off',
-            'chcp 65001 >nul',
-            'echo Y-TEC WinPE read-only disk inventory',
-            '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe --text',
-            'echo.',
-            'echo Read-only diagnostics completed. Use the Tsumugi GUI for verified clone/restore jobs.'
-        ) | Set-Content -LiteralPath $launchScript -Encoding ascii
-    }
-    if ($ValidationScenario -eq 'StandaloneBootRepair') {
-        @(
-            '[LaunchApps]',
-            '%SYSTEMROOT%\System32\wpeinit.exe',
-            '%SYSTEMROOT%\System32\cmd.exe, /k %SYSTEMDRIVE%\YtecDiskClone\launch.cmd'
-        ) | Set-Content -LiteralPath $winpeshl -Encoding ascii
-    } else {
-        @(
-            '[LaunchApps]',
-            '%SYSTEMROOT%\System32\wpeinit.exe',
-            '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe, --launch-gui-from-media'
-        ) | Set-Content -LiteralPath $winpeshl -Encoding ascii
-    }
+    @(
+        '@echo off',
+        'chcp 65001 >nul',
+        'echo Y-TEC WinPE read-only disk inventory',
+        '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe --text',
+        'echo.',
+        'echo Read-only diagnostics completed. Use the Tsumugi GUI for verified clone/restore operations.'
+    ) | Set-Content -LiteralPath $launchScript -Encoding ascii
+    @(
+        '[LaunchApps]',
+        '%SYSTEMROOT%\System32\wpeinit.exe',
+        '%SYSTEMDRIVE%\YtecDiskClone\ytec-winpe-app.exe, --launch-gui-from-media'
+    ) | Set-Content -LiteralPath $winpeshl -Encoding ascii
 
     $mountedHash = (Get-FileHash -LiteralPath $mountedApp `
         -Algorithm SHA256).Hash
@@ -2631,9 +2533,6 @@ try {
         $mountedRescueMediaMarker,
         $launchScript,
         $winpeshl)
-    if ($ValidationScenario -eq 'StandaloneBootRepair') {
-        $payloadFiles += @($uefiDiskPart, $biosDiskPart)
-    }
     $addedFiles = @(
         foreach ($file in $payloadFiles) {
             [ordered]@{

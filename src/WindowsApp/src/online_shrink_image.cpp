@@ -523,11 +523,44 @@ execute_windows_online_shrink_image_create(
               L"オンライン縮小Snapshot callback",
               L"一つの操作で有効なSnapshot captureは1回だけです");
         }
+        std::unique_ptr<vssrequester::VssDiffAreaOperationMonitor>
+            diff_area_monitor;
+        clonecore::DiskOperationCallbacks active_callbacks =
+            request.callbacks;
+        if (dependencies.make_diff_area_monitor) {
+          if (clonecore::disk_operation_cancellation_requested(
+                  request.callbacks)) {
+            return status_failure(
+                clonecore::ErrorCode::cancelled,
+                ERROR_CANCELLED,
+                L"オンライン縮小VSS差分領域初回poll",
+                L"初回output変更前に取消要求を確認しました");
+          }
+          auto made_monitor =
+              dependencies.make_diff_area_monitor(context);
+          if (!made_monitor || !made_monitor.value()) {
+            return clonecore::Status::failure(
+                made_monitor
+                    ? shrink_error(
+                          clonecore::ErrorCode::internal_error,
+                          ERROR_INVALID_HANDLE,
+                          L"オンライン縮小VSS差分領域monitor",
+                          L"製品monitor factoryが空のmonitorを返しました")
+                    : made_monitor.error());
+          }
+          diff_area_monitor = made_monitor.take_value();
+          const auto initial = diff_area_monitor->initial_poll();
+          if (!initial) {
+            return initial;
+          }
+          active_callbacks =
+              diff_area_monitor->callbacks(std::move(active_callbacks));
+        }
         auto captured = dependencies.capture_snapshot_payloads(
             context,
             request.image_template.manifest.partitions,
             canonical_work_paths,
-            request.callbacks);
+            active_callbacks);
         if (!captured || !captured.value()) {
           return clonecore::Status::failure(
               captured ? shrink_error(
@@ -549,7 +582,7 @@ execute_windows_online_shrink_image_create(
           return clonecore::Status::failure(std::move(error));
         }
         auto prepared = dependencies.prepare_image(
-            payloads.value().image, request.callbacks);
+            payloads.value().image, active_callbacks);
         const auto cleanup = session->discard_owned_staging();
         if (!prepared || !cleanup) {
           auto error = prepared ? cleanup.error() : prepared.error();
@@ -573,6 +606,18 @@ execute_windows_online_shrink_image_create(
               L"完成名未確定の選択済み検証を通過した.partialが得られませんでした");
           error = with_abort_failure(std::move(error), prepared.value());
           return clonecore::Status::failure(std::move(error));
+        }
+        if (diff_area_monitor) {
+          auto monitored = diff_area_monitor->completion_poll();
+          if (monitored) {
+            monitored = vssrequester::
+                validate_completed_vss_diff_area_operation_evidence(
+                    diff_area_monitor->evidence());
+          }
+          if (!monitored) {
+            return clonecore::Status::failure(with_abort_failure(
+                monitored.error(), prepared.value()));
+          }
         }
         captured_snapshot_set = context.snapshot_set_id;
         wim_count = payloads.value().wim_count;

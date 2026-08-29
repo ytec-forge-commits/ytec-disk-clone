@@ -15,6 +15,8 @@ add_library(
     src/offline_windows.cpp
     src/registry_hive.cpp
     src/standalone_repair.cpp
+    src/system_partition_creation.cpp
+    src/system_partition_creation_windows.cpp
     src/system_volume_mount.cpp
     src/winre_diagnostic.cpp
     src/winre_registration.cpp
@@ -38,6 +40,7 @@ target_link_libraries(
     bcrypt
     crypt32
     ole32
+    vds_uuid
     wintrust
 )
 

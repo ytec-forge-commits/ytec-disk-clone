@@ -66,6 +66,49 @@ ytec::operationcore::OperationPlan make_restore_plan() {
   };
 }
 
+ytec::operationcore::OperationPlan make_new_clone_plan() {
+  auto source = make_target();
+  source.disk_number = 4U;
+  source.model = L"Synthetic clone source";
+  source.serial_suffix = "SOURCE04";
+  source.device_instance_id = L"SYNTHETIC\\CLONE-SOURCE";
+
+  auto target = make_target();
+  target.disk_number = 5U;
+  target.model = L"Synthetic clone target";
+  target.serial_suffix = "TARGET05";
+  target.device_instance_id = L"SYNTHETIC\\CLONE-TARGET";
+
+  return ytec::operationcore::OperationPlan{
+      .schema_version = ytec::operationcore::kOperationPlanSchemaVersion,
+      .operation_id = make_operation_id(0x70U),
+      .kind = ytec::operationcore::OperationKind::clone,
+      .environment = ytec::operationcore::OperationEnvironment::windows,
+      .source = std::move(source),
+      .target = std::move(target),
+      .expected_work_bytes = 16384U,
+      .immutable_payload_hash = make_digest(0x80U),
+  };
+}
+
+ytec::operationcore::OperationPlan make_image_create_plan() {
+  auto source = make_target();
+  source.disk_number = 3U;
+  source.model = L"Synthetic image source";
+  source.serial_suffix = "IMAGE03";
+  source.device_instance_id = L"SYNTHETIC\\IMAGE-SOURCE";
+  return ytec::operationcore::OperationPlan{
+      .schema_version = ytec::operationcore::kOperationPlanSchemaVersion,
+      .operation_id = make_operation_id(0x41U),
+      .kind = ytec::operationcore::OperationKind::image_create,
+      .environment = ytec::operationcore::OperationEnvironment::winpe,
+      .source = std::move(source),
+      .target = std::nullopt,
+      .expected_work_bytes = 8192U,
+      .immutable_payload_hash = make_digest(0x42U),
+  };
+}
+
 ytec::operationcore::ParsedCheckpoint parse_checkpoint_or_throw(
     const ytec::operationcore::InterruptionCheckpoint& checkpoint) {
   const auto bytes = ytec::operationcore::serialize_checkpoint(checkpoint);
@@ -125,6 +168,67 @@ ytec::operationcore::ResumeSlotRecord make_record(
   return record;
 }
 
+ytec::operationcore::ResumeSlotRecord make_v3_image_create_record() {
+  const auto plan = make_image_create_plan();
+  const auto plan_hash = ytec::operationcore::hash_operation_plan(plan);
+  if (!plan_hash) {
+    throw TestFailure{"Synthetic image-create plan must hash"};
+  }
+  const ytec::operationcore::InterruptionCheckpoint checkpoint{
+      .schema_version = ytec::operationcore::kCheckpointSchemaVersionV3,
+      .operation_id = plan.operation_id,
+      .kind = plan.kind,
+      .environment = plan.environment,
+      .phase = ytec::operationcore::CheckpointPhase::preparing,
+      .revision = 1U,
+      .expected_work_bytes = plan.expected_work_bytes,
+      .verified_work_bytes = 0U,
+      .verified_chunk_count = 0U,
+      .plan_hash = plan_hash.value(),
+      .output_identity_hash = make_digest(0x43U),
+      .source = plan.source,
+      .target = std::nullopt,
+      .continuity_token = L"PE-SOURCE-STATE-SYNTHETIC-0001",
+      .preparation_evidence = std::nullopt,
+      .output_progress_evidence =
+          ytec::operationcore::CheckpointOutputProgressEvidence{
+              .verified_prefix_hash = make_digest(0x44U),
+              .primary_output_length = 0U,
+              .journal_length = 0U,
+              .auxiliary_output_length = 0U,
+          },
+  };
+  const ytec::operationcore::ResumeIdentityBinding identities{
+      .source_identity_hash = make_digest(0x45U),
+      .target_identity_hash = make_digest(0x46U),
+      .output_identity_hash = checkpoint.output_identity_hash,
+  };
+  return ytec::operationcore::ResumeSlotRecord{
+      .capability =
+          ytec::operationcore::ResumeCapability::
+              persistent_pe_exact_image_create,
+      .checkpoint = parse_checkpoint_or_throw(checkpoint),
+      .identities = identities,
+      .owned_partial = std::nullopt,
+      .owned_objects = {
+          {
+              .role = ytec::operationcore::ResumeOwnedObjectRole::
+                  image_partial,
+              .operation_id = checkpoint.operation_id,
+              .identities = identities,
+              .file_object_identity_hash = make_digest(0x47U),
+          },
+          {
+              .role = ytec::operationcore::ResumeOwnedObjectRole::
+                  image_resume_journal,
+              .operation_id = checkpoint.operation_id,
+              .identities = identities,
+              .file_object_identity_hash = make_digest(0x48U),
+          },
+      },
+  };
+}
+
 ytec::clonecore::Error synthetic_error(
     const ytec::clonecore::ErrorCode code,
     std::wstring operation) {
@@ -153,6 +257,7 @@ class SyntheticResumePlatform final
   bool fail_observe{};
   std::optional<ytec::operationcore::ResumeSlotRecord> slot;
   std::optional<ytec::operationcore::ResumeOwnedPartialBinding> partial;
+  std::vector<ytec::operationcore::ResumeOwnedObjectBinding> objects;
   int observe_calls{};
   int create_calls{};
   int replace_calls{};
@@ -168,6 +273,16 @@ class SyntheticResumePlatform final
           synthetic_error(
               ytec::clonecore::ErrorCode::invalid_data,
               L"synthetic corrupt slot"));
+    }
+    std::vector<ytec::operationcore::ResumeFileStorageProof> object_files;
+    object_files.reserve(objects.size());
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+      object_files.push_back({
+          .exists = true,
+          .is_regular_file = true,
+          .is_reparse_free = true,
+          .hard_link_count = 1U,
+      });
     }
     return ytec::clonecore::Result<
         ytec::operationcore::ResumeSlotObservation>::success({
@@ -189,9 +304,11 @@ class SyntheticResumePlatform final
                 .is_reparse_free = partial_reparse_free,
                 .hard_link_count = partial_links,
             },
+            .owned_object_files = std::move(object_files),
         },
         .slot = slot,
         .observed_owned_partial = partial,
+        .observed_owned_objects = objects,
     });
   }
 
@@ -243,16 +360,31 @@ class SyntheticResumePlatform final
             binding.checkpoint_record_hash ||
         actual.value().partial_file_object_identity_hash !=
             binding.partial_file_object_identity_hash ||
+        actual.value().owned_object_file_bindings !=
+            binding.owned_object_file_bindings ||
         binding.partial_file_object_identity_hash.has_value() !=
             partial.has_value() ||
+        binding.owned_object_file_bindings.size() != objects.size() ||
         (partial && partial->file_object_identity_hash !=
                         *binding.partial_file_object_identity_hash)) {
       return ytec::clonecore::Status::failure(synthetic_error(
           ytec::clonecore::ErrorCode::identity_mismatch,
           L"synthetic discard binding"));
     }
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+      if (objects[index].role !=
+              binding.owned_object_file_bindings[index].role ||
+          objects[index].file_object_identity_hash !=
+              binding.owned_object_file_bindings[index]
+                  .file_object_identity_hash) {
+        return ytec::clonecore::Status::failure(synthetic_error(
+            ytec::clonecore::ErrorCode::identity_mismatch,
+            L"synthetic discard object binding"));
+      }
+    }
     slot.reset();
     partial.reset();
+    objects.clear();
     return ytec::clonecore::success_status();
   }
 };
@@ -263,14 +395,59 @@ void test_capability_matrix_and_persistent_gate() {
   using ytec::operationcore::ResumeCapability;
   using ytec::operationcore::ResumeLifetime;
 
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::persistent_exact_restore) == 0U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::persistent_rescue_restore) == 1U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::same_process_only_vss_image_create) == 2U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::same_process_only_vss_clone) == 3U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::same_process_only_pe_image_create) == 4U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::same_process_only_pe_clone) == 5U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::unsupported_shrink_migration) == 6U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::unsupported_raw_rescue) == 7U);
+  static_assert(
+      static_cast<std::uint8_t>(
+          ResumeCapability::persistent_pe_exact_image_create) == 8U);
+  check(
+      ytec::operationcore::resume_lifetime(
+          static_cast<ResumeCapability>(2U)) ==
+              ResumeLifetime::same_process_only &&
+          ytec::operationcore::resume_lifetime(
+              static_cast<ResumeCapability>(4U)) ==
+              ResumeLifetime::same_process_only &&
+          ytec::operationcore::resume_lifetime(
+              static_cast<ResumeCapability>(6U)) ==
+              ResumeLifetime::unsupported &&
+          ytec::operationcore::resume_lifetime(
+              static_cast<ResumeCapability>(7U)) ==
+              ResumeLifetime::unsupported,
+      "Legacy envelope values 2..7 must retain their rejection lifetime");
+
   check(
       ytec::operationcore::resume_lifetime(
           ResumeCapability::persistent_exact_restore) ==
           ResumeLifetime::persistent &&
           ytec::operationcore::resume_lifetime(
               ResumeCapability::persistent_rescue_restore) ==
+              ResumeLifetime::persistent &&
+          ytec::operationcore::resume_lifetime(
+              ResumeCapability::persistent_pe_exact_image_create) ==
               ResumeLifetime::persistent,
-      "Exact and rescue restore should be persistent-capable");
+      "Restore and PE exact image-create should be persistent-capable");
   check(
       ytec::operationcore::resume_lifetime(
           ResumeCapability::same_process_only_vss_clone) ==
@@ -495,6 +672,142 @@ void test_orphan_partial_can_only_be_claimed_by_exact_create() {
         "Only the exact operation-owned partial may be attached to a slot");
 }
 
+void test_global_start_gate_requires_bound_resume_or_discard() {
+  const auto active_record = make_record(true);
+  const auto active_binding =
+      ytec::operationcore::make_resume_slot_binding(active_record);
+  check(active_binding.has_value(),
+        "Synthetic active record should produce a binding");
+
+  SyntheticResumePlatform empty_platform;
+  ytec::operationcore::SingleResumeSlot empty_slot(empty_platform);
+  const auto new_clone = make_new_clone_plan();
+  check(empty_slot.guard_new_operation_start(new_clone).has_value(),
+        "A valid new plan should pass only when the fixed slot is empty");
+
+  SyntheticResumePlatform occupied_platform;
+  occupied_platform.slot = active_record;
+  occupied_platform.partial = active_record.owned_partial;
+  ytec::operationcore::SingleResumeSlot occupied_slot(occupied_platform);
+  check(!occupied_slot.guard_new_operation_start(new_clone) &&
+            occupied_platform.create_calls == 0 &&
+            occupied_platform.replace_calls == 0 &&
+            occupied_platform.discard_calls == 0 &&
+            occupied_platform.slot && occupied_platform.partial,
+        "An active slot must block every different new plan without mutation");
+  check(!occupied_slot.guard_new_operation_start(make_restore_plan()) &&
+            occupied_platform.slot && occupied_platform.partial,
+        "Even the same operation shape must use bound resume, not new start");
+  check(occupied_slot.open_bound(active_binding.value()).has_value(),
+        "The exact active binding should remain available for resume");
+  check(occupied_slot.discard(active_binding.value()).has_value() &&
+            !occupied_platform.slot && !occupied_platform.partial,
+        "The exact bound discard should remove only the owned pair");
+  check(occupied_slot.guard_new_operation_start(new_clone).has_value(),
+        "A new plan may start only after the owned active slot is gone");
+}
+
+void test_global_start_gate_fails_closed_on_unknown_state() {
+  const auto new_clone = make_new_clone_plan();
+
+  SyntheticResumePlatform corrupt_platform;
+  corrupt_platform.slot = make_record(true);
+  corrupt_platform.partial = corrupt_platform.slot->owned_partial;
+  corrupt_platform.fail_observe = true;
+  ytec::operationcore::SingleResumeSlot corrupt_slot(corrupt_platform);
+  check(!corrupt_slot.guard_new_operation_start(new_clone) &&
+            corrupt_platform.create_calls == 0 &&
+            corrupt_platform.replace_calls == 0 &&
+            corrupt_platform.discard_calls == 0 &&
+            corrupt_platform.slot && corrupt_platform.partial,
+        "An unreadable or corrupt slot must block new work without deletion");
+
+  SyntheticResumePlatform orphan_platform;
+  const auto orphan_record = make_record(true);
+  orphan_platform.partial = orphan_record.owned_partial;
+  ytec::operationcore::SingleResumeSlot orphan_slot(orphan_platform);
+  check(!orphan_slot.guard_new_operation_start(new_clone) &&
+            !orphan_platform.slot && orphan_platform.partial &&
+            orphan_platform.create_calls == 0 &&
+            orphan_platform.replace_calls == 0 &&
+            orphan_platform.discard_calls == 0,
+        "An orphan owned-looking partial must block new work and remain untouched");
+
+  SyntheticResumePlatform invalid_plan_platform;
+  ytec::operationcore::SingleResumeSlot invalid_plan_slot(
+      invalid_plan_platform);
+  auto invalid_plan = new_clone;
+  invalid_plan.operation_id = {};
+  check(!invalid_plan_slot.guard_new_operation_start(invalid_plan) &&
+            invalid_plan_platform.observe_calls == 0,
+        "An invalid OperationPlan must never reach slot admission");
+}
+
+void test_v3_image_create_requires_exact_two_object_binding() {
+  auto record = make_v3_image_create_record();
+  SyntheticResumePlatform platform;
+  platform.objects = record.owned_objects;
+  ytec::operationcore::SingleResumeSlot slot(platform);
+  check(slot.create(record).has_value() && platform.create_calls == 1,
+        "A v3 image slot should claim exactly its partial and journal");
+
+  const auto binding = ytec::operationcore::make_resume_slot_binding(record);
+  check(binding.has_value() &&
+            binding.value().owned_object_file_bindings.size() == 2U &&
+            slot.open_bound(binding.value()).has_value(),
+        "The role-tagged file-object identities should bind resume");
+
+  auto relinked = binding.value();
+  relinked.owned_object_file_bindings[1].file_object_identity_hash[0] ^=
+      std::byte{0x01};
+  check(!slot.open_bound(relinked),
+        "A relinked journal identity must fail closed");
+
+  auto next = record.checkpoint.checkpoint;
+  next.revision = 2U;
+  next.phase = ytec::operationcore::CheckpointPhase::prepared;
+  next.output_progress_evidence->verified_prefix_hash = make_digest(0x49U);
+  next.output_progress_evidence->journal_length = 256U;
+  const auto parsed = parse_checkpoint_or_throw(next);
+  check(slot.replace(binding.value(), parsed).has_value(),
+        "A durable v3 journal header should permit one exact slot replace");
+
+  record.checkpoint = parsed;
+  const auto replaced_binding =
+      ytec::operationcore::make_resume_slot_binding(record);
+  check(replaced_binding.has_value() &&
+            slot.discard(replaced_binding.value()).has_value() &&
+            !platform.slot && platform.objects.empty(),
+        "Discard should remove the exact checkpoint/partial/journal set");
+
+  auto missing = make_v3_image_create_record();
+  missing.owned_objects.pop_back();
+  check(!ytec::operationcore::validate_resume_slot_record(missing),
+        "A missing journal must not enable persistent image-create resume");
+
+  auto reversed = make_v3_image_create_record();
+  std::swap(reversed.owned_objects[0], reversed.owned_objects[1]);
+  check(!ytec::operationcore::validate_resume_slot_record(reversed),
+        "Owned objects must use one canonical role order");
+
+  auto duplicate_role = make_v3_image_create_record();
+  duplicate_role.owned_objects[1].role =
+      ytec::operationcore::ResumeOwnedObjectRole::image_partial;
+  check(!ytec::operationcore::validate_resume_slot_record(duplicate_role),
+        "A duplicated owned-object role must fail closed");
+
+  auto legacy_schema = make_v3_image_create_record();
+  legacy_schema.checkpoint.checkpoint.schema_version =
+      ytec::operationcore::kCheckpointSchemaVersionV2;
+  legacy_schema.checkpoint.checkpoint.phase =
+      ytec::operationcore::CheckpointPhase::executing;
+  legacy_schema.checkpoint.checkpoint.output_progress_evidence.reset();
+  legacy_schema.checkpoint =
+      parse_checkpoint_or_throw(legacy_schema.checkpoint.checkpoint);
+  check(!ytec::operationcore::validate_resume_slot_record(legacy_schema),
+        "A legacy checkpoint must not be auto-migrated into image resume");
+}
+
 }  // namespace
 
 int main() {
@@ -511,6 +824,12 @@ int main() {
        test_storage_proofs_and_fixed_path_fail_closed},
       {"orphan_partial_can_only_be_claimed_by_exact_create",
        test_orphan_partial_can_only_be_claimed_by_exact_create},
+      {"global_start_gate_requires_bound_resume_or_discard",
+       test_global_start_gate_requires_bound_resume_or_discard},
+      {"global_start_gate_fails_closed_on_unknown_state",
+       test_global_start_gate_fails_closed_on_unknown_state},
+      {"v3_image_create_requires_exact_two_object_binding",
+       test_v3_image_create_requires_exact_two_object_binding},
   };
 
   int failures = 0;

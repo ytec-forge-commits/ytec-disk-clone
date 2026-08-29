@@ -288,6 +288,95 @@ void test_surplus_is_proportional_or_left_unallocated() {
       "Leave-unallocated must preserve both exact minima and the full surplus");
 }
 
+void test_surplus_can_bind_one_selected_data_partition() {
+  using namespace ytec::migrationcore;
+  auto request = DirectClonePlanningRequest{
+      .mode_choice = DirectCloneModeChoice::exact,
+      .partition_style_choice =
+          DirectClonePartitionStyleChoice::preserve,
+      .source_style = MigrationPartitionStyle::mbr,
+      .source_size_bytes = 1200ULL * kGiB,
+      .source_logical_sector_size = 512U,
+      .target_size_bytes = 1100ULL * kGiB + 3ULL * kMiB,
+      .target_logical_sector_size = 512U,
+      .bitlocker_fully_decrypted = true,
+      .surplus_allocation =
+          ShrinkSurplusAllocation::selected_data_partition,
+      .surplus_target_source_table_index = 1U,
+      .source_partitions = {
+          partition(
+              0U,
+              MigrationPartitionRole::data,
+              MigrationFileSystem::ntfs,
+              600ULL * kGiB,
+              100ULL * kGiB),
+          partition(
+              1U,
+              MigrationPartitionRole::data,
+              MigrationFileSystem::exfat,
+              400ULL * kGiB,
+              100ULL * kGiB),
+      },
+  };
+  const auto targeted = plan_direct_clone(request);
+  check(targeted.has_value(), "Selected-data surplus should plan");
+  check(
+      targeted.value().surplus_target_source_table_index() == 1U &&
+          target_partition(targeted.value(), 0U).size_bytes ==
+              600ULL * kGiB &&
+          target_partition(targeted.value(), 1U).size_bytes ==
+              500ULL * kGiB &&
+          targeted.value().unallocated_tail_bytes() == 0U,
+      "All aligned surplus must belong only to the bound data table index");
+
+  request.surplus_target_source_table_index = 9U;
+  check(
+      !plan_direct_clone(request),
+      "A missing surplus target table index must fail");
+
+  request.surplus_target_source_table_index = 1U;
+  request.source_partitions[1].selected = false;
+  check(
+      !plan_direct_clone(request),
+      "An unchecked surplus target must fail");
+
+  request.source_partitions[1].selected = true;
+  request.source_partitions[1].partition.role =
+      MigrationPartitionRole::recovery;
+  check(
+      !plan_direct_clone(request),
+      "A selected non-data surplus target must fail");
+
+  request.source_partitions[1].partition.role = MigrationPartitionRole::data;
+  request.source_partitions[1].partition.file_system =
+      MigrationFileSystem::none;
+  check(
+      !plan_direct_clone(request),
+      "A selected non-archive filesystem surplus target must fail");
+
+  request.source_partitions[1].partition.file_system =
+      MigrationFileSystem::ntfs;
+  request.source_partitions[1].partition.source_table_index = 0U;
+  request.surplus_target_source_table_index = 0U;
+  check(
+      !plan_direct_clone(request),
+      "Duplicate source table indexes must fail before surplus allocation");
+
+  request.source_partitions[1].partition.source_table_index = 1U;
+  request.surplus_allocation = ShrinkSurplusAllocation::leave_unallocated;
+  request.surplus_target_source_table_index = 1U;
+  check(
+      !plan_direct_clone(request),
+      "A target index must be forbidden for a non-targeted surplus policy");
+
+  request.surplus_allocation =
+      ShrinkSurplusAllocation::selected_data_partition;
+  request.surplus_target_source_table_index.reset();
+  check(
+      !plan_direct_clone(request),
+      "Selected-data policy must require exactly one target index");
+}
+
 void test_partition_style_choice_is_explicit_and_eligible() {
   using namespace ytec::migrationcore;
   auto request = DirectClonePlanningRequest{
@@ -353,17 +442,31 @@ void test_partition_style_choice_is_explicit_and_eligible() {
       "GPT-to-GPT must not be mislabeled as MBR-to-GPT");
 }
 
-void test_selected_unsupported_file_system_fails_closed() {
+void test_selected_unsupported_file_system_uses_exact_raw() {
   using namespace ytec::migrationcore;
   auto request = mbr_data_request(
       500ULL * kGiB, DirectCloneModeChoice::automatic);
   request.source_partitions[0].partition.file_system =
       MigrationFileSystem::unsupported;
-  const auto rejected = plan_direct_clone(request);
-  check(!rejected.has_value(), "Selected unsupported FS must be rejected");
+  constexpr std::uint64_t kSectorAlignedNonMiBRawSize =
+      400ULL * kGiB - 512U;
+  request.source_partitions[0].partition.source_size_bytes =
+      kSectorAlignedNonMiBRawSize;
+  request.source_partitions[0].partition.used_bytes =
+      kSectorAlignedNonMiBRawSize;
+  const auto planned = plan_direct_clone(request);
+  check(planned.has_value(), "Selected unsupported FS must be retained");
   check(
-      rejected.error().native_code == ERROR_NOT_SUPPORTED,
-      "Unsupported FS should fail before any executor is selected");
+      planned.value().target_partitions().size() == 1U &&
+          planned.value().target_partitions()[0].transfer ==
+              DirectClonePartitionTransfer::exact_content &&
+          planned.value().target_partitions()[0].size_bytes ==
+              request.source_partitions[0].partition.source_size_bytes &&
+          planned.value().target_partitions()[0].minimum_size_bytes ==
+              request.source_partitions[0].partition.source_size_bytes &&
+          planned.value().target_partitions()[0].size_bytes % kMiB ==
+              kSectorAlignedNonMiBRawSize % kMiB,
+      "Unsupported FS must retain its sector-aligned non-MiB exact RAW size");
 
   request.source_partitions[0].selected = false;
   request.source_partitions.push_back(partition(
@@ -409,10 +512,12 @@ int main() {
        test_explicit_override_and_unsafe_exact_are_distinct},
       {"surplus_is_proportional_or_left_unallocated",
        test_surplus_is_proportional_or_left_unallocated},
+      {"surplus_can_bind_one_selected_data_partition",
+       test_surplus_can_bind_one_selected_data_partition},
       {"partition_style_choice_is_explicit_and_eligible",
        test_partition_style_choice_is_explicit_and_eligible},
-      {"selected_unsupported_file_system_fails_closed",
-       test_selected_unsupported_file_system_fails_closed},
+      {"selected_unsupported_file_system_uses_exact_raw",
+       test_selected_unsupported_file_system_uses_exact_raw},
       {"cross_sector_exact_fails_but_automatic_can_shrink",
        test_cross_sector_exact_fails_but_automatic_can_shrink},
   };

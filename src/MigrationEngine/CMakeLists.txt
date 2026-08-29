@@ -8,6 +8,8 @@ add_library(
     src/target_layout.cpp
     src/target_layout_io.cpp
     src/volume_apply.cpp
+    src/windows_file_system_recreate.cpp
+    src/windows_file_system_recreate_target_io.cpp
 )
 
 add_library(ytec::migration_engine ALIAS MigrationEngine)
@@ -25,8 +27,12 @@ target_link_libraries(
     ytec::disk_model
     ytec::image_format
     ytec::legacy_image_format
+    ytec::migration_core
     ytec::windows_shrink_analysis
   PRIVATE
+    Ole32
+    Uuid
+    bcrypt
     ytec::clone_core
     ytec::windows_dism
 )

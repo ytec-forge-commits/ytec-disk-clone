@@ -104,7 +104,7 @@ clonecore::Result<operationcore::Sha256Digest> clone_evidence_hash(
     const operationcore::OperationPlan& plan,
     const OnlineDirectCloneReport& report) {
   constexpr std::string_view domain =
-      "YTEC-WINDOWS-DIRECT-CLONE-EVIDENCE-V1";
+      "YTEC-WINDOWS-DIRECT-CLONE-EVIDENCE-V2";
   std::vector<std::byte> bytes;
   bytes.reserve(128U);
   append_u32(bytes, static_cast<std::uint32_t>(domain.size()));
@@ -122,6 +122,9 @@ clonecore::Result<operationcore::Sha256Digest> clone_evidence_hash(
   append_u8(bytes, report.partition_table_committed ? 1U : 0U);
   append_u8(bytes, report.snapshot_backup_completed ? 1U : 0U);
   append_u8(bytes, report.snapshots_deleted ? 1U : 0U);
+  append_u8(bytes, report.used_vss_snapshot ? 1U : 0U);
+  append_u32(bytes, report.locked_volume_count);
+  append_u8(bytes, report.source_consistency_verified ? 1U : 0U);
   append_u8(bytes, report.target_left_offline ? 1U : 0U);
   append_u8(bytes, report.boot_finalization_required ? 1U : 0U);
   append_u8(bytes, report.boot_finalization_completed ? 1U : 0U);
@@ -146,7 +149,12 @@ clonecore::Status validate_clone_report(
       accounted_partitions != request.reviewed_source.partitions.size() ||
       all_zero(report.verified_write_digest) ||
       !report.read_back_verified || !report.partition_table_committed ||
-      !report.snapshot_backup_completed || !report.snapshots_deleted ||
+      !report.source_consistency_verified ||
+      (report.used_vss_snapshot &&
+       (!report.snapshot_backup_completed || !report.snapshots_deleted)) ||
+      (!report.used_vss_snapshot &&
+       (report.snapshot_backup_completed || report.snapshots_deleted ||
+        report.locked_volume_count == 0U)) ||
       !report.target_left_offline ||
       report.boot_finalization_required !=
           request.clone.expected_source.is_system_disk ||
@@ -157,7 +165,7 @@ clonecore::Status validate_clone_report(
         clonecore::ErrorCode::verification_failed,
         ERROR_CRC,
         L"Windows直接クローンOperation最終検証",
-        L"Snapshot完了、全書込み読戻し、最終レイアウト確定、オフライン保持、または起動情報再構築の証跡が不足しています"));
+        L"VSS/Volume lock整合性、全書込み読戻し、最終レイアウト確定、オフライン保持、または起動情報再構築の証跡が不足しています"));
   }
   return clonecore::success_status();
 }

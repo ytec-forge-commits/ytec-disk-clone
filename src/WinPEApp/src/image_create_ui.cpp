@@ -97,7 +97,6 @@ WinPeImageCreateUiView build_winpe_image_create_ui_view(
     const WinPeImageCreateUiInput& input) noexcept {
   const bool selectable = input.idle && !input.progress_active;
   const bool confirmation = input.reviewed && !input.progress_active;
-  const bool confirmation_matches = input.confirmation_text == L"OK";
   return WinPeImageCreateUiView{
       .source_enabled = selectable,
       .destination_enabled = selectable,
@@ -108,11 +107,10 @@ WinPeImageCreateUiView build_winpe_image_create_ui_view(
       .review_enabled = selectable && input.inventory_ready &&
           input.source_selected && input.destination_entered &&
           input.verification_mode_selected,
-      .confirmation_visible = confirmation,
-      .confirmation_enabled = selectable && input.reviewed,
+      .confirmation_visible = false,
+      .confirmation_enabled = false,
       .execute_visible = confirmation,
-      .execute_enabled = selectable && input.reviewed &&
-          confirmation_matches,
+      .execute_enabled = selectable && input.reviewed,
       .cancel_visible = input.progress_active,
       .cancel_enabled = !input.idle && input.progress_active &&
           input.cancellation_allowed && !input.cancellation_requested,

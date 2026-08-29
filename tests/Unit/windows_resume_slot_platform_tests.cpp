@@ -205,6 +205,12 @@ class TemporaryDirectory final {
   [[nodiscard]] std::wstring partial() const {
     return output_ + L"\\Tsumugi-Image.tsumugi.partial";
   }
+  [[nodiscard]] std::wstring journal() const {
+    return output_ + L"\\Tsumugi-Image.tsumugi.resume-journal.partial";
+  }
+  [[nodiscard]] std::wstring final_image() const {
+    return output_ + L"\\Tsumugi-Image.tsumugi";
+  }
 
  private:
   std::wstring root_;
@@ -279,6 +285,60 @@ ytec::operationcore::ParsedCheckpoint parsed_checkpoint(
   auto parsed = ytec::operationcore::parse_checkpoint(bytes.value());
   check(parsed.has_value(), "Synthetic checkpoint must parse");
   return parsed.take_value();
+}
+
+ytec::operationcore::ParsedCheckpoint parse_checkpoint_value(
+    const ytec::operationcore::InterruptionCheckpoint& checkpoint);
+
+ytec::operationcore::ParsedCheckpoint parsed_image_checkpoint(
+    const std::uint64_t revision,
+    const ytec::operationcore::CheckpointPhase phase,
+    const std::uint64_t verified_bytes,
+    const std::uint64_t verified_chunks,
+    const std::uint64_t primary_length,
+    const std::uint64_t journal_length,
+    const std::uint8_t prefix_seed) {
+  auto source = target_identity();
+  source.disk_number = 4U;
+  source.model = L"Synthetic resume image source";
+  source.serial_suffix = "IMG04";
+  source.device_instance_id = L"SYNTHETIC\\RESUME-IMAGE-SOURCE";
+  const ytec::operationcore::OperationPlan plan{
+      .schema_version = ytec::operationcore::kOperationPlanSchemaVersion,
+      .operation_id = operation_id(0x61U),
+      .kind = ytec::operationcore::OperationKind::image_create,
+      .environment = ytec::operationcore::OperationEnvironment::winpe,
+      .source = source,
+      .target = std::nullopt,
+      .expected_work_bytes = 8192U,
+      .immutable_payload_hash = digest(0x62U),
+  };
+  const auto plan_hash = ytec::operationcore::hash_operation_plan(plan);
+  check(plan_hash.has_value(), "Synthetic image plan must hash");
+  return parse_checkpoint_value({
+      .schema_version = ytec::operationcore::kCheckpointSchemaVersionV3,
+      .operation_id = plan.operation_id,
+      .kind = plan.kind,
+      .environment = plan.environment,
+      .phase = phase,
+      .revision = revision,
+      .expected_work_bytes = plan.expected_work_bytes,
+      .verified_work_bytes = verified_bytes,
+      .verified_chunk_count = verified_chunks,
+      .plan_hash = plan_hash.value(),
+      .output_identity_hash = digest(0x50U),
+      .source = plan.source,
+      .target = std::nullopt,
+      .continuity_token = L"PE-SOURCE-STATE-SYNTHETIC-0001",
+      .preparation_evidence = std::nullopt,
+      .output_progress_evidence =
+          ytec::operationcore::CheckpointOutputProgressEvidence{
+              .verified_prefix_hash = digest(prefix_seed),
+              .primary_output_length = primary_length,
+              .journal_length = journal_length,
+              .auxiliary_output_length = 0U,
+          },
+  });
 }
 
 ytec::operationcore::ParsedCheckpoint parse_checkpoint_value(
@@ -357,6 +417,25 @@ ytec::operationcore::ResumeSlotRecord record(
   };
 }
 
+ytec::operationcore::ResumeSlotRecord image_record(
+    const ytec::operationcore::ParsedCheckpoint& checkpoint,
+    const std::vector<ytec::operationcore::WindowsResumeOwnedObject>&
+        objects) {
+  std::vector<ytec::operationcore::ResumeOwnedObjectBinding> bindings;
+  bindings.reserve(objects.size());
+  for (const auto& object : objects) {
+    bindings.push_back(object.binding);
+  }
+  return {
+      .capability = ytec::operationcore::ResumeCapability::
+          persistent_pe_exact_image_create,
+      .checkpoint = checkpoint,
+      .identities = resume_identities(),
+      .owned_partial = std::nullopt,
+      .owned_objects = std::move(bindings),
+  };
+}
+
 struct BackingProof final {
   bool separated{true};
   bool from_handle{true};
@@ -384,7 +463,8 @@ std::unique_ptr<ytec::operationcore::IResumeSlotPlatform> make_platform(
     const TemporaryDirectory& temporary,
     BackingProof& proof,
     std::optional<ytec::operationcore::WindowsResumeOwnedPartial> partial =
-        std::nullopt) {
+        std::nullopt,
+    std::vector<ytec::operationcore::WindowsResumeOwnedObject> objects = {}) {
   auto platform = ytec::operationcore::make_windows_resume_slot_platform({
       .executable_path = temporary.executable(),
       .prove_data_backing_separation =
@@ -395,6 +475,7 @@ std::unique_ptr<ytec::operationcore::IResumeSlotPlatform> make_platform(
             return proof(data_directory, current);
           },
       .owned_partial_for_create = std::move(partial),
+      .owned_objects_for_create = std::move(objects),
   });
   if (!platform) {
     std::wcerr << L"platform error: " << platform.error().operation << L" / "
@@ -958,6 +1039,396 @@ void test_replace_stage_failure_keeps_current_revision() {
         "Failed replace must leave the current slot revision intact");
 }
 
+void test_v3_multi_object_slot_survives_restart_and_discards_exact_set() {
+  TemporaryDirectory temporary;
+  constexpr std::array<std::byte, 4U> partial_marker{
+      std::byte{0x10}, std::byte{0x20}, std::byte{0x30}, std::byte{0x40}};
+  constexpr std::array<std::byte, 4U> journal_marker{
+      std::byte{0x50}, std::byte{0x60}, std::byte{0x70}, std::byte{0x80}};
+  write_bytes(temporary.partial(), partial_marker);
+  write_bytes(temporary.journal(), journal_marker);
+
+  const auto identities = resume_identities();
+  const auto partial = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.partial(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_partial,
+      operation_id(0x61U),
+      identities);
+  const auto journal = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.journal(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_resume_journal,
+      operation_id(0x61U),
+      identities);
+  check(partial.has_value() && journal.has_value(),
+        "Both v3 owned file objects must bind from opened handles");
+  const std::vector<ytec::operationcore::WindowsResumeOwnedObject> objects{
+      partial.value(), journal.value()};
+  auto first = image_record(
+      parsed_image_checkpoint(
+          1U,
+          ytec::operationcore::CheckpointPhase::preparing,
+          0U,
+          0U,
+          0U,
+          0U,
+          0x64U),
+      objects);
+
+  BackingProof proof;
+  {
+    auto platform = make_platform(temporary, proof, std::nullopt, objects);
+    ytec::operationcore::SingleResumeSlot slot(*platform);
+    check(slot.create(first).has_value(),
+          "A v3 checkpoint must persist both authenticated object paths");
+  }
+
+  auto platform = make_platform(temporary, proof);
+  ytec::operationcore::SingleResumeSlot slot(*platform);
+  auto restarted = slot.inspect();
+  check(restarted.has_value() && restarted.value() &&
+            restarted.value()->owned_objects.size() == 2U,
+        "Restart must re-open and prove both persisted File IDs");
+  const auto binding =
+      ytec::operationcore::make_resume_slot_binding(*restarted.value());
+  check(binding.has_value(), "Restarted v3 slot must produce exact binding");
+
+  auto second = image_record(
+      parsed_image_checkpoint(
+          2U,
+          ytec::operationcore::CheckpointPhase::prepared,
+          0U,
+          0U,
+          0U,
+          4U,
+          0x65U),
+      objects);
+  check(slot.replace(binding.value(), second.checkpoint).has_value(),
+        "V3 replace must preserve both immutable object bindings");
+  const auto second_binding =
+      ytec::operationcore::make_resume_slot_binding(second);
+  check(second_binding.has_value() &&
+            slot.discard(second_binding.value()).has_value(),
+        "Exact v3 discard must remove checkpoint, partial, and journal");
+  check(GetFileAttributesW(temporary.checkpoint().c_str()) ==
+            INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(temporary.partial().c_str()) ==
+                INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(temporary.journal().c_str()) ==
+                INVALID_FILE_ATTRIBUTES,
+        "No member of the exact owned set may survive successful discard");
+}
+
+void test_v3_missing_or_relinked_object_is_never_adopted_or_deleted() {
+  TemporaryDirectory temporary;
+  const std::vector<std::byte> partial_marker{
+      std::byte{0x11}, std::byte{0x21}, std::byte{0x31}, std::byte{0x41}};
+  const std::vector<std::byte> journal_marker{
+      std::byte{0x51}, std::byte{0x61}, std::byte{0x71}, std::byte{0x81}};
+  const std::vector<std::byte> replacement_marker{
+      std::byte{0x91}, std::byte{0xA1}, std::byte{0xB1}, std::byte{0xC1}};
+  write_bytes(temporary.partial(), partial_marker);
+  write_bytes(temporary.journal(), journal_marker);
+
+  const auto identities = resume_identities();
+  const auto partial = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.partial(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_partial,
+      operation_id(0x61U),
+      identities);
+  const auto journal = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.journal(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_resume_journal,
+      operation_id(0x61U),
+      identities);
+  check(partial.has_value() && journal.has_value(),
+        "V3 orphan/relink fixture objects must bind");
+  const std::vector<ytec::operationcore::WindowsResumeOwnedObject> objects{
+      partial.value(), journal.value()};
+  const auto record = image_record(
+      parsed_image_checkpoint(
+          1U,
+          ytec::operationcore::CheckpointPhase::preparing,
+          0U,
+          0U,
+          0U,
+          0U,
+          0x66U),
+      objects);
+  const auto binding = ytec::operationcore::make_resume_slot_binding(record);
+  check(binding.has_value(), "V3 orphan/relink fixture must bind its slot");
+
+  BackingProof proof;
+  {
+    auto platform = make_platform(temporary, proof, std::nullopt, objects);
+    ytec::operationcore::SingleResumeSlot slot(*platform);
+    check(slot.create(record).has_value(),
+          "V3 orphan/relink fixture must persist");
+  }
+
+  check(DeleteFileW(temporary.journal().c_str()) != FALSE,
+        "Owned journal must be removable after the simulated crash");
+  {
+    auto platform = make_platform(temporary, proof);
+    ytec::operationcore::SingleResumeSlot slot(*platform);
+    check(!slot.inspect() && !slot.discard(binding.value()) &&
+              GetFileAttributesW(temporary.checkpoint().c_str()) !=
+                  INVALID_FILE_ATTRIBUTES &&
+              read_bytes(temporary.partial()) == partial_marker &&
+              GetFileAttributesW(temporary.journal().c_str()) ==
+                  INVALID_FILE_ATTRIBUTES,
+          "A missing owned journal must fail closed without deleting the remaining exact set");
+  }
+
+  write_bytes(temporary.journal(), replacement_marker);
+  {
+    auto platform = make_platform(temporary, proof);
+    ytec::operationcore::SingleResumeSlot slot(*platform);
+    check(!slot.inspect() && !slot.discard(binding.value()) &&
+              GetFileAttributesW(temporary.checkpoint().c_str()) !=
+                  INVALID_FILE_ATTRIBUTES &&
+              read_bytes(temporary.partial()) == partial_marker &&
+              read_bytes(temporary.journal()) == replacement_marker,
+          "A relinked journal must never be adopted or deleted through the stale binding");
+  }
+}
+
+struct ImageCommitFixture final {
+  ytec::operationcore::ResumeSlotBinding binding;
+  std::vector<std::byte> image_marker;
+  std::vector<std::byte> journal_marker;
+  ytec::operationcore::Sha256Digest global_hash{};
+};
+
+ImageCommitFixture create_image_commit_fixture(
+    const TemporaryDirectory& temporary,
+    BackingProof& proof) {
+  ImageCommitFixture fixture{
+      .image_marker = {
+          std::byte{0x14}, std::byte{0x24}, std::byte{0x34}, std::byte{0x44}},
+      .journal_marker = {
+          std::byte{0x54}, std::byte{0x64}, std::byte{0x74}, std::byte{0x84}},
+      .global_hash = digest(0x70U),
+  };
+  write_bytes(temporary.partial(), fixture.image_marker);
+  write_bytes(temporary.journal(), fixture.journal_marker);
+  const auto identities = resume_identities();
+  auto partial = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.partial(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_partial,
+      operation_id(0x61U),
+      identities);
+  auto journal = ytec::operationcore::bind_windows_resume_owned_object(
+      temporary.journal(),
+      ytec::operationcore::ResumeOwnedObjectRole::image_resume_journal,
+      operation_id(0x61U),
+      identities);
+  check(partial && journal,
+        "Commit-ready image partial and journal must bind");
+  const std::vector<ytec::operationcore::WindowsResumeOwnedObject> objects{
+      partial.value(), journal.value()};
+  const auto record = image_record(
+      parsed_image_checkpoint(
+          1U,
+          ytec::operationcore::CheckpointPhase::commit_ready,
+          8192U,
+          2U,
+          fixture.image_marker.size(),
+          fixture.journal_marker.size(),
+          0x70U),
+      objects);
+  auto binding = ytec::operationcore::make_resume_slot_binding(record);
+  check(binding.has_value(), "Commit-ready image slot must bind");
+  {
+    auto platform = make_platform(
+        temporary, proof, std::nullopt, objects);
+    ytec::operationcore::SingleResumeSlot slot(*platform);
+    check(slot.create(record).has_value(),
+          "Commit-ready image slot must persist before crash window tests");
+  }
+  fixture.binding = binding.take_value();
+  return fixture;
+}
+
+ytec::operationcore::PersistentPeExactImageCreateCommitRequest
+image_commit_request(
+    const TemporaryDirectory& temporary,
+    const ImageCommitFixture& fixture,
+    int& reproof_calls,
+    int& verifier_calls) {
+  return {
+      .reviewed_binding = fixture.binding,
+      .reviewed_final_path = temporary.final_image(),
+      .reprove_before_publish = [&reproof_calls]() {
+        ++reproof_calls;
+        return ytec::clonecore::success_status();
+      },
+      .verify_published_image =
+          [&fixture, &verifier_calls](const std::wstring&) {
+            ++verifier_calls;
+            return ytec::clonecore::Result<ytec::operationcore::
+                PersistentPeExactImageCreateVerification>::success({
+                .image_length = fixture.image_marker.size(),
+                .global_hash = fixture.global_hash,
+                .header_hash_verified = true,
+                .metadata_authenticated = true,
+                .all_chunks_verified = true,
+                .global_hash_verified = true,
+            });
+          },
+  };
+}
+
+void test_image_commit_publishes_absent_final_then_retires_exact_set() {
+  TemporaryDirectory temporary;
+  BackingProof proof;
+  const auto fixture = create_image_commit_fixture(temporary, proof);
+  auto platform = make_platform(temporary, proof);
+  auto inspected = platform->inspect_persistent_pe_exact_image_create();
+  check(inspected && inspected.value().state == ytec::operationcore::
+              PersistentPeExactImageCreateObjectState::staged &&
+            inspected.value().final_path == temporary.final_image() &&
+            inspected.value().final_path_available,
+        "Commit-ready partial must classify as staged with an absent final");
+  int reproof_calls{};
+  int verifier_calls{};
+  auto committed = platform->commit_persistent_pe_exact_image_create(
+      image_commit_request(
+          temporary, fixture, reproof_calls, verifier_calls));
+  if (!committed) {
+    std::wcerr << L"staged commit error: " << committed.error().operation
+               << L" / " << committed.error().message << L" ("
+               << committed.error().native_code << L")\n";
+  }
+  check(committed && committed.value().image_published &&
+            committed.value().complete_image_verified &&
+            committed.value().journal_retired &&
+            committed.value().slot_retired &&
+            !committed.value().recovered_after_publish &&
+            reproof_calls == 1 && verifier_calls == 1 &&
+            read_bytes(temporary.final_image()) == fixture.image_marker &&
+            GetFileAttributesW(temporary.partial().c_str()) ==
+                INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(temporary.journal().c_str()) ==
+                INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(temporary.checkpoint().c_str()) ==
+                INVALID_FILE_ATTRIBUTES,
+        "Staged commit must no-overwrite publish, verify, then retire journal and slot");
+}
+
+void test_image_commit_never_overwrites_an_existing_final() {
+  TemporaryDirectory temporary;
+  BackingProof proof;
+  const auto fixture = create_image_commit_fixture(temporary, proof);
+  const std::vector<std::byte> existing{
+      std::byte{0x91}, std::byte{0x92}, std::byte{0x93}};
+  write_bytes(temporary.final_image(), existing);
+  auto platform = make_platform(temporary, proof);
+  auto inspected = platform->inspect_persistent_pe_exact_image_create();
+  check(inspected && inspected.value().state == ytec::operationcore::
+              PersistentPeExactImageCreateObjectState::staged &&
+            !inspected.value().final_path_available,
+        "An unrelated completed name must not be adopted as the staged output");
+  int reproof_calls{};
+  int verifier_calls{};
+  auto committed = platform->commit_persistent_pe_exact_image_create(
+      image_commit_request(
+          temporary, fixture, reproof_calls, verifier_calls));
+  check(!committed && reproof_calls == 0 && verifier_calls == 0 &&
+            read_bytes(temporary.final_image()) == existing &&
+            read_bytes(temporary.partial()) == fixture.image_marker &&
+            read_bytes(temporary.journal()) == fixture.journal_marker &&
+            GetFileAttributesW(temporary.checkpoint().c_str()) !=
+                INVALID_FILE_ATTRIBUTES,
+        "Existing final must block publish without touching either transaction");
+}
+
+void test_image_commit_recovers_after_publish_crash_without_source_reproof() {
+  TemporaryDirectory temporary;
+  BackingProof proof;
+  const auto fixture = create_image_commit_fixture(temporary, proof);
+  check(MoveFileExW(
+            temporary.partial().c_str(),
+            temporary.final_image().c_str(),
+            0U) != FALSE,
+        "Synthetic crash must move the same File ID before journal retirement");
+  auto platform = make_platform(temporary, proof);
+  auto inspected = platform->inspect_persistent_pe_exact_image_create();
+  check(inspected && inspected.value().state == ytec::operationcore::
+              PersistentPeExactImageCreateObjectState::published,
+        "Same pre-move File ID under final name must classify as published");
+  int reproof_calls{};
+  int verifier_calls{};
+  auto request = image_commit_request(
+      temporary, fixture, reproof_calls, verifier_calls);
+  request.reprove_before_publish = {};
+  auto committed = platform->commit_persistent_pe_exact_image_create(request);
+  check(committed && committed.value().recovered_after_publish &&
+            committed.value().image_published &&
+            committed.value().complete_image_verified &&
+            committed.value().journal_retired &&
+            committed.value().slot_retired && reproof_calls == 0 &&
+            verifier_calls == 1 &&
+            read_bytes(temporary.final_image()) == fixture.image_marker &&
+            GetFileAttributesW(temporary.journal().c_str()) ==
+                INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(temporary.checkpoint().c_str()) ==
+                INVALID_FILE_ATTRIBUTES,
+        "Post-publish recovery must verify the exact final File ID and retire without source I/O");
+}
+
+void test_image_commit_recovers_after_journal_retire_crash() {
+  TemporaryDirectory temporary;
+  BackingProof proof;
+  const auto fixture = create_image_commit_fixture(temporary, proof);
+  check(MoveFileExW(
+            temporary.partial().c_str(),
+            temporary.final_image().c_str(),
+            0U) != FALSE &&
+            DeleteFileW(temporary.journal().c_str()) != FALSE,
+        "Synthetic retirement crash must preserve final and checkpoint only");
+  auto platform = make_platform(temporary, proof);
+  auto inspected = platform->inspect_persistent_pe_exact_image_create();
+  check(inspected && inspected.value().state == ytec::operationcore::
+              PersistentPeExactImageCreateObjectState::retirement_pending,
+        "Missing exact journal after same-File-ID publish must classify as retirement pending");
+  int reproof_calls{};
+  int verifier_calls{};
+  auto request = image_commit_request(
+      temporary, fixture, reproof_calls, verifier_calls);
+  request.reprove_before_publish = {};
+  auto committed = platform->commit_persistent_pe_exact_image_create(request);
+  check(committed && committed.value().recovered_after_publish &&
+            committed.value().complete_image_verified &&
+            committed.value().journal_retired &&
+            committed.value().slot_retired && verifier_calls == 1 &&
+            read_bytes(temporary.final_image()) == fixture.image_marker &&
+            GetFileAttributesW(temporary.checkpoint().c_str()) ==
+                INVALID_FILE_ATTRIBUTES,
+        "Retirement-pending recovery must reverify final then retire only the checkpoint");
+}
+
+void test_image_post_publish_relinked_final_fails_closed() {
+  TemporaryDirectory temporary;
+  BackingProof proof;
+  const auto fixture = create_image_commit_fixture(temporary, proof);
+  check(MoveFileExW(
+            temporary.partial().c_str(),
+            temporary.final_image().c_str(),
+            0U) != FALSE &&
+            DeleteFileW(temporary.final_image().c_str()) != FALSE,
+        "Synthetic final relink fixture must remove the moved object");
+  const std::vector<std::byte> replacement{
+      std::byte{0xa1}, std::byte{0xb1}, std::byte{0xc1}};
+  write_bytes(temporary.final_image(), replacement);
+  auto platform = make_platform(temporary, proof);
+  auto inspected = platform->inspect_persistent_pe_exact_image_create();
+  check(!inspected && read_bytes(temporary.final_image()) == replacement &&
+            read_bytes(temporary.journal()) == fixture.journal_marker &&
+            GetFileAttributesW(temporary.checkpoint().c_str()) !=
+                INVALID_FILE_ATTRIBUTES,
+        "A relinked final must remain untouched and cannot be adopted for recovery");
+}
+
 }  // namespace
 
 int main() {
@@ -986,6 +1457,20 @@ int main() {
        test_locked_partial_rolls_back_checkpoint_discard},
       {"replace_stage_failure_keeps_current_revision",
        test_replace_stage_failure_keeps_current_revision},
+      {"v3_multi_object_slot_survives_restart_and_discards_exact_set",
+       test_v3_multi_object_slot_survives_restart_and_discards_exact_set},
+      {"v3_missing_or_relinked_object_is_never_adopted_or_deleted",
+       test_v3_missing_or_relinked_object_is_never_adopted_or_deleted},
+      {"image_commit_publishes_absent_final_then_retires_exact_set",
+       test_image_commit_publishes_absent_final_then_retires_exact_set},
+      {"image_commit_never_overwrites_an_existing_final",
+       test_image_commit_never_overwrites_an_existing_final},
+      {"image_commit_recovers_after_publish_crash_without_source_reproof",
+       test_image_commit_recovers_after_publish_crash_without_source_reproof},
+      {"image_commit_recovers_after_journal_retire_crash",
+       test_image_commit_recovers_after_journal_retire_crash},
+      {"image_post_publish_relinked_final_fails_closed",
+       test_image_post_publish_relinked_final_fails_closed},
   };
 
   int failures = 0;

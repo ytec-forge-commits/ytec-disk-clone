@@ -12,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,11 @@ void write_little(
     const T value) {
   std::memcpy(bytes.data() + offset, &value, sizeof(T));
 }
+
+void write_ntfs_boot(
+    std::vector<std::byte>& bytes,
+    std::uint64_t first_lba,
+    std::uint64_t sector_count);
 
 std::vector<std::byte> make_mbr_disk(const bool fat32) {
   std::vector<std::byte> bytes(
@@ -70,6 +76,26 @@ std::vector<std::byte> make_mbr_disk(const bool fat32) {
   }
   bytes[boot + 510U] = std::byte{0x55};
   bytes[boot + 511U] = std::byte{0xAA};
+  return bytes;
+}
+
+std::vector<std::byte> make_two_partition_mbr_disk() {
+  std::vector<std::byte> bytes(
+      static_cast<std::size_t>(kDiskSize), std::byte{0});
+  write_little<std::uint32_t>(bytes, 440U, 0x50607080U);
+  constexpr std::uint32_t first_lba = 2048U;
+  constexpr std::uint32_t partition_sectors = 4096U;
+  constexpr std::uint32_t second_lba = 8192U;
+  for (const auto [entry, start] : {
+           std::pair<std::size_t, std::uint32_t>{446U, first_lba},
+           std::pair<std::size_t, std::uint32_t>{462U, second_lba}}) {
+    bytes[entry + 4U] = std::byte{0x07};
+    write_little(bytes, entry + 8U, start);
+    write_little(bytes, entry + 12U, partition_sectors);
+    write_ntfs_boot(bytes, start, partition_sectors);
+  }
+  bytes[510U] = std::byte{0x55};
+  bytes[511U] = std::byte{0xAA};
   return bytes;
 }
 
@@ -462,7 +488,9 @@ class MemoryRescueStaging final
   bool discarded_{};
 };
 
-ytec::diskmodel::DiskInfo source_disk(const bool system = true) {
+ytec::diskmodel::DiskInfo source_disk(
+    const bool system = true,
+    const bool fat32 = false) {
   return ytec::diskmodel::DiskInfo{
       .disk_number = 0U,
       .device_path = L"\\\\.\\PhysicalDrive0",
@@ -479,6 +507,20 @@ ytec::diskmodel::DiskInfo source_disk(const bool system = true) {
       .read_only = false,
       .removable = false,
       .is_system_disk = system,
+      .partitions = {
+          ytec::diskmodel::PartitionInfo{
+              .number = 1U,
+              .offset_bytes =
+                  static_cast<std::uint64_t>(kFirstLba) * kSectorSize,
+              .size_bytes =
+                  static_cast<std::uint64_t>(kPartitionSectors) * kSectorSize,
+              .style = ytec::diskmodel::PartitionStyle::mbr,
+              .type = fat32 ? L"0x0C" : L"0x07",
+              .identifier = L"MBR-PARTITION-1",
+              .name = fat32 ? L"Data" : L"Windows",
+              .bootable = !fat32,
+          },
+      },
   };
 }
 
@@ -488,6 +530,72 @@ ytec::diskmodel::DiskInfo source_gpt_disk() {
   result.model = L"TSUMUGI GPT SOURCE FIXTURE";
   result.serial_suffix = "TSUMGPT1";
   result.partition_style = ytec::diskmodel::PartitionStyle::gpt;
+  result.partitions = {
+      ytec::diskmodel::PartitionInfo{
+          .number = 1U,
+          .offset_bytes = 2048ULL * kSectorSize,
+          .size_bytes = 1024ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::gpt,
+          .type = L"{C12A7328-F81F-11D2-BA4B-00A0C93EC93B}",
+          .identifier = L"GPT-PARTITION-1",
+          .name = L"EFI",
+      },
+      ytec::diskmodel::PartitionInfo{
+          .number = 2U,
+          .offset_bytes = 3072ULL * kSectorSize,
+          .size_bytes = 256ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::gpt,
+          .type = L"{E3C9E316-0B5C-4DB8-817D-F92DF00215AE}",
+          .identifier = L"GPT-PARTITION-2",
+          .name = L"MSR",
+      },
+      ytec::diskmodel::PartitionInfo{
+          .number = 3U,
+          .offset_bytes = 4096ULL * kSectorSize,
+          .size_bytes = 12288ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::gpt,
+          .type = L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}",
+          .identifier = L"GPT-PARTITION-3",
+          .name = L"Windows",
+      },
+      ytec::diskmodel::PartitionInfo{
+          .number = 4U,
+          .offset_bytes = 18432ULL * kSectorSize,
+          .size_bytes = 2048ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::gpt,
+          .type = L"{DE94BBA4-06D1-4D40-A16A-BFD50179D6AC}",
+          .identifier = L"GPT-PARTITION-4",
+          .name = L"Recovery",
+      },
+  };
+  return result;
+}
+
+ytec::diskmodel::DiskInfo source_two_partition_mbr_disk() {
+  auto result = source_disk(false);
+  result.device_instance_id = L"VIRTUAL\\TSUMUGI_TWO_PARTITION_SOURCE";
+  result.model = L"TSUMUGI TWO PARTITION SOURCE FIXTURE";
+  result.serial_suffix = "TSUM0002";
+  result.partitions = {
+      ytec::diskmodel::PartitionInfo{
+          .number = 1U,
+          .offset_bytes = 2048ULL * kSectorSize,
+          .size_bytes = 4096ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::mbr,
+          .type = L"0x07",
+          .identifier = L"MBR-PARTITION-1",
+          .name = L"Data 1",
+      },
+      ytec::diskmodel::PartitionInfo{
+          .number = 2U,
+          .offset_bytes = 8192ULL * kSectorSize,
+          .size_bytes = 4096ULL * kSectorSize,
+          .style = ytec::diskmodel::PartitionStyle::mbr,
+          .type = L"0x07",
+          .identifier = L"MBR-PARTITION-2",
+          .name = L"Data 2",
+      },
+  };
   return result;
 }
 
@@ -515,7 +623,7 @@ ytec::clonecore::Result<ytec::diskmodel::ReadOnlyPhysicalDiskHandle>
 open_fixture(
     const ytec::clonecore::StableDiskIdentity& expected,
     const bool fat32 = false) {
-  auto observed = source_disk(expected.is_system_disk);
+  auto observed = source_disk(expected.is_system_disk, fat32);
   return ytec::clonecore::Result<
       ytec::diskmodel::ReadOnlyPhysicalDiskHandle>::success(
       ytec::diskmodel::ReadOnlyPhysicalDiskHandle{
@@ -563,7 +671,8 @@ ytec::windowsapp::OnlineImageCreateDependencies dependencies(
           },
       .query_gpt_bindings =
           [](const ytec::diskmodel::DiskInfo&,
-             const ytec::clonecore::GptDisk&) {
+             const ytec::clonecore::GptDisk&,
+             const std::span<const std::uint32_t>) {
             return ytec::clonecore::Result<std::vector<
                 ytec::clonecore::VolumeBitmapBinding>>::failure(
                 ytec::clonecore::Error{
@@ -575,9 +684,13 @@ ytec::windowsapp::OnlineImageCreateDependencies dependencies(
           },
       .query_mbr_bindings =
           [&](const ytec::diskmodel::DiskInfo&,
-              const ytec::clonecore::MbrDisk& layout) {
+              const ytec::clonecore::MbrDisk& layout,
+              const std::span<const std::uint32_t> selected_entries) {
             observed.bindings = true;
             check(layout.partitions.size() == 1U, "Expected one MBR partition");
+            check(
+                selected_entries.size() == 1U && selected_entries[0] == 0U,
+                "Whole MBR selection must bind its only table entry");
             return ytec::clonecore::Result<std::vector<
                 ytec::clonecore::VolumeBitmapBinding>>::success({
                 ytec::clonecore::VolumeBitmapBinding{
@@ -975,7 +1088,7 @@ void test_unknown_verification_mode_stops_before_environment_io() {
 void test_mutable_fat32_data_is_rejected_before_vss() {
   Observations observed;
   auto value = request();
-  value.selected_source = source_disk(false);
+  value.selected_source = source_disk(false, true);
   auto deps = dependencies(observed, true);
   const auto result = ytec::windowsapp::execute_online_image_create(
       value, deps);
@@ -1058,9 +1171,15 @@ void test_gpt_static_system_ranges_are_the_only_raw_sources() {
       };
   deps.query_gpt_bindings =
       [&](const ytec::diskmodel::DiskInfo&,
-          const ytec::clonecore::GptDisk& layout) {
+          const ytec::clonecore::GptDisk& layout,
+          const std::span<const std::uint32_t> selected_entries) {
         observed.bindings = true;
         check(layout.partitions.size() == 4U, "Expected four GPT partitions");
+        check(
+            selected_entries.size() == 4U &&
+                selected_entries[0] == 0U && selected_entries[1] == 1U &&
+                selected_entries[2] == 2U && selected_entries[3] == 3U,
+            "Whole GPT selection must bind all table entries");
         return ytec::clonecore::Result<std::vector<
             ytec::clonecore::VolumeBitmapBinding>>::success({
             ytec::clonecore::VolumeBitmapBinding{
@@ -1115,6 +1234,118 @@ void test_gpt_static_system_ranges_are_the_only_raw_sources() {
       "Verified GPT system disk should reach the exact Tsumugi executor");
 }
 
+void test_mbr_partition_selection_binds_only_selected_vss_volume() {
+  Observations observed;
+  auto value = request();
+  value.selected_source = source_two_partition_mbr_disk();
+  value.selected_partition_numbers = {2U};
+  auto deps = dependencies(observed);
+  deps.open_read_only_disk =
+      [&](const ytec::clonecore::StableDiskIdentity& expected) {
+        observed.opened = true;
+        auto current = source_two_partition_mbr_disk();
+        auto reader =
+            std::make_unique<MemoryReader>(make_two_partition_mbr_disk());
+        observed.reader = reader.get();
+        return ytec::clonecore::Result<
+            ytec::diskmodel::ReadOnlyPhysicalDiskHandle>::success({
+            .observed = {
+                .observed = std::move(current),
+                .identity = expected,
+            },
+            .reader = std::move(reader),
+        });
+      };
+  deps.query_mbr_bindings =
+      [&](const ytec::diskmodel::DiskInfo&,
+          const ytec::clonecore::MbrDisk& layout,
+          const std::span<const std::uint32_t> selected_entries) {
+        observed.bindings = true;
+        check(
+            layout.partitions.size() == 2U &&
+                selected_entries.size() == 1U &&
+                selected_entries[0] == 1U,
+            "partition 2 selection must bind only MBR table entry 1");
+        return ytec::clonecore::Result<std::vector<
+            ytec::clonecore::VolumeBitmapBinding>>::success({
+            ytec::clonecore::VolumeBitmapBinding{
+                .partition_entry_index = 1U,
+                .volume_device_path =
+                    L"\\\\?\\Volume{33333333-3333-3333-3333-333333333333}\\",
+            },
+        });
+      };
+  deps.execute_backup =
+      [&](const ytec::vssrequester::WindowsOnlineTsumugiBackupRequest&
+              execution) {
+        observed.executed = true;
+        const auto& image_plan = execution.prepared.image;
+        const auto& manifest = image_plan.image.manifest;
+        const auto selection_flag = static_cast<std::uint32_t>(
+            ytec::imageformat::TsumugiManifestFlags::partition_selection);
+        check(
+            execution.prepared.workflow.volumes.size() == 1U &&
+                image_plan.volumes.size() == 1U &&
+                image_plan.volumes[0].partition_entry_index == 2U &&
+                image_plan.volumes[0].disk_offset ==
+                    8192ULL * kSectorSize &&
+                image_plan.raw_regions.empty(),
+            "VSS and payload plans must contain only selected partition 2");
+        check(
+            manifest.partitions.size() == 2U &&
+                (static_cast<std::uint32_t>(manifest.flags) &
+                 selection_flag) != 0U &&
+                !flag_set(
+                    manifest.partitions[0].flags,
+                    ytec::imageformat::
+                        TsumugiManifestPartitionFlags::selected) &&
+                manifest.partitions[0].minimum_target_bytes == 0U &&
+                manifest.partitions[0].planned_target_bytes == 0U &&
+                manifest.partitions[0].payload_logical_offset == 0U &&
+                manifest.partitions[0].payload_logical_length == 0U &&
+                flag_set(
+                    manifest.partitions[1].flags,
+                    ytec::imageformat::
+                        TsumugiManifestPartitionFlags::selected) &&
+                manifest.partitions[1].source_partition_number == 2U &&
+                manifest.partitions[1].payload_logical_offset ==
+                    8192ULL * kSectorSize &&
+                manifest.partitions[1].payload_logical_length ==
+                    4096ULL * kSectorSize,
+            "typed manifest must retain the unselected record without payload and bind partition 2 exactly");
+        check(
+            ytec::imageformat::build_tsumugi_manifest_v1(manifest)
+                .has_value(),
+            "partial exact manifest must remain canonical Tsumugi v1");
+        return ytec::clonecore::Result<
+            ytec::vssrequester::OnlineTsumugiBackupReport>::success({
+            .final_file_committed_after_vss = true,
+        });
+      };
+  const auto result = ytec::windowsapp::execute_online_image_create(
+      value, deps);
+  check(
+      result.has_value() && observed.opened && observed.bindings &&
+          observed.executed,
+      "selected MBR data partition must reach the real VSS planning backend");
+}
+
+void test_invalid_partition_selection_stops_before_environment_io() {
+  for (const auto selection : {
+           std::vector<std::uint32_t>{99U},
+           std::vector<std::uint32_t>{1U, 1U}}) {
+    Observations observed;
+    auto value = request();
+    value.selected_partition_numbers = selection;
+    const auto result = ytec::windowsapp::execute_online_image_create(
+        value, dependencies(observed));
+    check(
+        !result.has_value() && !observed.opened && !observed.bindings &&
+            !observed.executed && observed.destination_requirements.empty(),
+        "unknown or duplicate online selection must fail before environment I/O");
+  }
+}
+
 void test_public_identity_hash_contract() {
   const auto identity = ytec::diskmodel::make_stable_disk_identity(
       source_disk(), true);
@@ -1167,6 +1398,10 @@ int main() {
        test_locked_layout_drift_is_detected},
       {"gpt_static_system_ranges_are_the_only_raw_sources",
        test_gpt_static_system_ranges_are_the_only_raw_sources},
+      {"mbr_partition_selection_binds_only_selected_vss_volume",
+       test_mbr_partition_selection_binds_only_selected_vss_volume},
+      {"invalid_partition_selection_stops_before_environment_io",
+       test_invalid_partition_selection_stops_before_environment_io},
       {"public_identity_hash_contract",
        test_public_identity_hash_contract},
   };

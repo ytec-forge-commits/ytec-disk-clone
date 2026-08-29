@@ -7,6 +7,8 @@ add_library(
     src/snapshot_plan.cpp
     src/tsumugi_snapshot.cpp
     src/online_tsumugi_backup.cpp
+    src/diff_area_monitor.cpp
+    src/windows_diff_area_observer.cpp
     src/windows_backend.cpp
 )
 

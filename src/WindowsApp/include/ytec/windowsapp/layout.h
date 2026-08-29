@@ -47,9 +47,52 @@ struct BottomActionLayout final {
   HorizontalBounds primary_action;
 };
 
+// The diagnostics page has four equally important keyboard-reachable actions.
+// It uses the complete content row instead of squeezing extra controls into
+// the normal two-action layout.
+struct DiagnosticsActionLayout final {
+  HorizontalBounds update_action;
+  HorizontalBounds post_migration_action;
+  HorizontalBounds guidance_action;
+  HorizontalBounds support_action;
+};
+
 struct ImageCreateOptionLayout final {
   HorizontalBounds verification_control;
   HorizontalBounds transfer_control;
+};
+
+struct DialogBounds final {
+  int left{};
+  int top{};
+  int right{};
+  int bottom{};
+
+  [[nodiscard]] int width() const noexcept {
+    return right > left ? right - left : 0;
+  }
+  [[nodiscard]] int height() const noexcept {
+    return bottom > top ? bottom - top : 0;
+  }
+  [[nodiscard]] bool contains(const DialogBounds& other) const noexcept {
+    return other.left >= left && other.top >= top &&
+        other.right <= right && other.bottom <= bottom;
+  }
+};
+
+struct ClonePartitionCapacityDialogLayout final {
+  int client_width{};
+  int client_height{};
+  DialogBounds client;
+  DialogBounds guidance;
+  DialogBounds partition_list;
+  DialogBounds surplus_label;
+  DialogBounds surplus_policy;
+  DialogBounds surplus_target_label;
+  DialogBounds surplus_target;
+  DialogBounds status;
+  DialogBounds accept_button;
+  DialogBounds cancel_button;
 };
 
 [[nodiscard]] CloneColumnLayout calculate_clone_column_layout(
@@ -66,7 +109,18 @@ calculate_rescue_media_vertical_layout(
 [[nodiscard]] BottomActionLayout calculate_bottom_action_layout(
     int client_width) noexcept;
 
+[[nodiscard]] DiagnosticsActionLayout
+calculate_diagnostics_action_layout(int client_width) noexcept;
+
 [[nodiscard]] ImageCreateOptionLayout
 calculate_image_create_option_layout(int client_width) noexcept;
+
+// Fits inside the monitor work area at 100-200% DPI. The partition ListView
+// owns vertical scrolling, so no row count can push buttons off-screen.
+[[nodiscard]] ClonePartitionCapacityDialogLayout
+calculate_clone_partition_capacity_dialog_layout(
+    int work_width,
+    int work_height,
+    unsigned int dpi) noexcept;
 
 }  // namespace ytec::windowsapp

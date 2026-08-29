@@ -42,6 +42,22 @@ bool is_hex(const wchar_t value) {
          (value >= L'A' && value <= L'F');
 }
 
+bool is_guid_string(const std::wstring_view value) {
+  if (value.size() != 38U || value.front() != L'{' ||
+      value.back() != L'}') {
+    return false;
+  }
+  for (std::size_t index = 1U; index + 1U < value.size(); ++index) {
+    const bool hyphen =
+        index == 9U || index == 14U || index == 19U || index == 24U;
+    if ((hyphen && value[index] != L'-') ||
+        (!hyphen && !is_hex(value[index]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool is_volume_guid_path(const std::wstring_view path) {
   constexpr std::wstring_view prefix = L"\\\\?\\Volume{";
   if (path.size() != 49 || !path.starts_with(prefix) ||
@@ -173,13 +189,15 @@ clonecore::Status validate_mappings(
   }
   for (std::size_t index = 0; index < mappings.size(); ++index) {
     if (!is_volume_guid_path(mappings[index].original_volume_guid_path) ||
-        mappings[index].snapshot_id.empty() ||
-        !is_snapshot_device_path(mappings[index].snapshot_device_path)) {
+        !is_guid_string(mappings[index].snapshot_id) ||
+        !is_snapshot_device_path(mappings[index].snapshot_device_path) ||
+        !is_guid_string(mappings[index].provider_id) ||
+        mappings[index].creation_timestamp == 0) {
       return clonecore::Status::failure(workflow_error(
           clonecore::ErrorCode::invalid_data,
-          E_INVALIDARG,
-          L"VSS Snapshotデバイスパス検証",
-          L"VSSが返したSnapshot対応またはデバイスパスが不正です"));
+        E_INVALIDARG,
+        L"VSS Snapshotデバイスパス検証",
+        L"VSSが返したSnapshot、デバイス、provider、またはcreation timestampが不正です"));
     }
     for (std::size_t previous = 0; previous < index; ++previous) {
       if (equals_case_insensitive(

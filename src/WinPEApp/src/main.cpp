@@ -286,12 +286,9 @@ int wmain(const int argc, wchar_t* argv[]) {
 
   const ytec::clonecore::Logger logger = ytec::clonecore::make_stderr_logger();
   auto provider = ytec::diskmodel::make_windows_disk_inventory_provider(&logger);
-  auto clone_execution =
-      ytec::winpeapp::make_windows_clone_execution_service();
   return ytec::winpeapp::run_winpe_app(
       arguments,
       *provider,
       std::cout,
-      std::cerr,
-      clone_execution.get());
+      std::cerr);
 }

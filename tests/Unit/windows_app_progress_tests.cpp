@@ -1,6 +1,7 @@
 #include "ytec/windowsapp/progress.h"
 #include "ytec/windowsapp/selection.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <limits>
@@ -244,6 +245,164 @@ void test_clone_selection_safety() {
       "A SMART/NVMe abnormal target must fail closed");
 }
 
+void test_transfer_mode_context_is_explicit_and_fail_closed() {
+  using ytec::windowsapp::WindowsTransferModeChoice;
+  using ytec::windowsapp::WindowsTransferModeContext;
+
+  const auto clone = ytec::windowsapp::windows_transfer_mode_options(
+      WindowsTransferModeContext::clone);
+  const auto image = ytec::windowsapp::windows_transfer_mode_options(
+      WindowsTransferModeContext::create_image);
+  const auto contains = [](const auto options,
+                           const WindowsTransferModeChoice choice) {
+    return std::ranges::any_of(
+        options,
+        [choice](const ytec::windowsapp::WindowsTransferModeOption& option) {
+          return option.choice == choice;
+        });
+  };
+
+  check(clone.size() == 3U, "The clone page must retain three transfer modes");
+  check(image.size() == 3U, "The image-create page must expose three modes");
+  check(
+      contains(clone, WindowsTransferModeChoice::exact) &&
+          contains(clone, WindowsTransferModeChoice::shrink) &&
+          contains(clone, WindowsTransferModeChoice::rescue),
+      "Clone transfer modes must remain normal, shrink, and rescue");
+  check(
+      contains(image, WindowsTransferModeChoice::exact) &&
+          contains(image, WindowsTransferModeChoice::shrink) &&
+          contains(image, WindowsTransferModeChoice::rescue),
+      "Image-create transfer modes must remain normal, shrink, and rescue");
+  const auto unknown_context =
+      static_cast<WindowsTransferModeContext>(0xFFU);
+  check(
+      ytec::windowsapp::windows_transfer_mode_options(unknown_context)
+              .empty() &&
+          !ytec::windowsapp::windows_transfer_mode_allowed(
+              unknown_context,
+              WindowsTransferModeChoice::exact),
+      "An unknown page context must not inherit another page's combo model");
+
+  for (const auto& option : clone) {
+    const auto decoded =
+        ytec::windowsapp::decode_windows_transfer_mode_item_data(
+            ytec::windowsapp::windows_transfer_mode_item_data(option.choice));
+    check(
+        decoded.has_value() && decoded.value() == option.choice,
+        "Every combo item must round-trip through explicit item data");
+  }
+  check(
+      !ytec::windowsapp::decode_windows_transfer_mode_item_data(0U)
+           .has_value() &&
+          !ytec::windowsapp::decode_windows_transfer_mode_item_data(999U)
+               .has_value(),
+      "Missing or unknown combo item data must fail closed");
+
+  check(
+      ytec::windowsapp::windows_transfer_mode_requires_same_or_larger_target(
+          WindowsTransferModeChoice::exact) &&
+          ytec::windowsapp::
+              windows_transfer_mode_requires_same_or_larger_target(
+                  WindowsTransferModeChoice::rescue) &&
+          !ytec::windowsapp::
+              windows_transfer_mode_requires_same_or_larger_target(
+                  WindowsTransferModeChoice::shrink),
+      "Only shrink mode may admit a smaller target candidate");
+
+  using ytec::windowsapp::WindowsPartitionStyleChoice;
+  const auto styles = ytec::windowsapp::windows_partition_style_options();
+  check(styles.size() == 2U, "Clone style selector must expose two choices");
+  for (const auto& option : styles) {
+    const auto decoded =
+        ytec::windowsapp::decode_windows_partition_style_item_data(
+            ytec::windowsapp::windows_partition_style_item_data(
+                option.choice));
+    check(
+        decoded.has_value() && decoded.value() == option.choice,
+        "Every partition-style item must round-trip through item data");
+  }
+  check(
+      !ytec::windowsapp::decode_windows_partition_style_item_data(0U)
+           .has_value() &&
+          !ytec::windowsapp::decode_windows_partition_style_item_data(999U)
+               .has_value(),
+      "Unknown partition-style item data must fail closed");
+  check(
+      !ytec::windowsapp::windows_partition_style_choice_allowed(
+          WindowsTransferModeChoice::exact,
+          ytec::diskmodel::PartitionStyle::mbr,
+          true,
+          WindowsPartitionStyleChoice::mbr_to_gpt) &&
+          ytec::windowsapp::windows_partition_style_choice_allowed(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::mbr,
+              true,
+              WindowsPartitionStyleChoice::mbr_to_gpt),
+      "This product slice must expose MBR-to-GPT only with shrink transfer");
+  check(
+      !ytec::windowsapp::windows_partition_style_choice_allowed(
+          WindowsTransferModeChoice::rescue,
+          ytec::diskmodel::PartitionStyle::mbr,
+          true,
+          WindowsPartitionStyleChoice::mbr_to_gpt) &&
+          !ytec::windowsapp::windows_partition_style_choice_allowed(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::gpt,
+              true,
+              WindowsPartitionStyleChoice::mbr_to_gpt) &&
+          !ytec::windowsapp::windows_partition_style_choice_allowed(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::mbr,
+              false,
+              WindowsPartitionStyleChoice::mbr_to_gpt),
+      "Rescue, GPT sources, and non-system sources must force preserve");
+  check(
+      ytec::windowsapp::windows_partition_style_choice_allowed(
+          WindowsTransferModeChoice::exact,
+          ytec::diskmodel::PartitionStyle::mbr,
+          true,
+          WindowsPartitionStyleChoice::preserve) &&
+          ytec::windowsapp::windows_partition_style_choice_allowed(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::gpt,
+              true,
+              WindowsPartitionStyleChoice::preserve) &&
+          ytec::windowsapp::windows_partition_style_choice_allowed(
+              WindowsTransferModeChoice::rescue,
+              ytec::diskmodel::PartitionStyle::mbr,
+              false,
+              WindowsPartitionStyleChoice::preserve),
+      "Preserve must remain available for exact, shrink, and rescue modes");
+  check(
+      ytec::windowsapp::windows_partition_style_route_available(
+          WindowsTransferModeChoice::shrink,
+          ytec::diskmodel::PartitionStyle::mbr,
+          true,
+          WindowsPartitionStyleChoice::preserve) &&
+          ytec::windowsapp::windows_partition_style_route_available(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::mbr,
+              true,
+              WindowsPartitionStyleChoice::mbr_to_gpt) &&
+          ytec::windowsapp::windows_partition_style_route_available(
+              WindowsTransferModeChoice::shrink,
+              ytec::diskmodel::PartitionStyle::gpt,
+              true,
+              WindowsPartitionStyleChoice::preserve) &&
+          !ytec::windowsapp::windows_partition_style_route_available(
+              static_cast<WindowsTransferModeChoice>(0xFFU),
+              ytec::diskmodel::PartitionStyle::mbr,
+              true,
+              WindowsPartitionStyleChoice::preserve) &&
+          !ytec::windowsapp::windows_partition_style_route_available(
+          WindowsTransferModeChoice::shrink,
+          ytec::diskmodel::PartitionStyle::unknown,
+          true,
+          WindowsPartitionStyleChoice::preserve),
+      "MBR-preserving shrink and target-only conversion must be explicit routes while unknown styles fail closed");
+}
+
 }  // namespace
 
 int main() {
@@ -254,6 +413,7 @@ int main() {
     test_terminal_labels();
     test_online_image_progress_keeps_work_streams_distinct();
     test_clone_selection_safety();
+    test_transfer_mode_context_is_explicit_and_fail_closed();
     std::cout << "windows app progress tests: PASS\n";
     return 0;
   } catch (const TestFailure& failure) {

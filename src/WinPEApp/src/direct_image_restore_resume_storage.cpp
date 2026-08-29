@@ -1,5 +1,7 @@
 #include "ytec/winpeapp/direct_image_restore_resume_storage.h"
 
+#include "ytec/winpeapp/direct_image_create_resume.h"
+
 #include "ytec/clonecore/unique_handle.h"
 #include "ytec/diskmodel/physical_disk.h"
 #include "ytec/imageformat/sha256.h"
@@ -439,6 +441,29 @@ struct StorageBindingState final {
   std::optional<DirectImageRestoreResumeStorageProof> selected;
 };
 
+struct ImageCreateStorageBindingState final {
+  std::mutex mutex;
+  std::optional<DirectImageCreateResumeStorageProof> selected;
+};
+
+clonecore::Result<std::wstring> current_data_directory() {
+  std::vector<wchar_t> module(kMaximumPathCharacters, L'\0');
+  const DWORD length = GetModuleFileNameW(
+      nullptr, module.data(), static_cast<DWORD>(module.size()));
+  if (length == 0U || length >= module.size()) {
+    return clonecore::Result<std::wstring>::failure(
+        clonecore::make_win32_error(
+            clonecore::ErrorCode::query_failed,
+            L"PE Resume executable path",
+            length == 0U ? GetLastError() : ERROR_FILENAME_EXCED_RANGE));
+  }
+  return clonecore::Result<std::wstring>::success(
+      (std::filesystem::path(std::wstring(module.data(), length))
+           .parent_path() /
+       L"data")
+          .wstring());
+}
+
 }  // namespace
 
 clonecore::Result<DirectImageRestoreResumeStoragePlatformV1>
@@ -580,13 +605,14 @@ observe_windows_resume_path_storage_domain_v1(
     return clonecore::Result<OpenedResumeStorageDomainV1>::failure(
         canonical.error());
   }
+  const bool directory_role =
+      role == ResumeStoragePathRole::checkpoint_data ||
+      role == ResumeStoragePathRole::image_output_parent;
   const DWORD attributes = GetFileAttributesW(canonical.value().c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES ||
       (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U ||
-      (role != ResumeStoragePathRole::checkpoint_data &&
-       (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) ||
-      (role == ResumeStoragePathRole::checkpoint_data &&
-       (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U)) {
+      (!directory_role && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) ||
+      (directory_role && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U)) {
     return failure<OpenedResumeStorageDomainV1>(
         clonecore::ErrorCode::unsupported_layout,
         attributes == INVALID_FILE_ATTRIBUTES ? GetLastError()
@@ -614,11 +640,11 @@ observe_windows_resume_path_storage_domain_v1(
   }
   FILE_ATTRIBUTE_TAG_INFO tag{};
   if (!GetFileInformationByHandleEx(
-          opened.get(), FileAttributeTagInfo, &tag, sizeof(tag)) ||
+      opened.get(), FileAttributeTagInfo, &tag, sizeof(tag)) ||
       (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U ||
-      (role != ResumeStoragePathRole::checkpoint_data &&
+      (!directory_role &&
        (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) ||
-      (role == ResumeStoragePathRole::checkpoint_data &&
+      (directory_role &&
        (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U)) {
     return failure<OpenedResumeStorageDomainV1>(
         clonecore::ErrorCode::unsupported_layout,
@@ -774,6 +800,135 @@ make_direct_image_restore_windows_storage_platform_v1() {
         }
         return domain;
       },
+  });
+}
+
+clonecore::Result<DirectImageCreateResumeStoragePlatformV1>
+make_direct_image_create_windows_resume_storage_platform_v1() {
+  auto state = std::make_shared<ImageCreateStorageBindingState>();
+  operationcore::WindowsResumeDataBackingProbe backing =
+      [state](
+          const std::wstring& data_directory,
+          const std::optional<operationcore::ResumeSlotRecord>&) {
+        auto data = observe_windows_resume_path_storage_domain_v1(
+            data_directory, ResumeStoragePathRole::checkpoint_data);
+        if (!data) {
+          return clonecore::Result<
+              operationcore::WindowsResumeDataBackingProof>::failure(
+              data.error());
+        }
+        bool separated = false;
+        {
+          std::scoped_lock lock(state->mutex);
+          if (state->selected) {
+            separated = data.value().persistent_checkpoint_backing &&
+                data.value().storage_identity_hash ==
+                    state->selected->checkpoint_storage_identity_hash &&
+                data.value().storage_identity_hash !=
+                    state->selected->source_storage_identity_hash &&
+                data.value().storage_identity_hash !=
+                    state->selected->destination_storage_identity_hash;
+          }
+        }
+        return clonecore::Result<
+            operationcore::WindowsResumeDataBackingProof>::success({
+            .backing_storage_identity_hash =
+                data.value().storage_identity_hash,
+            .identity_from_open_handle =
+                data.value().identity_from_open_handles,
+            .separated_from_source = separated,
+        });
+      };
+  DirectImageCreateResumeStorageProbe storage =
+      [state](
+          const DirectImageCreateRequest& request,
+          const std::optional<operationcore::ResumeSlotRecord>&) {
+        auto data_path = current_data_directory();
+        if (!data_path) {
+          return clonecore::Result<
+              DirectImageCreateResumeStorageProof>::failure(
+              data_path.error());
+        }
+        auto data = observe_windows_resume_path_storage_domain_v1(
+            data_path.value(), ResumeStoragePathRole::checkpoint_data);
+        auto source_identity = diskmodel::make_stable_disk_identity(
+            request.selected_source,
+            request.selected_source.is_system_disk);
+        if (!data || !source_identity) {
+          return clonecore::Result<
+              DirectImageCreateResumeStorageProof>::failure(
+              data ? source_identity.error() : data.error());
+        }
+        auto source = observe_windows_resume_physical_storage_domain_v1(
+            source_identity.value());
+        if (!source) {
+          return clonecore::Result<
+              DirectImageCreateResumeStorageProof>::failure(
+              source.error());
+        }
+        const std::filesystem::path output(request.final_path);
+        if (!output.has_parent_path() || output.parent_path().empty()) {
+          return failure<DirectImageCreateResumeStorageProof>(
+              clonecore::ErrorCode::invalid_argument,
+              ERROR_BAD_PATHNAME,
+              L"PE image-create output parent",
+              L"完成名を含む既存の絶対保存先ディレクトリが必要です");
+        }
+        auto destination = observe_windows_resume_path_storage_domain_v1(
+            output.parent_path().wstring(),
+            ResumeStoragePathRole::image_output_parent);
+        if (!destination) {
+          return clonecore::Result<
+              DirectImageCreateResumeStorageProof>::failure(
+              destination.error());
+        }
+        DirectImageCreateResumeStorageProof proof{
+            .checkpoint_storage_identity_hash =
+                data.value().storage_identity_hash,
+            .source_storage_identity_hash =
+                source.value().storage_identity_hash,
+            .destination_storage_identity_hash =
+                destination.value().storage_identity_hash,
+            .all_identities_from_open_handles =
+                data.value().identity_from_open_handles &&
+                source.value().identity_from_open_handles &&
+                destination.value().identity_from_open_handles,
+        };
+        if (!data.value().persistent_checkpoint_backing ||
+            !proof.all_identities_from_open_handles ||
+            all_zero(proof.checkpoint_storage_identity_hash) ||
+            all_zero(proof.source_storage_identity_hash) ||
+            all_zero(proof.destination_storage_identity_hash) ||
+            proof.checkpoint_storage_identity_hash ==
+                proof.source_storage_identity_hash ||
+            proof.checkpoint_storage_identity_hash ==
+                proof.destination_storage_identity_hash ||
+            proof.source_storage_identity_hash ==
+                proof.destination_storage_identity_hash) {
+          return failure<DirectImageCreateResumeStorageProof>(
+              clonecore::ErrorCode::unsupported_layout,
+              ERROR_NOT_SUPPORTED,
+              L"PE image-create opened storage separation",
+              L"永続data、read-only Source、保存先を3つの別opened-storage domainとして証明できません");
+        }
+        {
+          std::scoped_lock lock(state->mutex);
+          state->selected = proof;
+        }
+        return clonecore::Result<
+            DirectImageCreateResumeStorageProof>::success(proof);
+      };
+  DirectImageCreateResumeSlotPlatformFactory factory =
+      [backing](std::vector<operationcore::WindowsResumeOwnedObject> objects) {
+        return operationcore::
+            make_current_executable_windows_resume_slot_platform(
+                backing, std::nullopt, std::move(objects));
+      };
+  return clonecore::Result<
+      DirectImageCreateResumeStoragePlatformV1>::success({
+      .prove_data_backing = std::move(backing),
+      .prove_image_create_storage = std::move(storage),
+      .make_bound_slot_platform = std::move(factory),
   });
 }
 

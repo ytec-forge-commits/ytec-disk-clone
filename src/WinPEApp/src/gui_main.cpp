@@ -1,9 +1,11 @@
 #include "ytec/bootrepair/automatic_repair_windows.h"
 #include "ytec/bootrepair/nvram_repair.h"
 #include "ytec/bootrepair/standalone_repair.h"
+#include "ytec/bootrepair/system_partition_creation.h"
 #include "ytec/bootrepair/system_volume_mount.h"
 #include "ytec/bootrepair/winre_diagnostic.h"
 #include "ytec/bootrepair/winre_registration.h"
+#include "ytec/clonecore/completion_power_action.h"
 #include "ytec/clonecore/log.h"
 #include "ytec/clonecore/manual_pause.h"
 #include "ytec/clonecore/operation_power.h"
@@ -16,8 +18,10 @@
 #include "ytec/winpeapp/app_runner.h"
 #include "ytec/winpeapp/active_rescue_media.h"
 #include "ytec/winpeapp/automatic_boot_repair_ui.h"
+#include "ytec/winpeapp/completion_power_ui.h"
 #include "ytec/winpeapp/dashboard.h"
 #include "ytec/winpeapp/direct_image_create.h"
+#include "ytec/winpeapp/direct_image_create_resume.h"
 #include "ytec/winpeapp/direct_image_restore.h"
 #include "ytec/winpeapp/direct_shrink_image_restore.h"
 #include "ytec/winpeapp/direct_image_restore_resume.h"
@@ -25,7 +29,9 @@
 #include "ytec/winpeapp/direct_image_restore_resume_storage.h"
 #include "ytec/winpeapp/image_create_ui.h"
 #include "ytec/winpeapp/image_restore_ui.h"
+#include "ytec/winpeapp/offline_ntfs_direct_shrink_product.h"
 #include "ytec/winpeapp/repair_layout.h"
+#include "ytec/winpeapp/resume_slot_admission.h"
 #include "ytec/winpeapp/rescue_clone.h"
 #include "ytec/winpeapp/tsumugi_password_ui.h"
 #include "ytec/winpeapp/winre_diagnostic_view.h"
@@ -49,10 +55,12 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #ifndef YTEC_WINPE_PRODUCT_BOUNDARY
@@ -131,6 +139,7 @@ constexpr UINT kImageRestoreVerifyCompleteMessage = WM_APP + 10U;
 constexpr UINT kImageRestoreProgressMessage = WM_APP + 11U;
 constexpr UINT kImageRestoreCompleteMessage = WM_APP + 12U;
 constexpr UINT kManualPauseStateChangedMessage = WM_APP + 13U;
+constexpr UINT kCloneShrinkInspectionCompleteMessage = WM_APP + 14U;
 
 constexpr int kNavCloneId = 100;
 constexpr int kNavRepairId = 101;
@@ -185,6 +194,13 @@ constexpr int kImageRestoreOutputId = 258;
 constexpr int kImageRestorePauseId = 259;
 constexpr int kImageRestoreSourcePartitionId = 260;
 constexpr int kImageRestoreTargetPartitionId = 261;
+constexpr int kDirectShrinkPartitionListId = 270;
+constexpr int kDirectShrinkSurplusPolicyId = 271;
+constexpr int kDirectShrinkSurplusTargetId = 272;
+constexpr int kDirectShrinkStatusId = 273;
+constexpr int kCompletionPowerNoneId = 3401;
+constexpr int kCompletionPowerRestartId = 3403;
+constexpr int kCompletionPowerShutdownId = 3404;
 constexpr int kErrorCopyDetailsId = 42001;
 constexpr std::size_t kMaximumErrorDialogDetailCharacters = 240U;
 static_assert(
@@ -208,22 +224,38 @@ constexpr COLORREF kDanger = RGB(179, 59, 59);
 class ThreadSleepPrevention final {
  public:
   ThreadSleepPrevention() noexcept
-      : previous_(SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED)) {}
+      : active_(SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0U) {}
 
   ~ThreadSleepPrevention() {
-    if (active()) {
-      static_cast<void>(SetThreadExecutionState(ES_CONTINUOUS));
-    }
+    static_cast<void>(release());
   }
 
   ThreadSleepPrevention(const ThreadSleepPrevention&) = delete;
   ThreadSleepPrevention& operator=(const ThreadSleepPrevention&) = delete;
 
-  [[nodiscard]] bool active() const noexcept { return previous_ != 0U; }
+  [[nodiscard]] bool active() const noexcept { return active_; }
+
+  [[nodiscard]] ytec::clonecore::SleepPreventionReleaseState
+  release() noexcept {
+    if (!active_) {
+      return release_state_;
+    }
+    if (SetThreadExecutionState(ES_CONTINUOUS) == 0U) {
+      release_state_ = ytec::clonecore::
+          SleepPreventionReleaseState::release_failed;
+      return release_state_;
+    }
+    active_ = false;
+    release_state_ =
+        ytec::clonecore::SleepPreventionReleaseState::released;
+    return release_state_;
+  }
 
  private:
-  EXECUTION_STATE previous_{};
+  bool active_{};
+  ytec::clonecore::SleepPreventionReleaseState release_state_{
+      ytec::clonecore::SleepPreventionReleaseState::unknown};
 };
 
 bool confirm_long_operation_power(
@@ -257,6 +289,7 @@ enum class Page : std::uint8_t {
 
 enum class CloneRoute : std::uint8_t {
   exact,
+  shrink,
   rescue,
   mbr_to_gpt,
 };
@@ -276,7 +309,19 @@ struct CloneCheckPayload final {
       reviewed_rescue_plan;
   std::optional<ytec::winpeapp::Mbr2GptDirectOperationPlan>
       reviewed_mbr2gpt_plan;
+  std::shared_ptr<const
+      ytec::winpeapp::WinPeOfflineNtfsDirectShrinkPlan>
+      reviewed_direct_shrink_plan;
   std::wstring confirmation_token;
+  std::wstring output;
+  std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
+};
+
+struct CloneShrinkInspectionPayload final {
+  std::optional<
+      ytec::winpeapp::WinPeOfflineNtfsPartitionInspection>
+      inspection;
+  ytec::winpeapp::WinPeOfflineNtfsProductPlanningRequest request;
   std::wstring output;
   std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
 };
@@ -289,12 +334,16 @@ struct CloneProgressPayload final {
 struct CloneExecutePayload final {
   bool success{};
   CloneRoute route{CloneRoute::exact};
+  ytec::winpeapp::WinPeCompletionPowerProof completion_power_proof;
+  std::wstring completion_power_target;
   std::wstring output;
   std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
 };
 
 struct BootInspectPayload final {
   std::optional<ytec::bootrepair::AutomaticBootRepairPlan> plan;
+  std::optional<ytec::bootrepair::ReviewedSystemPartitionCreation>
+      system_partition_creation;
   std::optional<ytec::bootrepair::ReviewedAutomaticBootRepairChoices>
       choices;
   std::optional<
@@ -311,6 +360,11 @@ struct BootInspectPayload final {
 struct BootExecutePayload final {
   bool success{};
   bool partial{};
+  bool system_partition_creation_stage{};
+  ytec::winpeapp::WinPeCompletionPowerProof completion_power_proof;
+  std::wstring completion_power_target;
+  std::optional<ytec::bootrepair::AutomaticBootRepairPlan>
+      completed_creation_plan;
   std::wstring output;
   std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
 };
@@ -327,6 +381,13 @@ struct ImageCreateProgressPayload final {
 
 struct ImageCreatePayload final {
   bool success{};
+  bool persistent_resume_attempt{};
+  bool resume_platform_ready{};
+  bool resume_slot_present{};
+  std::optional<ytec::winpeapp::DirectImageCreateResumeStartupObservation>
+      resume_observation_after_operation;
+  ytec::winpeapp::WinPeCompletionPowerProof completion_power_proof;
+  std::wstring completion_power_target;
   std::wstring output;
   std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
 };
@@ -606,6 +667,649 @@ TsumugiPasswordPromptResult prompt_tsumugi_password(
   };
 }
 
+struct DirectShrinkPartitionDialogResult final {
+  std::vector<std::uint32_t> selected_source_table_indexes;
+  ytec::migrationcore::ShrinkSurplusAllocation surplus_allocation{
+      ytec::migrationcore::ShrinkSurplusAllocation::automatic_proportional};
+  std::optional<std::uint32_t> surplus_target_source_table_index;
+};
+
+struct DirectShrinkPartitionDialogState final {
+  const ytec::winpeapp::WinPeOfflineNtfsPartitionInspection* inspection{};
+  HFONT font{};
+  int client_width{880};
+  int client_height{500};
+  HWND partition_list{};
+  HWND surplus_policy{};
+  HWND surplus_target{};
+  HWND status{};
+  std::optional<DirectShrinkPartitionDialogResult> result;
+};
+
+std::wstring_view direct_shrink_partition_role_text(
+    const ytec::migrationcore::MigrationPartitionRole role) noexcept {
+  switch (role) {
+    case ytec::migrationcore::MigrationPartitionRole::efi_system:
+      return L"ESP";
+    case ytec::migrationcore::MigrationPartitionRole::microsoft_reserved:
+      return L"MSR";
+    case ytec::migrationcore::MigrationPartitionRole::bios_system:
+      return L"BIOS起動";
+    case ytec::migrationcore::MigrationPartitionRole::windows:
+      return L"Windows";
+    case ytec::migrationcore::MigrationPartitionRole::recovery:
+      return L"回復";
+    case ytec::migrationcore::MigrationPartitionRole::data:
+      return L"データ";
+  }
+  return L"不明";
+}
+
+std::wstring_view direct_shrink_file_system_text(
+    const ytec::migrationcore::MigrationFileSystem file_system) noexcept {
+  switch (file_system) {
+    case ytec::migrationcore::MigrationFileSystem::none:
+      return L"なし";
+    case ytec::migrationcore::MigrationFileSystem::ntfs:
+      return L"NTFS";
+    case ytec::migrationcore::MigrationFileSystem::fat32:
+      return L"FAT32";
+    case ytec::migrationcore::MigrationFileSystem::exfat:
+      return L"exFAT";
+    case ytec::migrationcore::MigrationFileSystem::unsupported:
+      return L"未対応（RAW）";
+  }
+  return L"不明";
+}
+
+std::optional<std::uint32_t> direct_shrink_list_source_index(
+    const HWND list,
+    const int item_index) {
+  LVITEMW item{
+      .mask = LVIF_PARAM,
+      .iItem = item_index,
+  };
+  if (ListView_GetItem(list, &item) == FALSE || item.lParam <= 0 ||
+      static_cast<std::uint64_t>(item.lParam) >
+          (std::numeric_limits<std::uint32_t>::max)()) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint32_t>(item.lParam);
+}
+
+const ytec::winpeapp::WinPeOfflineNtfsPartitionCandidate*
+find_direct_shrink_candidate(
+    const DirectShrinkPartitionDialogState& state,
+    const std::uint32_t source_table_index) {
+  if (state.inspection == nullptr) {
+    return nullptr;
+  }
+  const auto found = std::find_if(
+      state.inspection->candidates.begin(),
+      state.inspection->candidates.end(),
+      [source_table_index](const auto& candidate) {
+        return candidate.source_table_index == source_table_index;
+      });
+  return found == state.inspection->candidates.end() ? nullptr : &*found;
+}
+
+std::optional<ytec::migrationcore::ShrinkSurplusAllocation>
+selected_direct_shrink_surplus_policy(
+    const DirectShrinkPartitionDialogState& state) {
+  const LRESULT selection =
+      SendMessageW(state.surplus_policy, CB_GETCURSEL, 0, 0);
+  if (selection == CB_ERR) {
+    return std::nullopt;
+  }
+  const LRESULT data = SendMessageW(
+      state.surplus_policy,
+      CB_GETITEMDATA,
+      static_cast<WPARAM>(selection),
+      0);
+  if (data == CB_ERR) {
+    return std::nullopt;
+  }
+  const auto allocation =
+      static_cast<ytec::migrationcore::ShrinkSurplusAllocation>(data);
+  switch (allocation) {
+    case ytec::migrationcore::ShrinkSurplusAllocation::automatic_proportional:
+    case ytec::migrationcore::ShrinkSurplusAllocation::leave_unallocated:
+    case ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition:
+      return allocation;
+  }
+  return std::nullopt;
+}
+
+void set_direct_shrink_dialog_status(
+    DirectShrinkPartitionDialogState& state,
+    const std::wstring_view text) {
+  if (state.status != nullptr) {
+    SetWindowTextW(state.status, std::wstring(text).c_str());
+  }
+}
+
+bool rebuild_direct_shrink_surplus_targets(
+    DirectShrinkPartitionDialogState& state) {
+  if (state.partition_list == nullptr || state.surplus_target == nullptr) {
+    return false;
+  }
+  std::optional<std::uint32_t> previous;
+  const LRESULT old_selection =
+      SendMessageW(state.surplus_target, CB_GETCURSEL, 0, 0);
+  if (old_selection != CB_ERR) {
+    const LRESULT old_data = SendMessageW(
+        state.surplus_target,
+        CB_GETITEMDATA,
+        static_cast<WPARAM>(old_selection),
+        0);
+    if (old_data != CB_ERR && old_data > 0 &&
+        static_cast<std::uint64_t>(old_data) <=
+            (std::numeric_limits<std::uint32_t>::max)()) {
+      previous = static_cast<std::uint32_t>(old_data);
+    }
+  }
+  if (SendMessageW(state.surplus_target, CB_RESETCONTENT, 0, 0) == CB_ERR) {
+    return false;
+  }
+  LRESULT selected_item = CB_ERR;
+  const int item_count = ListView_GetItemCount(state.partition_list);
+  for (int index = 0; index < item_count; ++index) {
+    const auto source_table_index =
+        direct_shrink_list_source_index(state.partition_list, index);
+    const auto* candidate = source_table_index.has_value()
+        ? find_direct_shrink_candidate(state, *source_table_index)
+        : nullptr;
+    if (candidate == nullptr ||
+        candidate->role != ytec::migrationcore::MigrationPartitionRole::data ||
+        candidate->file_system !=
+            ytec::migrationcore::MigrationFileSystem::ntfs ||
+        ListView_GetCheckState(state.partition_list, index) == FALSE) {
+      continue;
+    }
+    std::wstring label = L"#" + std::to_wstring(*source_table_index) + L"  ";
+    label += candidate->label.empty() ? L"データ領域" : candidate->label;
+    label += L"  (" + ytec::winpeapp::format_dashboard_capacity(
+        candidate->source_size_bytes) + L")";
+    const LRESULT item = SendMessageW(
+        state.surplus_target,
+        CB_ADDSTRING,
+        0,
+        reinterpret_cast<LPARAM>(label.c_str()));
+    if (item == CB_ERR || item == CB_ERRSPACE ||
+        SendMessageW(
+            state.surplus_target,
+            CB_SETITEMDATA,
+            static_cast<WPARAM>(item),
+            static_cast<LPARAM>(*source_table_index)) == CB_ERR) {
+      return false;
+    }
+    if (selected_item == CB_ERR || previous == source_table_index) {
+      selected_item = item;
+    }
+  }
+  if (selected_item != CB_ERR) {
+    static_cast<void>(SendMessageW(
+        state.surplus_target,
+        CB_SETCURSEL,
+        static_cast<WPARAM>(selected_item),
+        0));
+  }
+  const bool selected_target = selected_direct_shrink_surplus_policy(state) ==
+      ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition;
+  EnableWindow(state.surplus_target, selected_target ? TRUE : FALSE);
+  set_direct_shrink_dialog_status(
+      state,
+      selected_target && selected_item == CB_ERR
+          ? L"指定配分には、選択済みのNTFSデータ領域が必要です。"
+          : L"Windows・起動・必須回復領域は解除できません。確定後に同じ対象を再解析します。");
+  return true;
+}
+
+bool collect_direct_shrink_partition_dialog_result(
+    DirectShrinkPartitionDialogState& state) {
+  DirectShrinkPartitionDialogResult result;
+  const int item_count = ListView_GetItemCount(state.partition_list);
+  for (int index = 0; index < item_count; ++index) {
+    const auto source_table_index =
+        direct_shrink_list_source_index(state.partition_list, index);
+    const auto* candidate = source_table_index.has_value()
+        ? find_direct_shrink_candidate(state, *source_table_index)
+        : nullptr;
+    if (candidate == nullptr) {
+      return false;
+    }
+    const bool selected =
+        ListView_GetCheckState(state.partition_list, index) != FALSE;
+    if (candidate->required && !selected) {
+      set_direct_shrink_dialog_status(
+          state, L"Windows・起動・必須回復領域は解除できません。");
+      return false;
+    }
+    if (selected) {
+      result.selected_source_table_indexes.push_back(*source_table_index);
+    }
+  }
+  if (result.selected_source_table_indexes.empty()) {
+    set_direct_shrink_dialog_status(
+        state, L"少なくとも1つのパーティションを選択してください。");
+    return false;
+  }
+  const auto allocation = selected_direct_shrink_surplus_policy(state);
+  if (!allocation.has_value()) {
+    return false;
+  }
+  result.surplus_allocation = *allocation;
+  if (*allocation ==
+      ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition) {
+    const LRESULT selection =
+        SendMessageW(state.surplus_target, CB_GETCURSEL, 0, 0);
+    if (selection == CB_ERR) {
+      set_direct_shrink_dialog_status(
+          state, L"余剰容量を受け取るNTFSデータ領域を選択してください。");
+      return false;
+    }
+    const LRESULT data = SendMessageW(
+        state.surplus_target,
+        CB_GETITEMDATA,
+        static_cast<WPARAM>(selection),
+        0);
+    if (data == CB_ERR || data <= 0 ||
+        static_cast<std::uint64_t>(data) >
+            (std::numeric_limits<std::uint32_t>::max)()) {
+      return false;
+    }
+    result.surplus_target_source_table_index =
+        static_cast<std::uint32_t>(data);
+  }
+  state.result = std::move(result);
+  return true;
+}
+
+INT_PTR CALLBACK direct_shrink_partition_dialog_proc(
+    const HWND dialog,
+    const UINT message,
+    const WPARAM wparam,
+    const LPARAM lparam) {
+  auto* state = reinterpret_cast<DirectShrinkPartitionDialogState*>(
+      GetWindowLongPtrW(dialog, DWLP_USER));
+  if (message == WM_INITDIALOG) {
+    state = reinterpret_cast<DirectShrinkPartitionDialogState*>(lparam);
+    if (state == nullptr || state->inspection == nullptr) {
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+    SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+    RECT bounds{0, 0, state->client_width, state->client_height};
+    static_cast<void>(AdjustWindowRectEx(
+        &bounds,
+        static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_STYLE)),
+        FALSE,
+        static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_EXSTYLE))));
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    MONITORINFO monitor{.cbSize = sizeof(MONITORINFO)};
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    const HMONITOR display = MonitorFromWindow(
+        GetWindow(dialog, GW_OWNER), MONITOR_DEFAULTTONEAREST);
+    if (display != nullptr && GetMonitorInfoW(display, &monitor) != FALSE) {
+      work = monitor.rcWork;
+    }
+    SetWindowPos(
+        dialog,
+        nullptr,
+        work.left + ((work.right - work.left) - width) / 2,
+        work.top + ((work.bottom - work.top) - height) / 2,
+        width,
+        height,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+
+    const auto make_control = [dialog, state](
+                                  const wchar_t* class_name,
+                                  const wchar_t* text,
+                                  const DWORD style,
+                                  const DWORD extended_style,
+                                  const int identifier,
+                                  const int left,
+                                  const int top,
+                                  const int width,
+                                  const int height) {
+      const HWND control = CreateWindowExW(
+          extended_style,
+          class_name,
+          text,
+          WS_CHILD | WS_VISIBLE | style,
+          left,
+          top,
+          width,
+          height,
+          dialog,
+          reinterpret_cast<HMENU>(static_cast<INT_PTR>(identifier)),
+          GetModuleHandleW(nullptr),
+          nullptr);
+      if (control != nullptr && state->font != nullptr) {
+        SendMessageW(
+            control,
+            WM_SETFONT,
+            reinterpret_cast<WPARAM>(state->font),
+            TRUE);
+      }
+      return control;
+    };
+    const int margin = 18;
+    const int list_top = 58;
+    const int list_height = state->client_height - 238;
+    const int combo_top = list_top + list_height + 32;
+    const int combo_width = (state->client_width - margin * 2 - 150) / 2;
+    const HWND guidance = make_control(
+        L"STATIC",
+        L"コピーする領域を選択してください。Windows起動に必要な領域は解除できません。未対応形式のデータ領域は元サイズRAWで保持し、安全に特定・検証できなければ停止します。",
+        SS_LEFT,
+        0,
+        -1,
+        margin,
+        12,
+        state->client_width - margin * 2,
+        38);
+    state->partition_list = make_control(
+        WC_LISTVIEWW,
+        L"",
+        LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_VSCROLL | WS_TABSTOP,
+        WS_EX_CLIENTEDGE,
+        kDirectShrinkPartitionListId,
+        margin,
+        list_top,
+        state->client_width - margin * 2,
+        list_height);
+    const HWND policy_label = make_control(
+        L"STATIC", L"余剰容量", SS_LEFT | SS_CENTERIMAGE, 0, -1,
+        margin, combo_top - 24, combo_width, 22);
+    state->surplus_policy = make_control(
+        L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0,
+        kDirectShrinkSurplusPolicyId, margin, combo_top, combo_width, 120);
+    const HWND target_label = make_control(
+        L"STATIC", L"指定するNTFSデータ領域", SS_LEFT | SS_CENTERIMAGE, 0,
+        -1, margin + combo_width + 16, combo_top - 24, combo_width, 22);
+    state->surplus_target = make_control(
+        L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 0,
+        kDirectShrinkSurplusTargetId, margin + combo_width + 16, combo_top,
+        combo_width, 120);
+    state->status = make_control(
+        L"STATIC", L"", SS_LEFT, 0, kDirectShrinkStatusId, margin,
+        combo_top + 38, state->client_width - margin * 2, 32);
+    const HWND accept = make_control(
+        L"BUTTON", L"この設定で再解析", BS_DEFPUSHBUTTON | WS_TABSTOP, 0,
+        IDOK, state->client_width - 214, state->client_height - 38, 92, 26);
+    const HWND cancel = make_control(
+        L"BUTTON", L"キャンセル", BS_PUSHBUTTON | WS_TABSTOP, 0,
+        IDCANCEL, state->client_width - 114, state->client_height - 38, 96, 26);
+    if (guidance == nullptr || state->partition_list == nullptr ||
+        policy_label == nullptr || state->surplus_policy == nullptr ||
+        target_label == nullptr || state->surplus_target == nullptr ||
+        state->status == nullptr || accept == nullptr || cancel == nullptr) {
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+
+    ListView_SetExtendedListViewStyleEx(
+        state->partition_list,
+        LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES,
+        LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    struct Column final {
+      wchar_t* title;
+      int width;
+    };
+    wchar_t number[] = L"番号";
+    wchar_t role[] = L"役割";
+    wchar_t file_system[] = L"形式";
+    wchar_t label[] = L"ラベル";
+    wchar_t size[] = L"元の容量";
+    wchar_t selection[] = L"選択";
+    const int list_width = state->client_width - margin * 2;
+    std::array<Column, 6U> columns{
+        Column{number, 60},
+        Column{role, 104},
+        Column{file_system, 90},
+        Column{label, (std::max)(120, list_width - 570)},
+        Column{size, 130},
+        Column{selection, 160},
+    };
+    for (std::size_t column_index = 0; column_index < columns.size();
+         ++column_index) {
+      LVCOLUMNW column{
+          .mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT,
+          .fmt = column_index == 4U ? LVCFMT_RIGHT : LVCFMT_LEFT,
+          .cx = columns[column_index].width,
+          .pszText = columns[column_index].title,
+      };
+      if (ListView_InsertColumn(
+              state->partition_list,
+              static_cast<int>(column_index),
+              &column) == -1) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+    }
+    int item_index = 0;
+    for (const auto& candidate : state->inspection->candidates) {
+      std::wstring number_text =
+          L"#" + std::to_wstring(candidate.source_table_index);
+      LVITEMW item{
+          .mask = LVIF_TEXT | LVIF_PARAM,
+          .iItem = item_index,
+          .pszText = number_text.data(),
+          .lParam = static_cast<LPARAM>(candidate.source_table_index),
+      };
+      const int inserted = ListView_InsertItem(state->partition_list, &item);
+      if (inserted < 0) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      const auto set_item = [state, inserted](
+                                const int subitem,
+                                const std::wstring& text) {
+        LVITEMW value{
+            .mask = LVIF_TEXT,
+            .iItem = inserted,
+            .iSubItem = subitem,
+            .pszText = const_cast<wchar_t*>(text.c_str()),
+        };
+        return ListView_SetItem(state->partition_list, &value) != FALSE;
+      };
+      const std::wstring role_text{
+          direct_shrink_partition_role_text(candidate.role)};
+      const std::wstring file_system_text{
+          direct_shrink_file_system_text(candidate.file_system)};
+      const std::wstring label_text =
+          candidate.label.empty() ? L"（なし）" : candidate.label;
+      const std::wstring size_text =
+          ytec::winpeapp::format_dashboard_capacity(
+              candidate.source_size_bytes);
+      const std::wstring selection_text =
+          candidate.required ? L"必須・解除不可" : L"任意";
+      if (!set_item(1, role_text) || !set_item(2, file_system_text) ||
+          !set_item(3, label_text) || !set_item(4, size_text) ||
+          !set_item(5, selection_text)) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+      ListView_SetCheckState(
+          state->partition_list,
+          inserted,
+          candidate.selected_by_default ? TRUE : FALSE);
+      ++item_index;
+    }
+    struct Policy final {
+      ytec::migrationcore::ShrinkSurplusAllocation allocation;
+      const wchar_t* label;
+    };
+    constexpr std::array<Policy, 3U> policies{
+        Policy{
+            ytec::migrationcore::ShrinkSurplusAllocation::automatic_proportional,
+            L"自動配分（推奨）"},
+        Policy{
+            ytec::migrationcore::ShrinkSurplusAllocation::leave_unallocated,
+            L"未割当のまま"},
+        Policy{
+            ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition,
+            L"指定したNTFSデータ領域へ配分"},
+    };
+    for (const auto& policy : policies) {
+      const LRESULT index = SendMessageW(
+          state->surplus_policy,
+          CB_ADDSTRING,
+          0,
+          reinterpret_cast<LPARAM>(policy.label));
+      if (index == CB_ERR || index == CB_ERRSPACE ||
+          SendMessageW(
+              state->surplus_policy,
+              CB_SETITEMDATA,
+              static_cast<WPARAM>(index),
+              static_cast<LPARAM>(policy.allocation)) == CB_ERR) {
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+      }
+    }
+    if (SendMessageW(state->surplus_policy, CB_SETCURSEL, 0, 0) == CB_ERR ||
+        !rebuild_direct_shrink_surplus_targets(*state)) {
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+    SetFocus(state->partition_list);
+    return FALSE;
+  }
+  if (message == WM_NOTIFY && state != nullptr &&
+      reinterpret_cast<const NMHDR*>(lparam)->idFrom ==
+          kDirectShrinkPartitionListId) {
+    const auto* header = reinterpret_cast<const NMHDR*>(lparam);
+    if (header->code == LVN_ITEMCHANGING) {
+      const auto* change = reinterpret_cast<const NMLISTVIEW*>(lparam);
+      if ((change->uChanged & LVIF_STATE) != 0U) {
+        const UINT old_check =
+            (change->uOldState & LVIS_STATEIMAGEMASK) >> 12U;
+        const UINT new_check =
+            (change->uNewState & LVIS_STATEIMAGEMASK) >> 12U;
+        const auto source_table_index = direct_shrink_list_source_index(
+            state->partition_list, change->iItem);
+        const auto* candidate = source_table_index.has_value()
+            ? find_direct_shrink_candidate(*state, *source_table_index)
+            : nullptr;
+        if (candidate != nullptr && candidate->required && old_check == 2U &&
+            new_check == 1U) {
+          MessageBeep(MB_ICONWARNING);
+          set_direct_shrink_dialog_status(
+              *state,
+              L"Windows・起動・必須回復領域は解除できません。");
+          SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+          return TRUE;
+        }
+      }
+    } else if (header->code == LVN_KEYDOWN) {
+      const auto* key = reinterpret_cast<const NMLVKEYDOWN*>(lparam);
+      if (key->wVKey == VK_SPACE) {
+        const int focused = ListView_GetNextItem(
+            state->partition_list, -1, LVNI_FOCUSED);
+        const auto source_table_index = focused >= 0
+            ? direct_shrink_list_source_index(state->partition_list, focused)
+            : std::nullopt;
+        const auto* candidate = source_table_index.has_value()
+            ? find_direct_shrink_candidate(*state, *source_table_index)
+            : nullptr;
+        if (candidate != nullptr && candidate->required &&
+            ListView_GetCheckState(state->partition_list, focused) != FALSE) {
+          MessageBeep(MB_ICONWARNING);
+          set_direct_shrink_dialog_status(
+              *state, L"Spaceキーでも必須領域は解除できません。");
+          SetWindowLongPtrW(dialog, DWLP_MSGRESULT, TRUE);
+          return TRUE;
+        }
+      }
+    } else if (header->code == LVN_ITEMCHANGED) {
+      static_cast<void>(rebuild_direct_shrink_surplus_targets(*state));
+    }
+  }
+  if (message == WM_COMMAND && state != nullptr) {
+    if (LOWORD(wparam) == kDirectShrinkSurplusPolicyId &&
+        HIWORD(wparam) == CBN_SELCHANGE) {
+      static_cast<void>(rebuild_direct_shrink_surplus_targets(*state));
+      return TRUE;
+    }
+    if (LOWORD(wparam) == IDOK) {
+      if (collect_direct_shrink_partition_dialog_result(*state)) {
+        EndDialog(dialog, IDOK);
+      } else {
+        MessageBeep(MB_ICONWARNING);
+      }
+      return TRUE;
+    }
+    if (LOWORD(wparam) == IDCANCEL) {
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+  }
+  if (message == WM_CLOSE) {
+    EndDialog(dialog, IDCANCEL);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+std::optional<DirectShrinkPartitionDialogResult>
+show_direct_shrink_partition_review_dialog(
+    const HWND owner,
+    const HFONT font,
+    const ytec::winpeapp::WinPeOfflineNtfsPartitionInspection& inspection) {
+  RECT work{0, 0, 1024, 600};
+  MONITORINFO monitor{.cbSize = sizeof(MONITORINFO)};
+  const HMONITOR display =
+      MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+  if (display != nullptr && GetMonitorInfoW(display, &monitor) != FALSE) {
+    work = monitor.rcWork;
+  }
+  DirectShrinkPartitionDialogState state{
+      .inspection = &inspection,
+      .font = font,
+      .client_width = (std::clamp)(
+          static_cast<int>(work.right - work.left) - 80, 720, 1040),
+      .client_height = (std::clamp)(
+          static_cast<int>(work.bottom - work.top) - 80, 480, 650),
+  };
+  alignas(DWORD) std::array<std::byte, 512U> storage{};
+  auto* dialog_template = reinterpret_cast<DLGTEMPLATE*>(storage.data());
+  dialog_template->style =
+      WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+  dialog_template->dwExtendedStyle = 0;
+  dialog_template->cdit = 0;
+  dialog_template->x = 0;
+  dialog_template->y = 0;
+  dialog_template->cx = 320;
+  dialog_template->cy = 240;
+  WORD* words = reinterpret_cast<WORD*>(dialog_template + 1);
+  *words++ = 0;
+  *words++ = 0;
+  constexpr std::wstring_view title{L"WinPE 縮小移行：パーティション・余剰容量"};
+  for (const wchar_t character : title) {
+    *words++ = static_cast<WORD>(character);
+  }
+  *words = 0;
+  const INT_PTR result = DialogBoxIndirectParamW(
+      GetModuleHandleW(nullptr),
+      dialog_template,
+      owner,
+      direct_shrink_partition_dialog_proc,
+      reinterpret_cast<LPARAM>(&state));
+  if (result != IDOK || !state.result.has_value()) {
+    if (result == -1) {
+      MessageBoxW(
+          owner,
+          L"パーティション・容量設定画面を開けませんでした。",
+          kWindowTitle,
+          MB_OK | MB_ICONERROR);
+    }
+    return std::nullopt;
+  }
+  return std::move(state.result);
+}
+
 struct VerifiedRestoreImageSelection final {
   std::wstring path;
   ytec::imageformat::TsumugiImageStorageFileSystem storage_file_system{
@@ -649,6 +1353,8 @@ struct ImageRestorePayload final {
   bool resume_slot_present{};
   std::optional<ytec::operationcore::ResumeSlotBinding>
       reviewed_resume_slot_after_operation;
+  ytec::winpeapp::WinPeCompletionPowerProof completion_power_proof;
+  std::wstring completion_power_target;
   std::wstring output;
   std::optional<ytec::uisupport::ErrorPresentation> error_presentation;
 };
@@ -658,6 +1364,7 @@ struct AppState final {
   Page page{Page::clone};
   bool inventory_busy{};
   bool operation_busy{};
+  std::uint64_t next_completion_power_operation_binding{1U};
   int clone_step{1};
   int repair_step{1};
   ytec::winpeapp::DashboardView dashboard;
@@ -668,8 +1375,13 @@ struct AppState final {
       reviewed_rescue_clone_plan;
   std::optional<ytec::winpeapp::Mbr2GptDirectOperationPlan>
       reviewed_mbr2gpt_clone_plan;
+  std::shared_ptr<const
+      ytec::winpeapp::WinPeOfflineNtfsDirectShrinkPlan>
+      reviewed_direct_shrink_clone_plan;
   std::optional<ytec::bootrepair::AutomaticBootRepairPlan>
       inspected_boot_plan;
+  std::optional<ytec::bootrepair::ReviewedSystemPartitionCreation>
+      inspected_system_partition_creation;
   std::optional<ytec::bootrepair::ReviewedAutomaticBootRepairChoices>
       inspected_boot_choices;
   std::optional<
@@ -690,6 +1402,8 @@ struct AppState final {
       clone_pause_controller;
   int image_step{1};
   std::optional<ytec::diskmodel::DiskInfo> reviewed_image_source;
+  std::optional<ytec::diskmodel::ImagePartitionSelection>
+      reviewed_image_partition_selection;
   std::wstring reviewed_image_path;
   bool reviewed_image_replace_existing{};
   bool reviewed_image_encrypted{};
@@ -698,6 +1412,11 @@ struct AppState final {
       reviewed_image_verification_mode{
           ytec::imageformat::TsumugiCreateVerificationMode::complete};
   std::shared_ptr<SecureAsciiPassword> reviewed_image_password;
+  std::optional<ytec::winpeapp::DirectImageCreateResumeStartupObservation>
+      reviewed_image_resume_observation;
+  bool image_resume_platform_ready{};
+  bool image_resume_slot_present{};
+  bool image_resume_requested{};
   bool image_execution_ready{};
   bool image_progress_active{};
   ytec::clonecore::DiskOperationProgress image_progress;
@@ -821,6 +1540,10 @@ std::wstring_view image_create_verification_mode_name(
 
 std::wstring control_text(HWND control);
 void update_action_state(AppState& state);
+std::optional<ytec::diskmodel::DiskInfo> find_inventory_disk(
+    const AppState& state,
+    std::uint32_t disk_number);
+std::string current_utc_timestamp();
 
 std::shared_ptr<ytec::clonecore::ManualPauseController>
 make_ui_manual_pause_controller(const HWND window) {
@@ -1133,6 +1856,205 @@ void show_captured_error(
   }
 }
 
+[[nodiscard]] int completion_power_radio_id(
+    const ytec::clonecore::CompletionPowerAction action) noexcept {
+  switch (action) {
+    case ytec::clonecore::CompletionPowerAction::none:
+      return kCompletionPowerNoneId;
+    case ytec::clonecore::CompletionPowerAction::restart:
+      return kCompletionPowerRestartId;
+    case ytec::clonecore::CompletionPowerAction::shutdown:
+      return kCompletionPowerShutdownId;
+    case ytec::clonecore::CompletionPowerAction::sleep:
+      return 0;
+  }
+  return 0;
+}
+
+[[nodiscard]] ytec::clonecore::CompletionPowerAction
+completion_power_action_from_radio_id(const int radio_id) noexcept {
+  switch (radio_id) {
+    case kCompletionPowerRestartId:
+      return ytec::clonecore::CompletionPowerAction::restart;
+    case kCompletionPowerShutdownId:
+      return ytec::clonecore::CompletionPowerAction::shutdown;
+    case kCompletionPowerNoneId:
+    default:
+      return ytec::clonecore::CompletionPowerAction::none;
+  }
+}
+
+[[nodiscard]] std::wstring_view completion_power_action_label(
+    const ytec::clonecore::CompletionPowerAction action) noexcept {
+  switch (action) {
+    case ytec::clonecore::CompletionPowerAction::none:
+      return L"何もしない";
+    case ytec::clonecore::CompletionPowerAction::restart:
+      return L"再起動";
+    case ytec::clonecore::CompletionPowerAction::shutdown:
+      return L"シャットダウン";
+    case ytec::clonecore::CompletionPowerAction::sleep:
+      return L"何もしない";
+  }
+  return L"何もしない";
+}
+
+// Returns true only after the platform accepted a restart/shutdown request.
+// Merely displaying, cancelling, or failing either confirmation returns false.
+[[nodiscard]] bool offer_winpe_completion_power_action(
+    AppState& state,
+    const ytec::winpeapp::WinPeCompletionPowerProof& proof,
+    const std::wstring_view completed_operation,
+    const std::wstring_view target_summary) {
+  const auto prompt_plan =
+      ytec::winpeapp::plan_winpe_completion_power_prompt(proof);
+  if (!prompt_plan.prompt_allowed || completed_operation.empty() ||
+      target_summary.empty()) {
+    return false;
+  }
+
+  auto platform =
+      ytec::clonecore::make_windows_completion_power_platform();
+  if (platform == nullptr) {
+    return false;
+  }
+  const auto availability =
+      ytec::clonecore::query_completion_power_availability(
+          ytec::clonecore::CompletionPowerEnvironment::winpe,
+          *platform);
+  const auto actions =
+      ytec::clonecore::available_completion_power_actions(availability);
+  constexpr std::array<std::wstring_view, 4U> kLabels{
+      L"何もしない（既定）",
+      L"スリープ（WinPEでは使用不可）",
+      L"再起動",
+      L"シャットダウン",
+  };
+  std::vector<TASKDIALOG_BUTTON> radio_buttons;
+  radio_buttons.reserve(actions.size());
+  for (const auto action : actions) {
+    const auto index = static_cast<std::size_t>(action);
+    const int radio_id = completion_power_radio_id(action);
+    if (index >= kLabels.size() || radio_id == 0) {
+      continue;
+    }
+    radio_buttons.push_back(TASKDIALOG_BUTTON{
+        radio_id,
+        kLabels[index].data(),
+    });
+  }
+  if (radio_buttons.size() != 3U ||
+      radio_buttons.front().nButtonID != kCompletionPowerNoneId) {
+    return false;
+  }
+
+  const HWND previous_focus = GetFocus();
+  const std::wstring instruction =
+      std::wstring(completed_operation) + L"が安全に完了しました";
+  const std::wstring content =
+      L"対象: " + std::wstring(target_summary) +
+      L"\r\n結果: 必須証拠の検証完了・自動スリープ防止解除済み"
+      L"\r\n\r\nこのあとWinPEへ要求する動作を選んでください。";
+  TASKDIALOGCONFIG config{};
+  config.cbSize = sizeof(config);
+  config.hwndParent = state.window;
+  config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+                   TDF_POSITION_RELATIVE_TO_WINDOW |
+                   TDF_SIZE_TO_CONTENT;
+  config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+  config.pszWindowTitle = L"完了後の動作";
+  config.pszMainIcon = TD_INFORMATION_ICON;
+  config.pszMainInstruction = instruction.c_str();
+  config.pszContent = content.c_str();
+  config.cRadioButtons = static_cast<UINT>(radio_buttons.size());
+  config.pRadioButtons = radio_buttons.data();
+  config.nDefaultRadioButton = kCompletionPowerNoneId;
+  config.nDefaultButton = IDOK;
+  config.pszFooterIcon = TD_INFORMATION_ICON;
+  config.pszFooter =
+      L"WinPEではスリープを提供しません。既定は「何もしない」です。"
+      L"電源操作は次の画面でもう一度確認します。";
+
+  using TaskDialogIndirectFunction = HRESULT(WINAPI*)(
+      const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+  HMODULE common_controls = LoadLibraryExW(
+      L"comctl32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  TaskDialogIndirectFunction task_dialog{};
+  if (common_controls != nullptr) {
+    task_dialog = reinterpret_cast<TaskDialogIndirectFunction>(
+        GetProcAddress(common_controls, "TaskDialogIndirect"));
+    if (task_dialog == nullptr) {
+      task_dialog = reinterpret_cast<TaskDialogIndirectFunction>(
+          GetProcAddress(common_controls, MAKEINTRESOURCEA(345)));
+    }
+  }
+  int pressed_button{};
+  int selected_radio = kCompletionPowerNoneId;
+  const HRESULT shown = task_dialog == nullptr
+      ? HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)
+      : task_dialog(&config, &pressed_button, &selected_radio, nullptr);
+  if (common_controls != nullptr) {
+    FreeLibrary(common_controls);
+  }
+  if (FAILED(shown) || pressed_button != IDOK) {
+    restore_error_dialog_focus(previous_focus);
+    return false;
+  }
+
+  const auto selected_action =
+      completion_power_action_from_radio_id(selected_radio);
+  if (selected_action ==
+      ytec::clonecore::kDefaultCompletionPowerAction) {
+    restore_error_dialog_focus(previous_focus);
+    return false;
+  }
+
+  const std::wstring reconfirmation =
+      L"対象: " + std::wstring(target_summary) +
+      L"\r\n結果: 必須証拠の検証完了"
+      L"\r\n動作: " +
+      std::wstring(completion_power_action_label(selected_action)) +
+      L"\r\n\r\n対象と結果をもう一度確認しました。"
+      L"この電源操作を今すぐWinPEへ要求しますか？";
+  if (MessageBoxW(
+          state.window,
+          reconfirmation.c_str(),
+          L"完了後の電源操作を再確認",
+          MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+    restore_error_dialog_focus(previous_focus);
+    return false;
+  }
+
+  const auto request = ytec::winpeapp::
+      make_winpe_completion_power_execution_request(
+          proof, selected_action, true, true);
+  const auto result = ytec::clonecore::execute_completion_power_action(
+      request, *platform);
+  if (result.disposition == ytec::clonecore::
+          CompletionPowerExecutionDisposition::request_accepted) {
+    const bool session_end_expected = ytec::winpeapp::
+        winpe_completion_power_action_expects_ui_session_end(
+            selected_action);
+    if (!session_end_expected) {
+      restore_error_dialog_focus(previous_focus);
+    }
+    return session_end_expected;
+  }
+  if (result.error.has_value()) {
+    show_error_presentation(
+        state.window,
+        ytec::uisupport::make_error_presentation(result.error.value()));
+    MessageBoxW(
+        state.window,
+        L"元の操作と検証済み完了結果は変わりません。"
+        L"このWinPEセッションはそのまま継続できます。",
+        L"電源操作は実行していません",
+        MB_OK | MB_ICONINFORMATION);
+  }
+  restore_error_dialog_focus(previous_focus);
+  return false;
+}
+
 ytec::clonecore::Error restore_ui_error(
     const ytec::clonecore::ErrorCode code,
     const DWORD native_code,
@@ -1260,6 +2182,20 @@ bool current_process_is_elevated() noexcept {
   return elevated;
 }
 
+bool current_environment_is_verified_winpe() noexcept {
+  HKEY key = nullptr;
+  const LSTATUS status = RegOpenKeyExW(
+      HKEY_LOCAL_MACHINE,
+      L"SYSTEM\\CurrentControlSet\\Control\\MiniNT",
+      0,
+      KEY_QUERY_VALUE,
+      &key);
+  if (key != nullptr) {
+    RegCloseKey(key);
+  }
+  return status == ERROR_SUCCESS;
+}
+
 std::wstring utf8_to_wide(const std::string& text) {
   if (text.empty()) {
     return {};
@@ -1289,6 +2225,193 @@ std::wstring utf8_to_wide(const std::string& text) {
     return L"診断結果の文字コードを安全に解釈できません。";
   }
   return result;
+}
+
+std::wstring format_completion_disk_target(
+    const ytec::clonecore::StableDiskIdentity& identity) {
+  std::wostringstream stream;
+  stream << L"ディスク " << identity.disk_number << L" / "
+         << (identity.model.empty() ? L"モデル不明" : identity.model)
+         << L" / "
+         << ytec::winpeapp::format_dashboard_capacity(identity.size_bytes)
+         << L" / シリアル末尾: "
+         << (identity.serial_suffix.empty()
+                 ? L"不明"
+                 : utf8_to_wide(identity.serial_suffix));
+  return stream.str();
+}
+
+std::wstring format_completion_disk_target(
+    const ytec::diskmodel::DiskInfo& disk) {
+  std::wostringstream stream;
+  stream << L"ディスク " << disk.disk_number << L" / "
+         << (disk.model.empty() ? L"モデル不明" : disk.model) << L" / "
+         << ytec::winpeapp::format_dashboard_capacity(disk.size_bytes)
+         << L" / シリアル末尾: "
+         << (disk.serial_suffix.empty()
+                 ? L"不明"
+                 : utf8_to_wide(disk.serial_suffix));
+  return stream.str();
+}
+
+[[nodiscard]] ytec::clonecore::CompletionOperationOutcome
+completion_operation_outcome(
+    const bool success,
+    const bool partial = false) noexcept {
+  if (!success) {
+    return ytec::clonecore::CompletionOperationOutcome::failed;
+  }
+  return partial
+      ? ytec::clonecore::CompletionOperationOutcome::partial
+      : ytec::clonecore::CompletionOperationOutcome::succeeded;
+}
+
+[[nodiscard]] bool direct_clone_completion_verified(
+    const ytec::winpeapp::CloneExecutionReport& report) noexcept {
+  const bool style_known =
+      report.partition_style == ytec::winpeapp::ClonePartitionStyle::gpt ||
+      report.partition_style == ytec::winpeapp::ClonePartitionStyle::mbr;
+  const bool boot_verified = !report.boot_finalization_required ||
+      (report.boot_repair.bcdboot.microsoft_signature_verified &&
+       report.boot_repair.bcdboot.exit_code == 0U &&
+       report.boot_repair.boot_store_verified &&
+       (!report.boot_repair.system_partition_temporarily_mounted ||
+        report.boot_repair.temporary_mount_released) &&
+       report.temporary_mounts_released &&
+       report.boot_finalization_verified);
+  return style_known && report.copied_data_bytes != 0U &&
+      report.copied_partition_count != 0U && report.read_back_verified &&
+      report.partition_table_committed && !report.target_returned_online &&
+      report.target_left_offline && boot_verified;
+}
+
+[[nodiscard]] bool mbr2gpt_clone_completion_verified(
+    const ytec::winpeapp::Mbr2GptDirectExecutionReport& report) noexcept {
+  const bool intermediate_clone_verified =
+      report.clone.partition_style ==
+          ytec::winpeapp::ClonePartitionStyle::mbr &&
+      report.clone.copied_data_bytes != 0U &&
+      report.clone.copied_partition_count != 0U &&
+      report.clone.read_back_verified &&
+      report.clone.partition_table_committed &&
+      report.clone.target_returned_online &&
+      !report.clone.target_left_offline &&
+      report.clone.boot_finalization_required &&
+      report.clone.boot_repair.bcdboot.microsoft_signature_verified &&
+      report.clone.boot_repair.bcdboot.exit_code == 0U &&
+      report.clone.boot_repair.boot_store_verified &&
+      report.clone.temporary_mounts_released &&
+      report.clone.boot_finalization_verified;
+  return intermediate_clone_verified &&
+      report.conversion.microsoft_signature_verified &&
+      report.conversion.target_reidentified_before_conversion &&
+      report.conversion.validation.exit_code == 0U &&
+      report.conversion.conversion.exit_code == 0U &&
+      report.boot_repair.bcdboot.microsoft_signature_verified &&
+      report.boot_repair.bcdboot.exit_code == 0U &&
+      report.boot_repair.boot_store_verified &&
+      (!report.boot_repair.system_partition_temporarily_mounted ||
+       report.boot_repair.temporary_mount_released) &&
+      report.source_reidentified_unchanged && report.source_left_read_only &&
+      report.target_reidentified_as_gpt &&
+      report.efi_system_partition_verified &&
+      report.microsoft_reserved_partition_verified &&
+      report.offline_windows_verified &&
+      report.temporary_windows_mount_released &&
+      report.final_layout_verified && report.final_target_left_offline;
+}
+
+[[nodiscard]] bool direct_image_create_completion_verified(
+    const ytec::winpeapp::DirectImageCreateReport& report) noexcept {
+  const bool common = report.imaged_partition_count != 0U &&
+      report.logical_payload_bytes != 0U && report.source_read_only_verified &&
+      report.source_left_read_only &&
+      report.image.stream.image_length != 0U &&
+      report.image.stream.chunk_count != 0U &&
+      report.image.stream.committed &&
+      ytec::imageformat::selected_tsumugi_creation_verification_passed(
+          report.image);
+  if (!common) {
+    return false;
+  }
+  if (report.rescue_mode) {
+    return report.rescue.has_value();
+  }
+  return report.layout_revalidated_before_commit &&
+      !report.rescue.has_value() && report.image.unreadable_ranges.empty();
+}
+
+[[nodiscard]] bool direct_image_restore_completion_verified(
+    const ytec::winpeapp::DirectImageRestoreReport& report) noexcept {
+  const auto& physical = report.physical;
+  const auto& restore = physical.restore;
+  return report.active_rescue_media_checked && report.direct_execution_only &&
+      physical.initial_image_verification_completed &&
+      physical.target_reidentified_before_offline &&
+      physical.target_handle_reidentified && physical.target_left_offline &&
+      !physical.partial_loss && !restore.partial_loss &&
+      restore.written_logical_bytes != 0U &&
+      restore.written_chunk_count != 0U &&
+      restore.callbacks_started_after_complete_verification &&
+      restore.image_matched_prepared_plan &&
+      restore.target_reidentified_before_write &&
+      restore.all_writes_read_back_verified &&
+      restore.final_layout_committed;
+}
+
+[[nodiscard]] bool direct_shrink_restore_completion_verified(
+    const ytec::winpeapp::DirectShrinkImageRestoreReport& report) noexcept {
+  const auto& restore = report.restore;
+  const std::uint64_t first = restore.archive_logical_bytes;
+  if (restore.exact_raw_logical_bytes >
+      (std::numeric_limits<std::uint64_t>::max)() - first) {
+    return false;
+  }
+  const std::uint64_t with_raw =
+      first + restore.exact_raw_logical_bytes;
+  if (restore.intentionally_omitted_logical_bytes >
+      (std::numeric_limits<std::uint64_t>::max)() - with_raw) {
+    return false;
+  }
+  const std::uint64_t verified_logical_bytes =
+      with_raw + restore.intentionally_omitted_logical_bytes;
+  return verified_logical_bytes != 0U &&
+      report.image_completely_reverified &&
+      report.image_backing_reidentified_before_write &&
+      report.active_rescue_media_checked &&
+      report.target_reidentified_before_plan &&
+      report.work_placement_reidentified_before_write &&
+      report.target_left_offline && report.direct_execution_only &&
+      restore.callbacks_started_after_complete_verification &&
+      restore.image_matched_prepared_plan &&
+      restore.target_reidentified_before_write &&
+      restore.all_payloads_verified_by_adapter &&
+      restore.final_layout_committed;
+}
+
+[[nodiscard]] bool persistent_restore_completion_verified(
+    const ytec::winpeapp::DirectImageRestoreResumeOutcome& outcome) noexcept {
+  const bool completed = outcome.kind == ytec::winpeapp::
+          DirectImageRestoreResumeOutcomeKind::completed ||
+      outcome.kind == ytec::winpeapp::
+          DirectImageRestoreResumeOutcomeKind::
+              completed_checkpoint_retained;
+  if (!completed || !outcome.transfer.has_value() || outcome.rescue_mode ||
+      outcome.partial_loss) {
+    return false;
+  }
+  const auto& transfer = *outcome.transfer;
+  return !transfer.rescue_mode && !transfer.partial_loss &&
+      transfer.final_verified_logical_bytes != 0U &&
+      transfer.final_verified_chunk_count != 0U &&
+      (outcome.expected_logical_bytes == 0U ||
+       transfer.final_verified_logical_bytes ==
+           outcome.expected_logical_bytes) &&
+      transfer.full_image_reverified_on_same_handle_before_first_write &&
+      transfer.target_and_incomplete_layout_reidentified_before_first_write &&
+      transfer.verified_prefix_was_not_rewritten &&
+      transfer.every_new_chunk_flushed_and_read_back &&
+      transfer.final_layout_committed && transfer.target_left_offline;
 }
 
 std::wstring format_direct_clone_plan(
@@ -1350,6 +2473,165 @@ std::wstring format_direct_clone_result(
       << report.copied_partition_count
       << L"\r\n読戻し検証: "
       << (report.read_back_verified ? L"合格" : L"未完了");
+  return stream.str();
+}
+
+std::wstring_view direct_shrink_surplus_text(
+    const ytec::migrationcore::ShrinkSurplusAllocation allocation) noexcept {
+  switch (allocation) {
+    case ytec::migrationcore::ShrinkSurplusAllocation::automatic_proportional:
+      return L"自動配分（最小必要量確保後、元サイズ比）";
+    case ytec::migrationcore::ShrinkSurplusAllocation::leave_unallocated:
+      return L"未割当のまま";
+    case ytec::migrationcore::ShrinkSurplusAllocation::selected_data_partition:
+      return L"指定したNTFSデータ領域へ配分";
+  }
+  return L"不明（実行不可）";
+}
+
+std::uint64_t direct_shrink_exact_raw_task_count(
+    const ytec::directshrink::TargetPlan& plan) noexcept {
+  return static_cast<std::uint64_t>(std::count_if(
+      plan.tasks().begin(),
+      plan.tasks().end(),
+      [](const ytec::directshrink::PartitionTask& task) {
+        return task.kind ==
+            ytec::directshrink::PartitionTaskKind::copy_exact_raw;
+      }));
+}
+
+std::wstring format_winpe_offline_direct_shrink_plan(
+    const ytec::winpeapp::WinPeOfflineNtfsDirectShrinkPlan& plan) {
+  const auto& target = plan.target_plan();
+  std::wostringstream stream;
+  stream
+      << L"Y-TEC WinPE 縮小移行クローン（再解析・計画確定済み）\r\n"
+         L"コピー元はOSレベルread-onlyに固定済みで、完了・失敗後も自動解除しません。\r\n\r\n"
+         L"コピー元（変更しません）\r\n  ディスク "
+      << target.expected_source().disk_number << L" / "
+      << target.expected_source().model << L"\r\n  容量: "
+      << ytec::winpeapp::format_dashboard_capacity(
+             target.expected_source().size_bytes)
+      << L" / GPT / 512-byte logical sector"
+         L"\r\n  シリアル末尾: "
+      << utf8_to_wide(target.expected_source().serial_suffix)
+      << L"\r\n\r\nコピー先（確認後に全内容を消去）\r\n  ディスク "
+      << target.expected_target().disk_number << L" / "
+      << target.expected_target().model << L"\r\n  容量: "
+      << ytec::winpeapp::format_dashboard_capacity(
+             target.expected_target().size_bytes)
+      << L" / 最終形式: GPT"
+         L"\r\n  シリアル末尾: "
+      << utf8_to_wide(target.expected_target().serial_suffix)
+      << L"\r\n\r\nパーティション選択（source table index）";
+  for (const auto& mapping : target.source_partition_mappings()) {
+    stream << L"\r\n  #" << mapping.source_table_index << L"  "
+           << direct_shrink_partition_role_text(mapping.role) << L"  ";
+    if (mapping.selected) {
+      stream << (mapping.required ? L"選択・必須" : L"選択");
+      if (mapping.target_number.has_value()) {
+        stream << L" → target #" << *mapping.target_number;
+      }
+    } else {
+      stream << L"除外（コピーしない）";
+    }
+  }
+  stream << L"\r\n\r\n余剰容量: "
+         << direct_shrink_surplus_text(target.surplus_allocation());
+  if (target.surplus_target_source_table_index().has_value()) {
+    stream << L" / source #"
+           << *target.surplus_target_source_table_index();
+  }
+  stream
+      << L"\r\n一時WIM: コピー先の非起動・専用staging領域（最大 "
+      << ytec::winpeapp::format_dashboard_capacity(
+             target.maximum_archive_upper_bound_bytes())
+      << L"）"
+         L"\r\n一時WIMがコピー先の専用領域に収まらない場合は安全に中止します。"
+         L"\r\n未対応FSの元サイズexact RAW: "
+      << direct_shrink_exact_raw_task_count(target)
+      << L"領域（source/target全chunkのSHA-256・flush・読戻しを検証）"
+         L"\r\n起動再構築: "
+      << (target.boot_finalization_required()
+              ? L"対象側だけで実行し、Boot/WinRE evidenceを読戻し確認"
+              : L"対象外（データ専用選択）")
+      << L"\r\n最終確定: 全payload・filesystem・Boot証拠の検証後にGPTをcommit last"
+         L"\r\n失敗・取消: 未完成GPTを公開せず、コピー先をoffline保持"
+         L"\r\n\r\nこの計画ではコピー先をまだ変更していません。"
+         L"対象要約を確認し、次画面で大文字 OK を完全一致で入力してください。";
+  return stream.str();
+}
+
+bool winpe_offline_direct_shrink_completion_verified(
+    const ytec::winpeapp::WinPeOfflineNtfsDirectShrinkPlan& plan,
+    const ytec::winpeapp::WinPeOfflineNtfsDirectShrinkOperationReport& report) {
+  if (report.lifecycle.outcome !=
+          ytec::operationcore::OperationOutcome::completed ||
+      !report.execution.has_value()) {
+    return false;
+  }
+  const auto& execution = *report.execution;
+  const auto& boot = execution.boot;
+  const auto& commit = execution.final_commit;
+  const std::uint64_t expected_exact_raw =
+      direct_shrink_exact_raw_task_count(plan.target_plan());
+  const bool checkpoint_retirement_exactly_one =
+      commit.checkpoint_retired != commit.checkpoint_retirement_pending;
+  const bool boot_verified =
+      (!boot.required ||
+       (boot.completed && boot.boot_files_read_back_verified &&
+        boot.recovery_configuration_verified)) &&
+      boot.target_offline && boot.target_only_reconstruction &&
+      boot.exact_target_volume_extents && boot.real_boot_not_claimed;
+  return execution.applied_archive_count ==
+          plan.target_plan().archive_task_count() &&
+      execution.copied_exact_raw_count == expected_exact_raw &&
+      execution.source_epoch_revalidation_count ==
+          execution.applied_archive_count + expected_exact_raw + 2U &&
+      execution.source_locked_read_only_before_target_io &&
+      execution.every_capture_used_exact_read_only_lease &&
+      execution.source_epoch_rechecked_after_boot_before_final_commit &&
+      execution.construction_layout_non_bootable &&
+      execution.durable_checkpoint_preceded_payload &&
+      execution.final_gpt_committed_last && execution.source_left_os_read_only &&
+      execution.target_left_offline && execution.real_boot_not_proven &&
+      boot_verified && commit.source_reidentified &&
+      commit.source_layout_unchanged && commit.target_reidentified &&
+      commit.staging_identity_reverified && commit.checkpoint_reverified &&
+      commit.staging_removed && checkpoint_retirement_exactly_one &&
+      commit.construction_layout_non_bootable &&
+      commit.checkpoint_retained_through_extensions_and_boot &&
+      commit.boot_completed_before_final_layout_publication &&
+      commit.final_layout_published_before_checkpoint_retirement &&
+      commit.hidden_final_layout_published_and_read_back &&
+      commit.every_required_ntfs_extension_verified &&
+      commit.every_write_flushed && commit.every_write_read_back &&
+      commit.primary_layout_committed_last && commit.target_offline &&
+      commit.final_partition_style ==
+          ytec::migrationcore::MigrationPartitionStyle::gpt;
+}
+
+std::wstring format_winpe_offline_direct_shrink_result(
+    const ytec::winpeapp::WinPeOfflineNtfsDirectShrinkOperationReport& report) {
+  const auto& execution = *report.execution;
+  std::wostringstream stream;
+  stream
+      << L"WinPE 縮小移行クローンと全必須証拠の検証が完了しました。\r\n"
+         L"適用したNTFS archive: "
+      << execution.applied_archive_count
+      << L"\r\n元サイズexact RAWコピー: "
+      << execution.copied_exact_raw_count
+      << L"\r\n検証済みtarget bytes: " << execution.verified_target_bytes
+      << L"\r\nsource epoch再照合: "
+      << execution.source_epoch_revalidation_count
+      << L"回（初回・各WIM capture／RAW source直前・最終commit直前）"
+         L"\r\n全書込みflush＋読戻し: 合格"
+         L"\r\nBoot/WinRE evidence: "
+      << (execution.boot.required ? L"合格" : L"対象外")
+      << L"\r\n最終GPT commit last: 合格"
+         L"\r\nコピー元: OS-level read-onlyのまま"
+         L"\r\nコピー先: offline（検証完了・換装待ち）"
+         L"\r\n実機での起動成功を確認した表示ではありません。";
   return stream.str();
 }
 
@@ -1495,7 +2777,8 @@ std::wstring format_direct_image_review(
       << (encrypted
               ? L"あり（Argon2id / AES-256-GCM、回復キーなし）"
               : L"なし")
-      << L"\r\n縮小移行: 今回のPE画面では未接続"
+      << L"\r\nこの画面はexact／救出イメージ作成専用です。"
+         L"縮小移行クローンは「ドライブをクローン」の方式選択から直接実行します。"
          L"\r\n予約ジョブは作成しません。"
          L"\r\n実行時に同じディスクを再識別し、コピー元をread-onlyに固定します。"
          L"\r\n各書込み直後の読戻し、認証・Hash、最終メタデータ検証後だけ"
@@ -1529,11 +2812,128 @@ std::wstring format_direct_image_review(
   return stream.str();
 }
 
+std::wstring format_image_partition_selection_review(
+    const ytec::diskmodel::ImagePartitionSelection& selection) {
+  if (selection.whole_disk) {
+    return L"ディスク全体（全パーティション）";
+  }
+  std::wstring result = L"Partition ";
+  for (std::size_t index = 0U;
+       index < selection.selected_partition_numbers.size(); ++index) {
+    if (index != 0U) {
+      result += L", ";
+    }
+    const auto number = selection.selected_partition_numbers[index];
+    result += L"#" + std::to_wstring(number);
+    if (std::find(
+            selection.required_partition_numbers.begin(),
+            selection.required_partition_numbers.end(),
+            number) != selection.required_partition_numbers.end()) {
+      result += L"（Windows必須）";
+    }
+  }
+  result += L" / 合計 " + std::to_wstring(selection.selected_bytes) +
+      L" bytes";
+  return result;
+}
+
+std::wstring canonical_image_partition_selection_binding(
+    const ytec::diskmodel::ImagePartitionSelection& selection) {
+  if (selection.whole_disk) {
+    return L"partitions=whole";
+  }
+  std::wstring result = L"partitions=";
+  for (std::size_t index = 0U;
+       index < selection.selected_partition_numbers.size(); ++index) {
+    if (index != 0U) {
+      result.push_back(L',');
+    }
+    result += std::to_wstring(selection.selected_partition_numbers[index]);
+  }
+  return result;
+}
+
+std::optional<ytec::diskmodel::ImagePartitionSelection>
+prompt_image_partition_selection(
+    const HWND owner,
+    const ytec::diskmodel::DiskInfo& source) {
+  const int scope = MessageBoxW(
+      owner,
+      L"イメージへ保存する範囲を選択します。\r\n\r\n"
+      L"[はい] ディスク全体（既定）\r\n"
+      L"[いいえ] パーティションを個別選択\r\n"
+      L"[キャンセル] 戻る\r\n\r\n"
+      L"Windows領域を選んだ場合、ESP／システム／MSR／必要な回復領域は自動追加され、解除できません。",
+      L"イメージ対象の選択",
+      MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1);
+  if (scope == IDCANCEL) {
+    return std::nullopt;
+  }
+  std::vector<std::uint32_t> requested;
+  if (scope == IDNO) {
+    auto partitions = source.partitions;
+    std::sort(
+        partitions.begin(),
+        partitions.end(),
+        [](const auto& left, const auto& right) {
+          return left.offset_bytes < right.offset_bytes;
+        });
+    for (const auto& partition : partitions) {
+      std::wstring prompt =
+          L"Partition #" + std::to_wstring(partition.number) +
+          L" をイメージへ含めますか？\r\n\r\n容量: " +
+          std::to_wstring(partition.size_bytes) + L" bytes";
+      if (!partition.name.empty()) {
+        prompt += L"\r\n名前: " + partition.name;
+      }
+      if (!partition.type.empty()) {
+        prompt += L"\r\n種類: " + partition.type;
+      }
+      const int chosen = MessageBoxW(
+          owner,
+          prompt.c_str(),
+          L"パーティション選択",
+          MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
+      if (chosen == IDCANCEL) {
+        return std::nullopt;
+      }
+      if (chosen == IDYES) {
+        requested.push_back(partition.number);
+      }
+    }
+    if (requested.empty()) {
+      MessageBoxW(
+          owner,
+          L"個別選択では少なくとも1つのパーティションを選んでください。\r\n"
+          L"何も選ばない操作をディスク全体として解釈しません。",
+          kWindowTitle,
+          MB_OK | MB_ICONWARNING);
+      return std::nullopt;
+    }
+  }
+  auto normalized = ytec::diskmodel::normalize_image_partition_selection(
+      source,
+      requested);
+  if (!normalized) {
+    const std::wstring message =
+        L"パーティション選択を確定できません。\r\n\r\n" +
+        normalized.error().message;
+    MessageBoxW(
+        owner,
+        message.c_str(),
+        kWindowTitle,
+        MB_OK | MB_ICONWARNING);
+    return std::nullopt;
+  }
+  return normalized.take_value();
+}
+
 std::wstring format_direct_image_result(
     const ytec::winpeapp::DirectImageCreateReport& report) {
   const auto verification_mode = report.image.stream.verification_mode;
-  const bool complete_verification = verification_mode ==
-      ytec::imageformat::TsumugiCreateVerificationMode::complete;
+  const bool final_complete_scan =
+      report.image.stream.final_complete_scan_performed &&
+      report.image.complete_verification_passed;
   std::wostringstream stream;
   stream
       << (report.rescue_mode
@@ -1553,7 +2953,12 @@ std::wstring format_direct_image_result(
       << image_create_verification_mode_name(verification_mode)
       << L"\r\n各書込み読戻し: 合格\r\n認証・Hash: 合格"
          L"\r\n最終メタデータ: 合格\r\n完成前の追加全走査: "
-      << (complete_verification ? L"合格" : L"高速検証のため省略")
+      << (final_complete_scan
+              ? verification_mode ==
+                        ytec::imageformat::TsumugiCreateVerificationMode::fast
+                    ? L"合格（永続再開経路で完全検証へ強化）"
+                    : L"合格"
+              : L"高速検証のため省略")
       << L"\r\nコピー元: read-onlyのまま保護";
   if (report.rescue_mode && report.rescue.has_value()) {
     stream
@@ -1849,7 +3254,7 @@ std::wstring format_persistent_restore_result(
 }
 
 ytec::clonecore::Result<ytec::operationcore::OperationId>
-make_restore_resume_operation_id() {
+make_operation_id(const std::wstring_view operation_name) {
   GUID guid{};
   const HRESULT created = CoCreateGuid(&guid);
   if (FAILED(created)) {
@@ -1857,7 +3262,7 @@ make_restore_resume_operation_id() {
         ytec::operationcore::OperationId>::failure({
         .code = ytec::clonecore::ErrorCode::io_failed,
         .native_code = static_cast<DWORD>(created),
-        .operation = L"PE永続復元操作ID",
+        .operation = std::wstring(operation_name),
         .message = L"単回操作IDを生成できません",
     });
   }
@@ -1867,6 +3272,115 @@ make_restore_resume_operation_id() {
   std::memcpy(id.data(), &guid, id.size());
   return ytec::clonecore::Result<
       ytec::operationcore::OperationId>::success(id);
+}
+
+[[nodiscard]] ytec::clonecore::Result<std::unique_ptr<
+    ytec::operationcore::IResumeSlotPlatform>>
+make_product_resume_slot_platform() {
+#ifdef YTEC_UI_ACCEPTANCE_BUILD
+  return ytec::clonecore::Result<std::unique_ptr<
+      ytec::operationcore::IResumeSlotPlatform>>::failure(
+      restore_ui_error(
+          ytec::clonecore::ErrorCode::unsupported_platform,
+          ERROR_NOT_SUPPORTED,
+          L"WinPE SingleResumeSlot product gate",
+          L"非破壊UI受入ビルドではhostのportable dataを観測せず、"
+          L"新規書込み操作を開始しません"));
+#else
+  auto storage = ytec::winpeapp::
+      make_direct_image_restore_windows_storage_platform_v1();
+  if (!storage) {
+    return ytec::clonecore::Result<std::unique_ptr<
+        ytec::operationcore::IResumeSlotPlatform>>::failure(
+        storage.error());
+  }
+  return ytec::operationcore::
+      make_current_executable_windows_resume_slot_platform(
+          storage.value().prove_data_backing);
+#endif
+}
+
+[[nodiscard]] ytec::clonecore::Result<
+    ytec::winpeapp::DirectImageCreateResumeStartupObservation>
+inspect_product_image_create_resume() {
+#ifdef YTEC_UI_ACCEPTANCE_BUILD
+  return ytec::clonecore::Result<
+      ytec::winpeapp::DirectImageCreateResumeStartupObservation>::failure(
+      restore_ui_error(
+          ytec::clonecore::ErrorCode::unsupported_platform,
+          ERROR_NOT_SUPPORTED,
+          L"WinPE image-create persistent startup",
+          L"非破壊UI受入ビルドではhostのportable dataを観測しません"));
+#else
+  auto storage = ytec::winpeapp::
+      make_direct_image_create_windows_resume_storage_platform_v1();
+  if (!storage) {
+    return ytec::clonecore::Result<
+        ytec::winpeapp::DirectImageCreateResumeStartupObservation>::failure(
+        storage.error());
+  }
+  auto platform = ytec::operationcore::
+      make_current_executable_windows_resume_slot_platform(
+          storage.value().prove_data_backing);
+  if (!platform) {
+    return ytec::clonecore::Result<
+        ytec::winpeapp::DirectImageCreateResumeStartupObservation>::failure(
+        platform.error());
+  }
+  return ytec::winpeapp::inspect_direct_image_create_resume_v1(
+      *platform.value());
+#endif
+}
+
+[[nodiscard]] bool guard_new_product_operation_start(
+    const HWND owner,
+    const HWND output,
+    const ytec::clonecore::Result<ytec::operationcore::OperationPlan>&
+        admission_plan) {
+  if (!admission_plan) {
+    set_error_output_and_show(owner, output, admission_plan.error());
+    return false;
+  }
+  auto platform = make_product_resume_slot_platform();
+  if (!platform) {
+    set_error_output_and_show(owner, output, platform.error());
+    return false;
+  }
+  const auto admitted = ytec::winpeapp::guard_new_winpe_operation_start(
+      admission_plan.value(), *platform.value());
+  if (!admitted) {
+    set_error_output_and_show(
+        owner,
+        output,
+        admitted.error(),
+        L"active.checkpointとその所有物は変更していません。"
+        L"復元画面で同じbindingの再開または所有物だけの破棄を選んでください。");
+    return false;
+  }
+  return true;
+}
+
+[[nodiscard]] bool guard_bound_product_restore_resume(
+    const HWND owner,
+    const HWND output,
+    const ytec::operationcore::ResumeSlotBinding& reviewed_binding) {
+  auto platform = make_product_resume_slot_platform();
+  if (!platform) {
+    set_error_output_and_show(owner, output, platform.error());
+    return false;
+  }
+  const auto admitted = ytec::winpeapp::guard_bound_winpe_restore_resume(
+      reviewed_binding, *platform.value());
+  if (!admitted) {
+    set_error_output_and_show(
+        owner,
+        output,
+        admitted.error(),
+        L"表示後にslotが変化したか、完全bindingが一致しません。"
+        L"checkpointと所有partialは変更していません。");
+    return false;
+  }
+  return true;
 }
 
 std::wstring format_automatic_boot_repair_plan(
@@ -2072,6 +3586,210 @@ std::wstring format_automatic_boot_repair_plan(
            L"\r\n予約ジョブは作成しません。";
   }
   return stream.str();
+}
+
+std::wstring format_system_partition_creation_review(
+    const ytec::bootrepair::ReviewedSystemPartitionCreation& reviewed) {
+  const auto& plan = reviewed.discovery();
+  const bool uefi = reviewed.system_role() ==
+      ytec::bootrepair::BootSystemPartitionRole::efi_system;
+  std::wostringstream stream;
+  stream
+      << L"\r\n\r\nシステム領域の新規作成（独立した追加確認）"
+         L"\r\n縮小するWindows区画: #"
+      << reviewed.windows_partition().number << L" / "
+      << reviewed.windows_volume_name()
+      << L"\r\nWindows区画: "
+      << ytec::winpeapp::format_dashboard_capacity(
+             reviewed.windows_partition().size_bytes)
+      << L" → "
+      << ytec::winpeapp::format_dashboard_capacity(
+             reviewed.shrunken_windows_size_bytes())
+      << L"\r\n作成する領域: "
+      << (uefi ? L"FAT32 ESP" : L"NTFS Active system partition")
+      << L" / offset "
+      << ytec::winpeapp::format_dashboard_capacity(
+             reviewed.system_partition_offset_bytes())
+      << L" / size "
+      << ytec::winpeapp::format_dashboard_capacity(
+             reviewed.system_partition_size_bytes())
+      << L"\r\n書込み対象: ディスク "
+      << plan.selected_disk.disk_number << L" のWindows区画終端と新規区画"
+         L"\r\n危険: NTFS縮小、パーティション表更新、"
+      << (uefi ? L"FAT32 format" : L"NTFS formatとActive属性設定")
+      << L"を行います。電源断や装置切断を避けてください。"
+         L"\r\n安全策: 実行直前の安定再識別、全区画・Volume GUID・"
+         L"最大縮小可能量の完全再確認、各段階の読戻し、失敗時のexact rollback"
+         L"\r\nこの段階ではBCD、WinRE、第三者EFI、現在PCのNVRAMを変更しません。"
+         L"作成完了後に再解析し、別の起動修復レビューと大文字OKを要求します。"
+         L"\r\n予約ジョブは作成しません。"
+         L"\r\n\r\n上記の追加確認に同意する場合だけ、大文字 OK を入力してください。";
+  return stream.str();
+}
+
+std::wstring format_system_partition_creation_report(
+    const ytec::bootrepair::SystemPartitionCreationReport& report) {
+  using ytec::bootrepair::SystemPartitionCreationOutcome;
+  std::wostringstream stream;
+  switch (report.outcome) {
+    case SystemPartitionCreationOutcome::committed:
+      stream
+          << L"システム領域の準備トランザクションが完了しました。"
+             L"\r\n・追加の大文字OK: 確認済み"
+             L"\r\n・対象の実行直前再識別: 完全一致"
+             L"\r\n・Windows NTFS縮小: exact寸法を読戻し済み"
+             L"\r\n・新規ESP／Active領域: 作成、format、役割、Volume GUIDを読戻し済み"
+             L"\r\n\r\nこれは起動修復の完了や起動成功を示しません。"
+             L"続けて新しいレイアウトを再解析し、BCD／WinRE／NVRAMの"
+             L"別レビューを行います。";
+      break;
+    case SystemPartitionCreationOutcome::rolled_back_exact:
+      stream
+          << L"システム領域の作成は完了しませんでしたが、"
+             L"縮小前のWindows extentと全レイアウトへexact rollback済みです。";
+      break;
+    case SystemPartitionCreationOutcome::rollback_incomplete:
+      stream
+          << L"システム領域の作成に失敗し、元のレイアウトへ戻ったことも"
+             L"完全確認できませんでした。これ以上の自動書込みを停止しました。"
+             L"\r\n対象ディスクを再起動・取外しせず、現在の状態を保って確認してください。";
+      break;
+    case SystemPartitionCreationOutcome::failed_before_mutation:
+    default:
+      stream
+          << L"実行前の追加確認または完全再解析に合格しなかったため、"
+             L"システム領域は作成していません。";
+      break;
+  }
+  return stream.str();
+}
+
+std::optional<std::uint32_t>
+prompt_system_partition_creation_windows_choice(
+    const HWND owner,
+    const ytec::bootrepair::AutomaticBootRepairPlan& plan) {
+  constexpr int kWindowsButtonBaseId = 43400;
+  constexpr std::size_t kMaximumWindowsChoices = 32U;
+  if (!plan.system_partition_create_plan_needed ||
+      !plan.system_partition_candidates.empty() ||
+      plan.windows_installations.empty() ||
+      plan.windows_installations.size() > kMaximumWindowsChoices) {
+    MessageBoxW(
+        owner,
+        L"システム領域作成の対象Windowsを安全に選べません。ディスクは変更しません。",
+        L"システム領域の作成",
+        MB_OK | MB_ICONWARNING);
+    return std::nullopt;
+  }
+
+  std::vector<std::wstring> labels;
+  labels.reserve(plan.windows_installations.size());
+  for (const auto& windows : plan.windows_installations) {
+    std::wostringstream label;
+    label << L"Windows区画 #" << windows.partition.number
+          << L" の終端を縮小して作成計画を確認\nWindows "
+          << windows.version.major << L"." << windows.version.build
+          << L" / "
+          << ytec::winpeapp::format_dashboard_capacity(
+                 windows.partition.size_bytes);
+    if (!windows.volume.mount_points.empty()) {
+      label << L" / " << windows.volume.mount_points.front();
+    }
+    labels.push_back(label.str());
+  }
+  std::vector<TASKDIALOG_BUTTON> buttons;
+  buttons.reserve(labels.size());
+  for (std::size_t index = 0U; index < labels.size(); ++index) {
+    buttons.push_back(TASKDIALOG_BUTTON{
+        kWindowsButtonBaseId + static_cast<int>(index),
+        labels[index].c_str()});
+  }
+
+  const bool uefi = plan.required_system_partition_role ==
+      ytec::bootrepair::BootSystemPartitionRole::efi_system;
+  const std::wstring content =
+      L"既存のシステム領域がないため、通常のBCD修復はまだ開始できません。\r\n"
+      L"選択したsimple NTFS Windows volumeをMicrosoft VDSでexact縮小し、" +
+      std::wstring(uefi ? L"260 MiB FAT32 ESP" : L"100 MiB NTFS Active領域") +
+      L"を新規作成する計画だけを先にレビューします。\r\n\r\n"
+      L"この選択ではまだ書き込みません。安全条件と配置を再確認した後、"
+      L"次画面で追加の大文字 OK が必要です。";
+
+  TASKDIALOGCONFIG config{};
+  config.cbSize = sizeof(config);
+  config.hwndParent = owner;
+  config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+                   TDF_POSITION_RELATIVE_TO_WINDOW |
+                   TDF_USE_COMMAND_LINKS |
+                   TDF_NO_DEFAULT_RADIO_BUTTON |
+                   TDF_SIZE_TO_CONTENT;
+  config.pszWindowTitle = L"システム領域作成の追加確認";
+  config.pszMainIcon = TD_WARNING_ICON;
+  config.pszMainInstruction =
+      L"縮小するWindows区画を明示してください";
+  config.pszContent = content.c_str();
+  config.cButtons = static_cast<UINT>(buttons.size());
+  config.pButtons = buttons.data();
+  config.nDefaultButton = IDCANCEL;
+  config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+
+  using TaskDialogIndirectFunction = HRESULT(WINAPI*)(
+      const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+  HMODULE common_controls = LoadLibraryExW(
+      L"comctl32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  TaskDialogIndirectFunction task_dialog{};
+  if (common_controls != nullptr) {
+    task_dialog = reinterpret_cast<TaskDialogIndirectFunction>(
+        GetProcAddress(common_controls, "TaskDialogIndirect"));
+    if (task_dialog == nullptr) {
+      task_dialog = reinterpret_cast<TaskDialogIndirectFunction>(
+          GetProcAddress(common_controls, MAKEINTRESOURCEA(345)));
+    }
+  }
+  int pressed = IDCANCEL;
+  const HRESULT result = task_dialog == nullptr
+      ? HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)
+      : task_dialog(&config, &pressed, nullptr, nullptr);
+  if (common_controls != nullptr) {
+    FreeLibrary(common_controls);
+  }
+  if (FAILED(result)) {
+    MessageBoxW(
+        owner,
+        L"システム領域作成の選択画面を開けないため、ディスクは変更しません。",
+        L"システム領域の作成",
+        MB_OK | MB_ICONWARNING);
+    return std::nullopt;
+  }
+  const int selected_index = pressed - kWindowsButtonBaseId;
+  if (selected_index < 0 ||
+      static_cast<std::size_t>(selected_index) >=
+          plan.windows_installations.size()) {
+    return std::nullopt;
+  }
+
+  const auto& selected = plan.windows_installations[
+      static_cast<std::size_t>(selected_index)];
+  std::wostringstream warning;
+  warning
+      << L"対象: ディスク " << plan.selected_disk.disk_number << L" / "
+      << plan.selected_disk.model << L"\r\nWindows区画: #"
+      << selected.partition.number << L" / "
+      << ytec::winpeapp::format_dashboard_capacity(
+             selected.partition.size_bytes)
+      << L"\r\n作成予定: "
+      << (uefi ? L"260 MiB FAT32 ESP" : L"100 MiB NTFS Active領域")
+      << L"\r\n\r\nNTFS縮小とパーティション表更新を伴います。"
+         L"この対象で読み取り専用の詳細レビューへ進みますか？"
+         L"\r\n（ここで「はい」を選んでも、まだ書き込みません）";
+  if (MessageBoxW(
+          owner,
+          warning.str().c_str(),
+          L"システム領域作成の追加確認",
+          MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+    return std::nullopt;
+  }
+  return selected.partition.number;
 }
 
 std::optional<ytec::winpeapp::WinPeAutomaticBootRepairProductChoice>
@@ -2509,6 +4227,20 @@ void post_payload(
 void post_payload(
     const HWND window,
     const UINT message,
+    std::unique_ptr<CloneShrinkInspectionPayload> payload) {
+  CloneShrinkInspectionPayload* const raw = payload.release();
+  if (PostMessageW(
+          window,
+          message,
+          0,
+          reinterpret_cast<LPARAM>(raw)) == FALSE) {
+    delete raw;
+  }
+}
+
+void post_payload(
+    const HWND window,
+    const UINT message,
     std::unique_ptr<CloneProgressPayload> payload) {
   CloneProgressPayload* const raw = payload.release();
   if (PostMessageW(
@@ -2594,6 +4326,8 @@ CloneRoute selected_clone_route(const AppState& state) {
       return CloneRoute::rescue;
     case 2:
       return CloneRoute::mbr_to_gpt;
+    case 3:
+      return CloneRoute::shrink;
     default:
       return CloneRoute::exact;
   }
@@ -2885,7 +4619,10 @@ void show_page_controls(AppState& state) {
   const bool show_image_confirmation =
       image_create && state.image_execution_ready &&
       !state.image_progress_active;
-  set_control_visible(state.image_token, show_image_confirmation);
+  // Source-to-file image creation is non-destructive to the Source and does
+  // not use the uppercase destructive-target confirmation token. The review
+  // itself is the immutable confirmation boundary.
+  set_control_visible(state.image_token, false);
   set_control_visible(state.image_execute, show_image_confirmation);
   set_control_visible(
       state.image_cancel,
@@ -2935,11 +4672,18 @@ void show_page_controls(AppState& state) {
     set_control_visible(control, false);
   }
   const bool show_boot_confirmation =
-      repair && state.inspected_boot_plan.has_value() &&
-      state.inspected_boot_choices.has_value() &&
-      state.inspected_boot_execution.has_value() &&
-      !state.inspected_boot_selections.empty() &&
+      repair &&
+      (state.inspected_system_partition_creation.has_value() ||
+       (state.inspected_boot_plan.has_value() &&
+        state.inspected_boot_choices.has_value() &&
+        state.inspected_boot_execution.has_value() &&
+        !state.inspected_boot_selections.empty())) &&
       !state.boot_execution_active;
+  SetWindowTextW(
+      state.repair_execute,
+      state.inspected_system_partition_creation.has_value()
+          ? L"システム領域を作成"
+          : L"起動修復を実行");
   set_control_visible(state.repair_token, show_boot_confirmation);
   set_control_visible(state.repair_execute, show_boot_confirmation);
   set_control_visible(state.repair_cancel, show_boot_confirmation);
@@ -3285,6 +5029,7 @@ void update_disk_details(AppState& state) {
 
 void invalidate_boot_review(AppState& state) {
   state.inspected_boot_plan.reset();
+  state.inspected_system_partition_creation.reset();
   state.inspected_boot_choices.reset();
   state.inspected_boot_execution.reset();
   state.inspected_efi_delete_plan.reset();
@@ -3318,6 +5063,24 @@ std::optional<std::uint32_t> selected_disk_number(const HWND combo) {
     return std::nullopt;
   }
   return static_cast<std::uint32_t>(data);
+}
+
+bool select_combo_disk_number(
+    const HWND combo,
+    const std::uint32_t disk_number) {
+  const LRESULT count = SendMessageW(combo, CB_GETCOUNT, 0, 0);
+  if (count == CB_ERR) {
+    return false;
+  }
+  for (LRESULT index = 0; index < count; ++index) {
+    const LRESULT data = SendMessageW(
+        combo, CB_GETITEMDATA, static_cast<WPARAM>(index), 0);
+    if (data != CB_ERR && data >= 0 &&
+        static_cast<std::uint64_t>(data) == disk_number) {
+      return SendMessageW(combo, CB_SETCURSEL, index, 0) != CB_ERR;
+    }
+  }
+  return false;
 }
 
 ytec::bootrepair::BcdBootFirmware selected_firmware(
@@ -3826,6 +5589,13 @@ void populate_disk_controls(AppState& state) {
   if (SendMessageW(state.image_source, CB_GETCOUNT, 0, 0) > 0) {
     SendMessageW(state.image_source, CB_SETCURSEL, 0, 0);
   }
+  if (state.image_resume_requested &&
+      state.reviewed_image_resume_observation.has_value() &&
+      state.reviewed_image_resume_observation->source.has_value()) {
+    static_cast<void>(select_combo_disk_number(
+        state.image_source,
+        state.reviewed_image_resume_observation->source->disk_number));
+  }
   if (SendMessageW(state.restore_target, CB_GETCOUNT, 0, 0) > 0) {
     SendMessageW(state.restore_target, CB_SETCURSEL, 0, 0);
   }
@@ -3915,10 +5685,11 @@ ytec::winpeapp::WinPeAutomaticBootRepairUiView current_boot_repair_view(
       .idle = !state.operation_busy && !state.inventory_busy,
       .target_selected =
           selected_disk_number(state.repair_disk).has_value(),
-      .reviewed = state.inspected_boot_plan.has_value() &&
-          state.inspected_boot_choices.has_value() &&
-          state.inspected_boot_execution.has_value() &&
-          !state.inspected_boot_selections.empty(),
+      .reviewed = state.inspected_system_partition_creation.has_value() ||
+          (state.inspected_boot_plan.has_value() &&
+           state.inspected_boot_choices.has_value() &&
+           state.inspected_boot_execution.has_value() &&
+           !state.inspected_boot_selections.empty()),
       .execution_active = state.boot_execution_active,
       .confirmation_text = control_text(state.repair_token),
   });
@@ -4056,6 +5827,7 @@ void invalidate_clone_review(
   state.reviewed_clone_plan.reset();
   state.reviewed_rescue_clone_plan.reset();
   state.reviewed_mbr2gpt_clone_plan.reset();
+  state.reviewed_direct_shrink_clone_plan.reset();
   state.clone_progress_active = false;
   state.clone_confirmation_token.clear();
   state.clone_cancellation.reset();
@@ -4081,6 +5853,7 @@ void invalidate_image_review(
     const std::wstring_view message) {
   state.image_step = 1;
   state.reviewed_image_source.reset();
+  state.reviewed_image_partition_selection.reset();
   state.reviewed_image_path.clear();
   state.reviewed_image_replace_existing = false;
   state.reviewed_image_encrypted = false;
@@ -4213,6 +5986,68 @@ void start_clone_check(AppState& state) {
     return;
   }
 
+  std::optional<
+      ytec::winpeapp::WinPeOfflineNtfsProductPlanningRequest>
+      shrink_request;
+  if (route == CloneRoute::shrink) {
+    if (!current_process_is_elevated() ||
+        !current_environment_is_verified_winpe()) {
+      invalidate_clone_review(
+          state,
+          L"縮小移行は、管理者権限で起動した正式なWinPE環境だけで実行できます。\r\n"
+          L"通常WindowsやUI受入ビルドから物理ディスクを変更しません。");
+      update_action_state(state);
+      return;
+    }
+    const auto source_disk = find_inventory_disk(state, *source);
+    const auto target_disk = find_inventory_disk(state, *target);
+    if (!source_disk.has_value() || !target_disk.has_value()) {
+      invalidate_clone_review(
+          state,
+          L"選択したコピー元またはコピー先を現在の一覧で確認できません。再読込みしてください。");
+      update_action_state(state);
+      return;
+    }
+    auto operation_id = make_operation_id(L"WinPE直接縮小クローン操作ID");
+    const std::string created_utc = current_utc_timestamp();
+    if (!operation_id || created_utc.empty()) {
+      invalidate_clone_review(
+          state,
+          !operation_id
+              ? format_error(operation_id.error(), nullptr)
+              : L"縮小移行の解析時刻をUTCで確定できません。");
+      update_action_state(state);
+      return;
+    }
+    const int consent = MessageBoxW(
+        state.window,
+        L"縮小移行の読取り解析を開始すると、選択したコピー元をOSレベルでread-onlyに固定します。\n\n"
+        L"この設定は完了・取消・失敗後も自動解除しません。コピー元へは書き込みません。\n"
+        L"コピー先は、パーティション選択・余剰容量設定と大文字OKが完了するまで変更しません。\n\n"
+        L"コピー元をread-onlyに固定して解析しますか？",
+        L"WinPE 縮小移行のコピー元保護",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (consent != IDYES) {
+      invalidate_clone_review(
+          state,
+          L"縮小移行の読取り解析を取り消しました。ディスクは変更していません。");
+      update_action_state(state);
+      return;
+    }
+    shrink_request =
+        ytec::winpeapp::WinPeOfflineNtfsProductPlanningRequest{
+            .administrator = true,
+            .winpe_environment_verified = true,
+            .reviewed_source = *source_disk,
+            .reviewed_target = *target_disk,
+            .operation_id = operation_id.take_value(),
+            .surplus_allocation = ytec::migrationcore::
+                ShrinkSurplusAllocation::automatic_proportional,
+            .analysis_created_utc = created_utc,
+            .app_version = YTEC_PROJECT_VERSION,
+        };
+  }
+
   invalidate_clone_review(state, L"");
   state.operation_busy = true;
   state.clone_step = 2;
@@ -4226,6 +6061,10 @@ void start_clone_check(AppState& state) {
           ? L"MBR→GPT（別ディスク）の対象を読取り専用で再列挙し、\r\n"
             L"安定識別、同容量以上、1～3基本プライマリ領域、一意なActive領域、健康状態を確認しています。\r\n"
             L"この確認ではどのディスクも変更しません。"
+          : route == CloneRoute::shrink
+          ? L"コピー元をOS-level read-onlyに固定し、コピー元・コピー先を安定再識別しています。\r\n"
+            L"GPT/512B/Windows/BitLocker/健康状態と、NTFS再構築／未対応FSの元サイズRAW可否を自動解析します。\r\n"
+            L"この段階ではコピー先を変更しません。コピー元のread-only設定は安全のため維持します。"
           : L"コピー元とコピー先を読取り専用で再列挙し、\r\n"
             L"安定識別、ディスク形式、容量、セクター、安全属性を確認しています。\r\n"
             L"この確認ではどのディスクも変更しません。");
@@ -4233,7 +6072,43 @@ void start_clone_check(AppState& state) {
   InvalidateRect(state.window, nullptr, FALSE);
 
   const HWND window = state.window;
-  std::thread([window, source = *source, target = *target, route]() {
+  std::thread([
+      window,
+      source = *source,
+      target = *target,
+      route,
+      shrink_request = std::move(shrink_request)]() mutable {
+    if (route == CloneRoute::shrink) {
+      auto inspection_payload =
+          std::make_unique<CloneShrinkInspectionPayload>();
+      if (!shrink_request.has_value()) {
+        inspection_payload->output =
+            L"縮小移行の製品解析requestが失われたため、コピー先を変更せず停止しました。";
+      } else {
+        inspection_payload->request = std::move(*shrink_request);
+        auto inspection = ytec::winpeapp::
+            inspect_winpe_offline_ntfs_direct_shrink_with_windows_apis(
+                inspection_payload->request);
+        if (inspection) {
+          inspection_payload->inspection = inspection.take_value();
+          inspection_payload->output =
+              L"コピー元のread-only固定と自動解析が完了しました。"
+              L"コピーするパーティションと余剰容量の使い方を選択してください。";
+        } else {
+          inspection_payload->output = format_error(
+              inspection.error(), &inspection_payload->error_presentation);
+          inspection_payload->output +=
+              L"\r\n\r\n読取り解析の途中でコピー元のread-only固定が"
+              L"完了している場合、安全のため自動解除しません。"
+              L"コピー先は変更していません。";
+        }
+      }
+      post_payload(
+          window,
+          kCloneShrinkInspectionCompleteMessage,
+          std::move(inspection_payload));
+      return;
+    }
     auto payload = std::make_unique<CloneCheckPayload>();
     payload->route = route;
     auto provider = ytec::diskmodel::make_windows_disk_inventory_provider();
@@ -4307,11 +6182,60 @@ void start_clone_check(AppState& state) {
   }).detach();
 }
 
+void start_clone_shrink_plan_after_review(
+    AppState& state,
+    ytec::winpeapp::WinPeOfflineNtfsProductPlanningRequest request,
+    ytec::winpeapp::WinPeOfflineNtfsPartitionReviewBinding review_binding) {
+  state.operation_busy = true;
+  state.clone_step = 2;
+  SetWindowTextW(
+      state.clone_output,
+      L"選択内容を固定し、コピー元・コピー先のstable identity、GPT配置、"
+      L"source raw snapshot、NTFS使用量、Windows/Boot/WinRE役割を再解析しています。\r\n"
+      L"最初の解析と完全一致した場合だけ、不変の縮小移行計画を作成します。"
+      L"コピー先はまだ変更しません。");
+  update_action_state(state);
+  InvalidateRect(state.window, nullptr, FALSE);
+  const HWND window = state.window;
+  std::thread([
+      window,
+      request = std::move(request),
+      review_binding = std::move(review_binding)]() mutable {
+    auto payload = std::make_unique<CloneCheckPayload>();
+    payload->route = CloneRoute::shrink;
+    auto plan = ytec::winpeapp::
+        plan_winpe_offline_ntfs_direct_shrink_after_review_with_windows_apis(
+            request,
+            review_binding);
+    payload->success = plan.has_value();
+    payload->execution_ready = plan.has_value();
+    payload->confirmation_token = plan ? L"OK" : L"";
+    if (plan) {
+      auto retained = std::make_shared<const
+          ytec::winpeapp::WinPeOfflineNtfsDirectShrinkPlan>(
+          plan.take_value());
+      payload->output = format_winpe_offline_direct_shrink_plan(*retained);
+      payload->reviewed_direct_shrink_plan = std::move(retained);
+    } else {
+      payload->output = format_error(
+          plan.error(), &payload->error_presentation);
+      payload->output +=
+          L"\r\n\r\n再解析が一致しない、4Kn、BitLocker未復号、"
+          L"未対応FSを元サイズRAWとして安全に保持できない、"
+          L"staging容量不足、または安全に解釈できない構成ではコピー先を変更せず停止します。"
+          L"コピー元はread-onlyのままです。";
+    }
+    post_payload(window, kCloneCheckCompleteMessage, std::move(payload));
+  }).detach();
+}
+
 void start_clone_execute(AppState& state) {
   const bool acknowledged =
       SendMessageW(state.clone_acknowledge, BM_GETCHECK, 0, 0) ==
       BST_CHECKED;
-  const CloneRoute route = state.reviewed_mbr2gpt_clone_plan.has_value()
+  const CloneRoute route = state.reviewed_direct_shrink_clone_plan != nullptr
+      ? CloneRoute::shrink
+      : state.reviewed_mbr2gpt_clone_plan.has_value()
       ? CloneRoute::mbr_to_gpt
       : state.reviewed_rescue_clone_plan.has_value()
       ? CloneRoute::rescue
@@ -4319,7 +6243,8 @@ void start_clone_execute(AppState& state) {
   const std::size_t reviewed_plan_count =
       (state.reviewed_clone_plan.has_value() ? 1U : 0U) +
       (state.reviewed_rescue_clone_plan.has_value() ? 1U : 0U) +
-      (state.reviewed_mbr2gpt_clone_plan.has_value() ? 1U : 0U);
+      (state.reviewed_mbr2gpt_clone_plan.has_value() ? 1U : 0U) +
+      (state.reviewed_direct_shrink_clone_plan != nullptr ? 1U : 0U);
   if (state.operation_busy || !state.clone_execution_ready ||
       reviewed_plan_count != 1U ||
       !acknowledged || control_text(state.clone_token) != L"OK") {
@@ -4327,17 +6252,99 @@ void start_clone_execute(AppState& state) {
   }
   if (!confirm_long_operation_power(
           state.window,
-          route == CloneRoute::rescue
-              ? L"救出クローン"
-              : route == CloneRoute::mbr_to_gpt
-              ? L"MBRからGPTへの別ディスク移行"
-              : L"ドライブのクローン")) {
+           route == CloneRoute::rescue
+               ? L"救出クローン"
+               : route == CloneRoute::mbr_to_gpt
+               ? L"MBRからGPTへの別ディスク移行"
+               : route == CloneRoute::shrink
+               ? L"WinPE 縮小移行クローン"
+               : L"ドライブのクローン")) {
     return;
   }
 
   const auto reviewed_plan = state.reviewed_clone_plan;
   const auto reviewed_rescue_plan = state.reviewed_rescue_clone_plan;
   const auto reviewed_mbr2gpt_plan = state.reviewed_mbr2gpt_clone_plan;
+  const auto reviewed_direct_shrink_plan =
+      state.reviewed_direct_shrink_clone_plan;
+  auto resume_slot_admission = [&]() -> ytec::clonecore::Result<
+      ytec::operationcore::OperationPlan> {
+    if (route == CloneRoute::shrink) {
+      return ytec::clonecore::Result<
+          ytec::operationcore::OperationPlan>::success(
+          reviewed_direct_shrink_plan->operation_plan());
+    }
+    if (route == CloneRoute::rescue) {
+      const auto& reviewed = reviewed_rescue_plan.value();
+      return ytec::clonecore::Result<
+          ytec::operationcore::OperationPlan>::success({
+          .operation_id = reviewed.operation_id,
+          .kind = ytec::operationcore::OperationKind::rescue_clone,
+          .environment = ytec::operationcore::OperationEnvironment::winpe,
+          .source = reviewed.expected_source,
+          .target = reviewed.expected_target,
+          .expected_work_bytes = reviewed.expected_source.size_bytes,
+          .immutable_payload_hash = reviewed.expected_source_layout_hash,
+      });
+    }
+
+    auto operation_id = make_operation_id(
+        route == CloneRoute::mbr_to_gpt
+            ? L"WinPE MBR→GPT clone resume-slot admission ID"
+            : L"WinPE direct clone resume-slot admission ID");
+    if (!operation_id) {
+      return ytec::clonecore::Result<
+          ytec::operationcore::OperationPlan>::failure(
+          operation_id.error());
+    }
+    const auto& reviewed = route == CloneRoute::mbr_to_gpt
+        ? reviewed_mbr2gpt_plan->clone
+        : reviewed_plan.value();
+    const std::array<std::wstring, 5U> owned_fields{
+        route == CloneRoute::mbr_to_gpt ? L"mbr-to-gpt" : L"exact-clone",
+        reviewed.source_bus_type,
+        reviewed.target_bus_type,
+        std::to_wstring(reviewed.source_partition_count),
+        std::to_wstring(reviewed.target_partition_count),
+    };
+    const std::array<std::wstring_view, 5U> fields{
+        owned_fields[0], owned_fields[1], owned_fields[2], owned_fields[3],
+        owned_fields[4],
+    };
+    const std::array<ytec::operationcore::Sha256Digest, 1U> mbr2gpt_digest{
+        route == CloneRoute::mbr_to_gpt
+            ? reviewed_mbr2gpt_plan->review_binding_digest
+            : ytec::operationcore::Sha256Digest{},
+    };
+    return ytec::winpeapp::make_winpe_resume_slot_admission_plan(
+        operation_id.take_value(),
+        ytec::operationcore::OperationKind::clone,
+        reviewed.expected_source,
+        reviewed.expected_target,
+        reviewed.expected_source.size_bytes,
+        fields,
+        route == CloneRoute::mbr_to_gpt
+            ? std::span<const ytec::operationcore::Sha256Digest>(mbr2gpt_digest)
+            : std::span<const ytec::operationcore::Sha256Digest>{});
+  }();
+  if (!guard_new_product_operation_start(
+          state.window, state.clone_output, resume_slot_admission)) {
+    return;
+  }
+  const std::uint64_t completion_power_binding =
+      ytec::winpeapp::take_winpe_completion_power_operation_binding(
+          state.next_completion_power_operation_binding);
+  const std::wstring completion_power_target =
+      route == CloneRoute::shrink
+      ? format_completion_disk_target(
+            reviewed_direct_shrink_plan->target_plan().expected_target())
+      : route == CloneRoute::mbr_to_gpt
+      ? format_completion_disk_target(
+            reviewed_mbr2gpt_plan->clone.expected_target)
+      : route == CloneRoute::rescue
+      ? format_completion_disk_target(
+            reviewed_rescue_plan->expected_target)
+      : format_completion_disk_target(reviewed_plan->expected_target);
 
   state.operation_busy = true;
   state.clone_execution_ready = false;
@@ -4363,6 +6370,10 @@ void start_clone_execute(AppState& state) {
           ? L"実行直前にコピー元・コピー先とMicrosoft署名済み変換ツールをもう一度確認します。\r\n"
             L"一致した場合だけコピー元をread-onlyに固定し、別のコピー先へ検証済みMBRクローンを作成します。\r\n"
             L"コピー先だけをGPTへ変換し、ESP・MSR・UEFI BCDを検証して最後にofflineへ戻します。"
+          : route == CloneRoute::shrink
+          ? L"実行直前にコピー元・コピー先をstable identityで再識別します。\r\n"
+            L"コピー元をOS-level read-onlyのまま保持し、各NTFS capture／exact RAW直前にsourceを再検証します。\r\n"
+            L"コピー先は非起動stagingから構築し、全書込み読戻し・Boot/WinRE証拠後にGPTをcommit lastしてoffline保持します。"
           : L"実行直前にコピー元とコピー先をもう一度再識別します。\r\n"
             L"一致した場合だけ、コピー元を読取り専用で保持し、コピー先だけに書き込みます。\r\n"
             L"書込み開始後の取消・失敗では、コピー先をオフラインのまま保護する場合があります。");
@@ -4377,17 +6388,24 @@ void start_clone_execute(AppState& state) {
       reviewed_plan,
       reviewed_rescue_plan,
       reviewed_mbr2gpt_plan,
+      reviewed_direct_shrink_plan,
       route,
+      completion_power_binding,
+      completion_power_target,
       cancellation,
       pause_controller]() {
     auto payload = std::make_unique<CloneExecutePayload>();
     payload->route = route;
+    payload->completion_power_target = completion_power_target;
     ThreadSleepPrevention sleep_prevention;
     if (!sleep_prevention.active()) {
       payload->success = false;
-      payload->output =
-          L"クローン中の自動スリープ防止を確立できないため、"
-          L"ディスクを変更せずに停止しました。";
+      payload->output = route == CloneRoute::shrink
+          ? L"縮小移行中の自動スリープ防止を確立できないため、"
+            L"コピー先を変更せずに停止しました。"
+            L"コピー元はOS-level read-onlyのままです。"
+          : L"クローン中の自動スリープ防止を確立できないため、"
+            L"ディスクを変更せずに停止しました。";
       pause_controller->mark_completed();
       post_payload(
           window, kCloneExecuteCompleteMessage, std::move(payload));
@@ -4455,12 +6473,51 @@ void start_clone_execute(AppState& state) {
           L"OK",
           *migration_service,
           std::move(callbacks));
-      payload->success = execution.has_value();
-      if (execution) {
+      payload->success = execution.has_value() &&
+          mbr2gpt_clone_completion_verified(execution.value());
+      if (execution && payload->success) {
         payload->output = format_mbr2gpt_clone_result(execution.value());
+      } else if (execution) {
+        payload->output =
+            L"MBR→GPT移行の必須証拠が一つでも不完全なため、"
+            L"完了扱いにしません。コピー先はofflineのままです。";
       } else {
         payload->output = format_error(
             execution.error(), &payload->error_presentation);
+      }
+    } else if (route == CloneRoute::shrink) {
+      ytec::winpeapp::WinPeOfflineNtfsDirectShrinkExecutionOptions options{
+          .confirmation = {
+              .first_step_acknowledged = true,
+              .typed_token = L"OK",
+          },
+          .callbacks = callbacks,
+      };
+      const auto dependencies = ytec::winpeapp::
+          make_winpe_offline_ntfs_direct_shrink_dependencies_with_windows_apis(
+              options);
+      auto execution = ytec::winpeapp::
+          execute_winpe_offline_ntfs_direct_shrink_clone(
+              *reviewed_direct_shrink_plan,
+              options,
+              dependencies);
+      payload->success = execution.has_value() &&
+          winpe_offline_direct_shrink_completion_verified(
+              *reviewed_direct_shrink_plan, execution.value());
+      if (payload->success) {
+        payload->output =
+            format_winpe_offline_direct_shrink_result(execution.value());
+      } else if (!execution) {
+        payload->output = format_error(
+            execution.error(), &payload->error_presentation);
+      } else if (execution.value().lifecycle.error.has_value()) {
+        payload->output = format_error(
+            *execution.value().lifecycle.error,
+            &payload->error_presentation);
+      } else {
+        payload->output =
+            L"WinPE縮小移行の必須証拠が一つでも不完全なため、"
+            L"完了扱いにしません。コピー先はofflineのままです。";
       }
     } else {
       auto clone_service =
@@ -4472,9 +6529,14 @@ void start_clone_execute(AppState& state) {
           L"",
           *clone_service,
           std::move(callbacks));
-      payload->success = execution.has_value();
-      if (execution) {
+      payload->success = execution.has_value() &&
+          direct_clone_completion_verified(execution.value());
+      if (execution && payload->success) {
         payload->output = format_direct_clone_result(execution.value());
+      } else if (execution) {
+        payload->output =
+            L"直接クローンの必須証拠が一つでも不完全なため、"
+            L"完了扱いにしません。コピー先はofflineのままです。";
       } else {
         payload->output = format_error(
             execution.error(), &payload->error_presentation);
@@ -4486,14 +6548,34 @@ void start_clone_execute(AppState& state) {
               ? L"救出クローンの全書込み読戻し検証が完了しました。"
               : route == CloneRoute::mbr_to_gpt
               ? L"MBR→GPT別ディスク移行と最終offline確認が完了しました。"
+              : route == CloneRoute::shrink
+              ? L"WinPE縮小移行の全必須証拠と最終offline確認が完了しました。"
               : L"クローンと読戻し検証が完了しました。"
           : route == CloneRoute::rescue
               ? L"救出クローンを安全に完了できませんでした。"
               : route == CloneRoute::mbr_to_gpt
               ? L"MBR→GPT別ディスク移行を安全に完了できませんでした。"
+              : route == CloneRoute::shrink
+              ? L"WinPE縮小移行を安全に完了できませんでした。"
               : L"クローンを安全に完了できませんでした。";
     }
     pause_controller->mark_completed();
+    const auto sleep_prevention_release = sleep_prevention.release();
+    const bool partial_result = route == CloneRoute::rescue;
+    payload->completion_power_proof =
+        ytec::winpeapp::make_winpe_completion_power_proof(
+            ytec::winpeapp::WinPeCompletionPowerOperation::clone,
+            completion_operation_outcome(
+                payload->success, partial_result && payload->success),
+            payload->success,
+            sleep_prevention_release,
+            completion_power_binding);
+    if (payload->success && sleep_prevention_release !=
+            ytec::clonecore::SleepPreventionReleaseState::released) {
+      payload->output +=
+          L"\r\n\r\n自動スリープ防止の解除を確認できないため、"
+          L"完了後の再起動／シャットダウンは提示しません。";
+    }
     post_payload(window, kCloneExecuteCompleteMessage, std::move(payload));
   }).detach();
 }
@@ -4792,6 +6874,94 @@ void start_image_review(AppState& state) {
     return;
   }
 
+  const bool encrypted =
+      SendMessageW(state.image_encryption, BM_GETCHECK, 0, 0) ==
+      BST_CHECKED;
+  const bool rescue_mode =
+      SendMessageW(state.image_rescue_mode, BM_GETCHECK, 0, 0) ==
+      BST_CHECKED;
+  const bool resume_existing = state.image_resume_requested;
+  const auto resume = state.reviewed_image_resume_observation;
+  if (resume_existing &&
+      (!state.image_resume_platform_ready ||
+       !state.image_resume_slot_present || !resume.has_value() ||
+       !resume->binding.has_value() || !resume->source.has_value() ||
+       !resume->continuity.has_value())) {
+    SetWindowTextW(
+        state.image_output,
+        L"前回の通常イメージ作成を安全に再開できる完全bindingがありません。"
+        L"checkpointと所有ファイルは変更していません。");
+    update_action_state(state);
+    return;
+  }
+  if (resume_existing &&
+      (_wcsicmp(destination.c_str(), resume->final_path.c_str()) != 0 ||
+       rescue_mode || encrypted != resume->continuity->encrypted ||
+       verification_mode.value() !=
+           resume->continuity->verification_mode)) {
+    SetWindowTextW(
+        state.image_output,
+        L"再開時は前回と同じ保存先・暗号化・検証方式を選び、"
+        L"通常（exact）モードのまま内容確認してください。"
+        L"表示済みcheckpointと所有ファイルは変更していません。");
+    update_action_state(state);
+    return;
+  }
+
+  std::optional<ytec::diskmodel::ImagePartitionSelection>
+      partition_selection;
+  if (rescue_mode) {
+    auto whole = ytec::diskmodel::normalize_image_partition_selection(
+        source.value(),
+        std::span<const std::uint32_t>{});
+    if (whole) {
+      partition_selection = whole.take_value();
+    } else {
+      set_error_output_and_show(
+          state.window, state.image_output, whole.error());
+      update_action_state(state);
+      return;
+    }
+  } else if (resume_existing) {
+    auto resumed = ytec::diskmodel::normalize_image_partition_selection(
+        source.value(),
+        resume->continuity->selected_partition_numbers);
+    if (resumed) {
+      const auto canonical = resumed.value().whole_disk
+          ? std::vector<std::uint32_t>{}
+          : resumed.value().selected_partition_numbers;
+      if (canonical !=
+          resume->continuity->selected_partition_numbers) {
+        SetWindowTextW(
+            state.image_output,
+            L"前回のpartition選択が現在の必須Windows領域を含むcanonical bindingと一致しません。"
+            L"checkpointと所有ファイルは変更していません。");
+        update_action_state(state);
+        return;
+      }
+      partition_selection = resumed.take_value();
+    } else {
+      set_error_output_and_show(
+          state.window,
+          state.image_output,
+          resumed.error(),
+          L"checkpointと所有ファイルは変更していません。");
+      update_action_state(state);
+      return;
+    }
+  } else {
+    partition_selection = prompt_image_partition_selection(
+        state.window,
+        source.value());
+    if (!partition_selection.has_value()) {
+      SetWindowTextW(
+          state.image_output,
+          L"イメージ対象の選択を取り消しました。作成元と保存先は変更していません。");
+      update_action_state(state);
+      return;
+    }
+  }
+
   bool replace_existing = false;
   const DWORD attributes = GetFileAttributesW(destination.c_str());
   if (attributes != INVALID_FILE_ATTRIBUTES) {
@@ -4802,16 +6972,55 @@ void start_image_review(AppState& state) {
       update_action_state(state);
       return;
     }
-    if (MessageBoxW(
-            state.window,
-            L"同名の完成イメージがあります。\r\n\r\n"
-            L"新しい .partial を完全検証できた後だけ、既存ファイルを失わない手順で置換します。\r\n"
-            L"この保存先を内容確認へ進めますか？",
-            L"既存イメージの置換確認",
-            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+    const bool resume_after_publish = resume_existing &&
+        (resume->object_state == ytec::operationcore::
+             PersistentPeExactImageCreateObjectState::published ||
+         resume->object_state == ytec::operationcore::
+             PersistentPeExactImageCreateObjectState::retirement_pending);
+    if (resume_existing && !resume_after_publish) {
+      SetWindowTextW(
+          state.image_output,
+          L"作成途中の再開先に同名の完成ファイルが現れました。"
+          L"別物を採用も上書きもせず、再開情報を保持して停止しました。");
+      update_action_state(state);
       return;
     }
-    replace_existing = true;
+    if (!resume_existing && !rescue_mode) {
+      SetWindowTextW(
+          state.image_output,
+          L"通常（exact）の永続再開対応作成は既存の完成ファイルを上書きしません。"
+          L"存在しない別の .tsumugi 保存名を選んでください。");
+      update_action_state(state);
+      return;
+    }
+    if (!resume_existing && rescue_mode) {
+      if (MessageBoxW(
+              state.window,
+              L"同名の完成イメージがあります。\r\n\r\n"
+              L"救出用 .partial を完全検証できた後だけ、既存ファイルを失わない手順で置換します。\r\n"
+              L"この保存先を内容確認へ進めますか？",
+              L"既存救出イメージの置換確認",
+              MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+      }
+      replace_existing = true;
+    }
+  } else {
+    const DWORD path_error = GetLastError();
+    if (path_error != ERROR_FILE_NOT_FOUND &&
+        path_error != ERROR_PATH_NOT_FOUND) {
+      set_error_output_and_show(
+          state.window,
+          state.image_output,
+          {
+              .code = ytec::clonecore::ErrorCode::io_failed,
+              .native_code = path_error,
+              .operation = L"WinPE image-create final read-only observation",
+              .message = L"完成名が存在しないことを確認できません",
+          });
+      update_action_state(state);
+      return;
+    }
   }
 
   auto identity = ytec::diskmodel::make_stable_disk_identity(
@@ -4822,50 +7031,75 @@ void start_image_review(AppState& state) {
     update_action_state(state);
     return;
   }
-  const auto destination_safe =
-      ytec::imageformat::validate_windows_tsumugi_destination({
-          .final_path = destination,
-          .expected_source_disk = identity.value(),
-          .required_available_bytes = 1U,
-          .replace_existing = replace_existing,
-      });
-  if (!destination_safe) {
-    set_error_output_and_show(
-        state.window, state.image_output, destination_safe.error());
-    update_action_state(state);
-    return;
+  if (resume_existing) {
+    const auto same_source = ytec::clonecore::validate_stable_identity(
+        *resume->source, identity.value(), L"WinPE image-create resume Source");
+    if (!same_source) {
+      set_error_output_and_show(
+          state.window,
+          state.image_output,
+          same_source.error(),
+          L"前回のcheckpointと所有ファイルは変更していません。");
+      update_action_state(state);
+      return;
+    }
+  } else {
+    const auto destination_safe =
+        ytec::imageformat::validate_windows_tsumugi_destination({
+            .final_path = destination,
+            .expected_source_disk = identity.value(),
+            .required_available_bytes = 1U,
+            .replace_existing = replace_existing,
+        });
+    if (!destination_safe) {
+      set_error_output_and_show(
+          state.window, state.image_output, destination_safe.error());
+      update_action_state(state);
+      return;
+    }
   }
 
-  const bool encrypted =
-      SendMessageW(state.image_encryption, BM_GETCHECK, 0, 0) ==
-      BST_CHECKED;
-  const bool rescue_mode =
-      SendMessageW(state.image_rescue_mode, BM_GETCHECK, 0, 0) ==
-      BST_CHECKED;
   std::shared_ptr<SecureAsciiPassword> password;
   if (encrypted) {
     auto prompt = prompt_tsumugi_password(
         state.window,
         state.body_font,
-        L"新しい .tsumugi の暗号化パスワードを2回入力してください。"
-        L"回復キーはなく、紛失すると復元できません。"
-        L"パスワードは作成完了または停止時にメモリから消去します。",
-        L"イメージを暗号化",
-        true,
-        true,
-        L"このパスワードを使用");
+        resume_existing
+            ? L"前回の .tsumugi の暗号化パスワードを再入力してください。"
+              L"パスワードと鍵はcheckpointへ保存していません。"
+              L"誤った値では既存prefixの認証に失敗し、何も追記しません。"
+            : L"新しい .tsumugi の暗号化パスワードを2回入力してください。"
+              L"回復キーはなく、紛失すると復元できません。"
+              L"パスワードは作成完了または停止時にメモリから消去します。",
+        resume_existing ? L"暗号化イメージ作成を再開" : L"イメージを暗号化",
+        !resume_existing,
+        !resume_existing,
+        resume_existing ? L"このパスワードで再開" : L"このパスワードを使用");
     if (!prompt.accepted || prompt.password == nullptr) {
       SetWindowTextW(
           state.image_output,
-          L"暗号化パスワードの入力を取り消しました。"
-          L"作成元と保存先は変更していません。");
+          resume_existing
+              ? L"暗号化パスワードの再入力を取り消しました。"
+                L"checkpointと所有ファイルは変更していません。"
+              : L"暗号化パスワードの入力を取り消しました。"
+                L"作成元と保存先は変更していません。");
       update_action_state(state);
       return;
     }
     password = std::move(prompt.password);
   }
 
+  if (resume_existing && resume->final_path.empty()) {
+    SetWindowTextW(
+        state.image_output,
+        L"再開情報の完成名が空のため、安全に再開できません。"
+        L"checkpointと所有ファイルは変更していません。");
+    update_action_state(state);
+    return;
+  }
+
   state.reviewed_image_source = source;
+  state.reviewed_image_partition_selection = partition_selection;
   state.reviewed_image_path = destination;
   state.reviewed_image_replace_existing = replace_existing;
   state.reviewed_image_encrypted = encrypted;
@@ -4882,33 +7116,147 @@ void start_image_review(AppState& state) {
       encrypted,
       verification_mode.value(),
       rescue_mode);
-  review += L"\r\n\r\n最終確認語: OK";
+  review += L"\r\nイメージ対象: " +
+      format_image_partition_selection_review(*partition_selection);
+  if (resume_existing) {
+    auto startup = ytec::winpeapp::
+        format_direct_image_create_resume_startup_review_v1(*resume);
+    if (!startup) {
+      set_error_output_and_show(
+          state.window, state.image_output, startup.error());
+      invalidate_image_review(state, L"");
+      update_action_state(state);
+      return;
+    }
+    review += L"\r\n\r\n" + startup.value();
+    review += L"\r\n再開直前にsource状態・保存先・partial/journal File ID・計画を再証明し、"
+              L"確認済みprefixを全量再認証してからsuffixだけを追記します。";
+  }
   SetWindowTextW(state.image_output, review.c_str());
   show_page_controls(state);
   update_action_state(state);
   InvalidateRect(state.window, nullptr, FALSE);
-  SetFocus(state.image_token);
+  SetFocus(state.image_execute);
 }
 
 void start_image_execute(AppState& state) {
   if (state.operation_busy || !state.image_execution_ready ||
       !state.reviewed_image_source.has_value() ||
+      !state.reviewed_image_partition_selection.has_value() ||
       state.reviewed_image_path.empty() ||
       (state.reviewed_image_encrypted &&
-       state.reviewed_image_password == nullptr) ||
-      control_text(state.image_token) != L"OK") {
+       state.reviewed_image_password == nullptr)) {
     return;
   }
   if (!confirm_long_operation_power(state.window, L"イメージ作成")) {
     return;
   }
   const auto source = state.reviewed_image_source.value();
+  const auto partition_selection =
+      state.reviewed_image_partition_selection.value();
+  const std::vector<std::uint32_t> selected_partition_numbers =
+      partition_selection.whole_disk
+      ? std::vector<std::uint32_t>{}
+      : partition_selection.selected_partition_numbers;
   const std::wstring destination = state.reviewed_image_path;
   const bool replace_existing = state.reviewed_image_replace_existing;
   const bool rescue_mode = state.reviewed_image_rescue_mode;
   const auto verification_mode =
       state.reviewed_image_verification_mode;
   const auto password = state.reviewed_image_password;
+  const bool persistent_exact = !rescue_mode;
+  const bool resume_existing =
+      persistent_exact && state.image_resume_requested;
+  const auto resume_observation = state.reviewed_image_resume_observation;
+  if (persistent_exact && !state.image_resume_platform_ready) {
+    SetWindowTextW(
+        state.image_output,
+        L"実行ファイル隣のdataと保存先を永続再開用として安全に確認できないため、"
+        L"通常イメージ作成は開始しません。");
+    return;
+  }
+  if (resume_existing &&
+      (!state.image_resume_slot_present || !resume_observation.has_value() ||
+       !resume_observation->binding.has_value())) {
+    SetWindowTextW(
+        state.image_output,
+        L"表示済みの完全bindingがないため、前回の通常イメージ作成は再開しません。"
+        L"checkpointと所有ファイルは変更していません。");
+    return;
+  }
+  auto source_identity = ytec::diskmodel::make_stable_disk_identity(
+      source, source.is_system_disk);
+  if (!source_identity) {
+    set_error_output_and_show(
+        state.window, state.image_output, source_identity.error());
+    return;
+  }
+  ytec::operationcore::OperationId new_operation_id{};
+  if (!resume_existing) {
+    auto admission_operation_id = make_operation_id(
+        rescue_mode
+            ? L"WinPE rescue image-create resume-slot admission ID"
+            : L"WinPE image-create resume-slot admission ID");
+    if (!admission_operation_id) {
+      set_error_output_and_show(
+          state.window, state.image_output, admission_operation_id.error());
+      return;
+    }
+    new_operation_id = admission_operation_id.value();
+    const std::array<std::wstring, 6U> admission_owned_fields{
+        destination,
+        replace_existing ? L"replace-existing" : L"create-new",
+        rescue_mode ? L"rescue" : L"exact",
+        verification_mode ==
+                ytec::imageformat::TsumugiCreateVerificationMode::complete
+            ? L"complete-verification"
+            : L"fast-verification",
+        state.reviewed_image_encrypted ? L"encrypted" : L"unencrypted",
+        canonical_image_partition_selection_binding(partition_selection),
+    };
+    const std::array<std::wstring_view, 6U> admission_fields{
+        admission_owned_fields[0],
+        admission_owned_fields[1],
+        admission_owned_fields[2],
+        admission_owned_fields[3],
+        admission_owned_fields[4],
+        admission_owned_fields[5],
+    };
+    auto resume_slot_admission =
+        ytec::winpeapp::make_winpe_resume_slot_admission_plan(
+            new_operation_id,
+            rescue_mode
+                ? ytec::operationcore::OperationKind::rescue_image
+                : ytec::operationcore::OperationKind::image_create,
+            source_identity.value(),
+            std::nullopt,
+            rescue_mode ? source.size_bytes
+                        : partition_selection.selected_bytes,
+            admission_fields);
+    if (!guard_new_product_operation_start(
+            state.window, state.image_output, resume_slot_admission)) {
+      return;
+    }
+  } else {
+    const auto same_source = ytec::clonecore::validate_stable_identity(
+        *resume_observation->source,
+        source_identity.value(),
+        L"WinPE image-create resume final Source");
+    if (!same_source) {
+      set_error_output_and_show(
+          state.window,
+          state.image_output,
+          same_source.error(),
+          L"checkpointと所有ファイルは変更していません。");
+      return;
+    }
+  }
+  const std::uint64_t completion_power_binding =
+      ytec::winpeapp::take_winpe_completion_power_operation_binding(
+          state.next_completion_power_operation_binding);
+  const std::wstring completion_power_target =
+      L"出力 " + destination + L" / コピー元 " +
+      format_completion_disk_target(source);
   state.reviewed_image_password.reset();
   state.operation_busy = true;
   state.image_execution_ready = false;
@@ -4952,20 +7300,42 @@ void start_image_execute(AppState& state) {
   std::thread([
       window,
       source,
+      selected_partition_numbers,
       destination,
       replace_existing,
       rescue_mode,
       verification_mode,
       password,
+      persistent_exact,
+      resume_existing,
+      resume_observation,
+      new_operation_id,
+      completion_power_binding,
+      completion_power_target,
       cancellation,
       pause_controller]() {
     auto payload = std::make_unique<ImageCreatePayload>();
+    payload->persistent_resume_attempt = persistent_exact;
+    payload->completion_power_target = completion_power_target;
     ThreadSleepPrevention sleep_prevention;
     if (!sleep_prevention.active()) {
       payload->success = false;
       payload->output =
           L"イメージ作成中の自動スリープ防止を確立できないため、"
           L"ディスクと保存先を変更せずに停止しました。";
+      if (persistent_exact) {
+        auto inspected = inspect_product_image_create_resume();
+        payload->resume_platform_ready = inspected.has_value();
+        payload->resume_slot_present = inspected &&
+            inspected.value().object_state != ytec::operationcore::
+                PersistentPeExactImageCreateObjectState::no_slot;
+        if (payload->resume_slot_present &&
+            inspected.value().object_state != ytec::operationcore::
+                PersistentPeExactImageCreateObjectState::other_capability) {
+          payload->resume_observation_after_operation =
+              inspected.take_value();
+        }
+      }
       pause_controller->mark_completed();
       post_payload(
           window, kImageCreateCompleteMessage, std::move(payload));
@@ -4998,9 +7368,9 @@ void start_image_execute(AppState& state) {
     };
     callbacks = ytec::clonecore::bind_manual_pause_controller(
         std::move(callbacks), pause_controller);
-    auto execution =
-        ytec::winpeapp::execute_direct_image_create_with_windows_apis({
+    const ytec::winpeapp::DirectImageCreateRequest request{
             .selected_source = source,
+            .selected_partition_numbers = selected_partition_numbers,
             .final_path = destination,
             .created_utc = current_utc_timestamp(),
             .app_version = YTEC_PROJECT_VERSION,
@@ -5011,10 +7381,32 @@ void start_image_execute(AppState& state) {
             .replace_existing = replace_existing,
             .rescue_mode = rescue_mode,
             .callbacks = std::move(callbacks),
-        });
-    payload->success = execution.has_value();
-    if (execution) {
+        };
+    auto execution = persistent_exact
+        ? ytec::winpeapp::
+              execute_direct_image_create_resume_with_windows_apis_v1(
+                  request,
+                  {
+                      .action = resume_existing
+                          ? ytec::winpeapp::
+                                DirectImageCreateResumeAction::resume_existing
+                          : ytec::winpeapp::
+                                DirectImageCreateResumeAction::start_new,
+                      .new_operation_id = new_operation_id,
+                      .reviewed_existing_slot = resume_existing
+                          ? resume_observation->binding
+                          : std::nullopt,
+                  })
+        : ytec::winpeapp::execute_direct_image_create_with_windows_apis(
+              request);
+    payload->success = execution.has_value() &&
+        direct_image_create_completion_verified(execution.value());
+    if (execution && payload->success) {
       payload->output = format_direct_image_result(execution.value());
+    } else if (execution) {
+      payload->output =
+          L".tsumugi作成の必須証拠が一つでも不完全なため、"
+          L"完成扱いにしません。";
     } else {
       payload->output = format_error(
           execution.error(), &payload->error_presentation);
@@ -5027,7 +7419,43 @@ void start_image_execute(AppState& state) {
               : L".tsumugiイメージの作成と高速検証が完了しました。"
           : L".tsumugiイメージを安全に完了できませんでした。";
     }
+    if (persistent_exact) {
+      auto inspected = inspect_product_image_create_resume();
+      if (!inspected) {
+        payload->resume_platform_ready = false;
+        payload->resume_slot_present = true;
+        payload->output +=
+            L"\r\n\r\n停止後のactive.checkpointを安全に再確認できません。"
+            L"再起動後のstartup確認まで新しい書込み操作を開始しないでください。";
+      } else {
+        payload->resume_platform_ready = true;
+        payload->resume_slot_present =
+            inspected.value().object_state != ytec::operationcore::
+                PersistentPeExactImageCreateObjectState::no_slot;
+        if (payload->resume_slot_present &&
+            inspected.value().object_state != ytec::operationcore::
+                PersistentPeExactImageCreateObjectState::other_capability) {
+          payload->resume_observation_after_operation =
+              inspected.take_value();
+        }
+      }
+    }
     pause_controller->mark_completed();
+    const auto sleep_prevention_release = sleep_prevention.release();
+    payload->completion_power_proof =
+        ytec::winpeapp::make_winpe_completion_power_proof(
+            ytec::winpeapp::WinPeCompletionPowerOperation::image_create,
+            completion_operation_outcome(
+                payload->success, rescue_mode && payload->success),
+            payload->success,
+            sleep_prevention_release,
+            completion_power_binding);
+    if (payload->success && sleep_prevention_release !=
+            ytec::clonecore::SleepPreventionReleaseState::released) {
+      payload->output +=
+          L"\r\n\r\n自動スリープ防止の解除を確認できないため、"
+          L"完了後の再起動／シャットダウンは提示しません。";
+    }
     post_payload(window, kImageCreateCompleteMessage, std::move(payload));
   }).detach();
 }
@@ -5047,6 +7475,11 @@ void request_image_cancellation(AppState& state) {
   output +=
       L"\r\n\r\n取消要求を受け付けました。安全なチャンク境界で停止します。"
       L"\r\n完成名へ確定済みの場合は中断せず、検証結果を返します。";
+  if (!state.reviewed_image_rescue_mode) {
+    output +=
+        L"\r\n通常（exact）作成では、検証済みprefixのpartial/journalと"
+        L"active.checkpointを保持し、次回の完全再証明後にsuffixだけを再開します。";
+  }
   SetWindowTextW(state.image_output, output.c_str());
   update_action_state(state);
   InvalidateRect(state.window, nullptr, FALSE);
@@ -5693,15 +8126,104 @@ void start_restore_execute(AppState& state) {
   const auto shrink_original_source_target =
       state.reviewed_shrink_original_source_target;
   ytec::operationcore::OperationId new_operation_id{};
-  if (persistent_resume && !resume_existing) {
-    auto generated = make_restore_resume_operation_id();
+  ytec::operationcore::OperationId admission_operation_id{};
+  if (!resume_existing) {
+    auto generated = make_operation_id(
+        persistent_resume
+            ? L"PE永続復元操作ID"
+            : L"PE直接復元resume-slot admission ID");
     if (!generated) {
       set_error_output_and_show(
           state.window, state.restore_output, generated.error());
       return;
     }
-    new_operation_id = generated.take_value();
+    admission_operation_id = generated.take_value();
+    if (persistent_resume) {
+      new_operation_id = admission_operation_id;
+    }
   }
+  if (resume_existing) {
+    if (!resume_binding.has_value() ||
+        !guard_bound_product_restore_resume(
+            state.window, state.restore_output, resume_binding.value())) {
+      return;
+    }
+  } else {
+    std::wstring individual_binding = L"whole-disk";
+    if (individual_partition.has_value()) {
+      individual_binding = L"source-table-index=" + std::to_wstring(
+          individual_partition->source_table_index);
+      if (const auto* existing = std::get_if<ytec::imageformat::
+              TsumugiPhysicalExistingPartitionRestoreSelection>(
+              &individual_partition->target)) {
+        individual_binding +=
+            L";existing-target=" +
+            std::to_wstring(existing->target_table_index) + L":" +
+            std::to_wstring(existing->target_partition_number) + L":" +
+            std::to_wstring(existing->target_offset) + L":" +
+            std::to_wstring(existing->target_size);
+      } else if (const auto* unallocated = std::get_if<ytec::imageformat::
+                     TsumugiPhysicalUnallocatedRestoreSelection>(
+                     &individual_partition->target)) {
+        individual_binding +=
+            L";unallocated-target=" +
+            std::to_wstring(unallocated->target_offset) + L":" +
+            std::to_wstring(unallocated->target_size);
+      } else {
+        SetWindowTextW(
+            state.restore_output,
+            L"個別復元の最終配置をSingleResumeSlot gateへ拘束できないため、"
+            L"復元先を変更せずに停止しました。");
+        return;
+      }
+    }
+    const std::wstring mode_binding =
+        image.mode == ytec::imageformat::TsumugiManifestMode::shrink
+        ? L"shrink"
+        : image.mode == ytec::imageformat::TsumugiManifestMode::rescue
+        ? L"rescue"
+        : L"exact";
+    const std::array<std::wstring, 6U> admission_owned_fields{
+        image.path,
+        mode_binding,
+        individual_binding,
+        persistent_resume ? L"persistent-start-new" : L"direct-restore",
+        image.encrypted ? L"encrypted" : L"unencrypted",
+        shrink_restore ? L"shrink-layout-reviewed" : L"exact-layout-reviewed",
+    };
+    const std::array<std::wstring_view, 6U> admission_fields{
+        admission_owned_fields[0],
+        admission_owned_fields[1],
+        admission_owned_fields[2],
+        admission_owned_fields[3],
+        admission_owned_fields[4],
+        admission_owned_fields[5],
+    };
+    const std::array<ytec::operationcore::Sha256Digest, 3U>
+        admission_digests{
+            image.global_hash,
+            image.source_state_hash,
+            target_layout_hash,
+        };
+    auto resume_slot_admission = ytec::winpeapp::
+        make_winpe_resume_slot_admission_plan(
+            admission_operation_id,
+            ytec::operationcore::OperationKind::image_restore,
+            std::nullopt,
+            target_identity,
+            image.source_disk_size,
+            admission_fields,
+            admission_digests);
+    if (!guard_new_product_operation_start(
+            state.window, state.restore_output, resume_slot_admission)) {
+      return;
+    }
+  }
+  const std::uint64_t completion_power_binding =
+      ytec::winpeapp::take_winpe_completion_power_operation_binding(
+          state.next_completion_power_operation_binding);
+  const std::wstring completion_power_target =
+      format_completion_disk_target(target_identity);
   const auto password = state.reviewed_restore_image_password;
   state.reviewed_restore_image_password.reset();
   state.operation_busy = true;
@@ -5746,9 +8268,13 @@ void start_restore_execute(AppState& state) {
        resume_binding,
        new_operation_id,
        password,
-      cancellation,
-      pause_controller]() {
+       completion_power_binding,
+       completion_power_target,
+       cancellation,
+       pause_controller]() {
     auto payload = std::make_unique<ImageRestorePayload>();
+    payload->completion_power_target = completion_power_target;
+    bool mandatory_completion_verified = false;
     ThreadSleepPrevention sleep_prevention;
     if (!sleep_prevention.active()) {
       payload->success = false;
@@ -5819,8 +8345,12 @@ void start_restore_execute(AppState& state) {
       auto execution = ytec::winpeapp::
           execute_direct_shrink_image_restore_with_windows_apis(request);
       payload->success = execution.has_value();
+      payload->partial_loss = image.partial_loss;
       payload->boot_repair_offer_required = execution.has_value() &&
           execution.value().boot_repair_offer_required;
+      mandatory_completion_verified = execution.has_value() &&
+          !payload->partial_loss &&
+          direct_shrink_restore_completion_verified(execution.value());
       if (execution) {
         payload->output = format_direct_shrink_restore_result(
             execution.value());
@@ -5860,6 +8390,9 @@ void start_restore_execute(AppState& state) {
             execution.value().physical.partial_loss;
         payload->boot_repair_offer_required = execution.has_value() &&
             execution.value().physical.boot_repair_offer_required;
+        mandatory_completion_verified = execution.has_value() &&
+            !payload->partial_loss &&
+            direct_image_restore_completion_verified(execution.value());
         if (execution) {
           payload->output = format_direct_restore_result(
               execution.value(), true);
@@ -5916,6 +8449,8 @@ void start_restore_execute(AppState& state) {
             payload->success = completed;
             if (completed) {
               payload->partial_loss = execution.value().partial_loss;
+              mandatory_completion_verified =
+                  persistent_restore_completion_verified(execution.value());
               payload->output = format_persistent_restore_result(
                   execution.value());
             } else if (!execution) {
@@ -5951,6 +8486,22 @@ void start_restore_execute(AppState& state) {
       }
     }
     pause_controller->mark_completed();
+    const auto sleep_prevention_release = sleep_prevention.release();
+    payload->completion_power_proof =
+        ytec::winpeapp::make_winpe_completion_power_proof(
+            ytec::winpeapp::WinPeCompletionPowerOperation::image_restore,
+            completion_operation_outcome(
+                payload->success,
+                payload->success && payload->partial_loss),
+            mandatory_completion_verified,
+            sleep_prevention_release,
+            completion_power_binding);
+    if (payload->success && sleep_prevention_release !=
+            ytec::clonecore::SleepPreventionReleaseState::released) {
+      payload->output +=
+          L"\r\n\r\n自動スリープ防止の解除を確認できないため、"
+          L"完了後の再起動／シャットダウンは提示しません。";
+    }
     post_payload(window, kImageRestoreCompleteMessage, std::move(payload));
   }).detach();
 }
@@ -6039,6 +8590,7 @@ void start_boot_inspect(AppState& state) {
   state.boot_execution_active = false;
   state.repair_step = 2;
   state.inspected_boot_plan.reset();
+  state.inspected_system_partition_creation.reset();
   state.inspected_boot_choices.reset();
   state.inspected_boot_execution.reset();
   state.inspected_efi_delete_plan.reset();
@@ -6077,6 +8629,67 @@ void start_boot_inspect(AppState& state) {
   }).detach();
 }
 
+void start_system_partition_creation_review(
+    AppState& state,
+    ytec::bootrepair::AutomaticBootRepairPlan plan,
+    const std::uint32_t windows_partition_number) {
+  state.operation_busy = true;
+  state.boot_execution_active = false;
+  state.repair_step = 2;
+  state.inspected_boot_plan.reset();
+  state.inspected_system_partition_creation.reset();
+  state.inspected_boot_choices.reset();
+  state.inspected_boot_execution.reset();
+  state.inspected_efi_delete_plan.reset();
+  state.inspected_boot_selections.clear();
+  state.boot_confirmation_token.clear();
+  SetWindowTextW(state.repair_token, L"");
+  SetWindowTextW(
+      state.repair_output,
+      L"選択したWindows volumeのVDS状態と最大縮小可能量を読み取り専用で確認し、"
+      L"新しいESP／Active領域のexact配置をpure reviewしています。\r\n"
+      L"この段階ではNTFS、パーティション表、BCD、NVRAMを変更しません。");
+  show_page_controls(state);
+  update_action_state(state);
+  InvalidateRect(state.window, nullptr, FALSE);
+  const HWND window = state.window;
+  std::thread([
+      window,
+      planned = std::move(plan),
+      windows_partition_number]() mutable {
+    auto payload = std::make_unique<BootInspectPayload>();
+    payload->output = format_automatic_boot_repair_plan(planned, nullptr);
+    auto platform = ytec::bootrepair::
+        make_windows_system_partition_creation_platform();
+    if (platform == nullptr) {
+      payload->error =
+          L"システム領域作成のMicrosoft VDS安全境界を初期化できません。";
+      post_payload(window, kBootInspectCompleteMessage, std::move(payload));
+      return;
+    }
+    auto observation = platform->observe_read_only(
+        planned.selected_identity, windows_partition_number);
+    if (!observation) {
+      payload->error = format_error(
+          observation.error(), &payload->error_presentation);
+      post_payload(window, kBootInspectCompleteMessage, std::move(payload));
+      return;
+    }
+    auto reviewed = ytec::bootrepair::review_system_partition_creation(
+        planned, windows_partition_number, observation.value());
+    if (!reviewed) {
+      payload->error = format_error(
+          reviewed.error(), &payload->error_presentation);
+      post_payload(window, kBootInspectCompleteMessage, std::move(payload));
+      return;
+    }
+    payload->output +=
+        format_system_partition_creation_review(reviewed.value());
+    payload->system_partition_creation = reviewed.take_value();
+    post_payload(window, kBootInspectCompleteMessage, std::move(payload));
+  }).detach();
+}
+
 void start_boot_review(
     AppState& state,
     ytec::bootrepair::AutomaticBootRepairPlan plan,
@@ -6084,6 +8697,7 @@ void start_boot_review(
   state.operation_busy = true;
   state.boot_execution_active = false;
   state.repair_step = 2;
+  state.inspected_system_partition_creation.reset();
   SetWindowTextW(
       state.repair_output,
       L"明示選択したWindows登録順をpure reviewへ束縛し、"
@@ -6226,6 +8840,135 @@ void start_boot_review(
 }
 
 void start_boot_execute(AppState& state) {
+  if (state.inspected_system_partition_creation.has_value()) {
+    if (state.operation_busy ||
+        state.boot_confirmation_token != L"OK" ||
+        control_text(state.repair_token) != L"OK") {
+      return;
+    }
+    const auto reviewed =
+        state.inspected_system_partition_creation.value();
+    auto admission_operation_id = make_operation_id(
+        L"WinPE system-partition creation resume-slot admission ID");
+    const std::array<std::wstring, 7U> admission_owned_fields{
+        L"system-partition-creation",
+        reviewed.windows_volume_name(),
+        std::to_wstring(reviewed.windows_partition().number),
+        std::to_wstring(reviewed.system_partition_size_bytes()),
+        std::to_wstring(reviewed.reclaim_bytes()),
+        std::to_wstring(reviewed.system_partition_offset_bytes()),
+        std::to_wstring(static_cast<unsigned int>(reviewed.system_role())),
+    };
+    const std::array<std::wstring_view, 7U> admission_fields{
+        admission_owned_fields[0],
+        admission_owned_fields[1],
+        admission_owned_fields[2],
+        admission_owned_fields[3],
+        admission_owned_fields[4],
+        admission_owned_fields[5],
+        admission_owned_fields[6],
+    };
+    auto resume_slot_admission = admission_operation_id
+        ? ytec::winpeapp::make_winpe_resume_slot_admission_plan(
+              admission_operation_id.take_value(),
+              ytec::operationcore::OperationKind::boot_repair,
+              std::nullopt,
+              reviewed.selected_identity(),
+              reviewed.reclaim_bytes(),
+              admission_fields)
+        : ytec::clonecore::Result<
+              ytec::operationcore::OperationPlan>::failure(
+              admission_operation_id.error());
+    if (!guard_new_product_operation_start(
+            state.window, state.repair_output, resume_slot_admission)) {
+      return;
+    }
+    state.operation_busy = true;
+    state.boot_execution_active = true;
+    state.repair_step = 3;
+    SetWindowTextW(
+        state.repair_output,
+        L"システム領域作成の実行直前再解析を行っています。\r\n"
+        L"安定ディスク識別、全パーティション、Windows Volume GUID、"
+        L"VDS状態、最大縮小可能量がレビューと完全一致した場合だけ、"
+        L"exact NTFS縮小とESP／Active領域作成を開始します。\r\n"
+        L"各段階を読戻し、失敗時は元のWindows extentへのrollbackを試みます。"
+        L"この確定区間は途中取消できません。");
+    show_page_controls(state);
+    update_action_state(state);
+    InvalidateRect(state.window, nullptr, FALSE);
+    const HWND window = state.window;
+    std::thread([window, reviewed]() {
+      auto payload = std::make_unique<BootExecutePayload>();
+      payload->system_partition_creation_stage = true;
+      ThreadSleepPrevention sleep_prevention;
+      if (!sleep_prevention.active()) {
+        payload->output =
+            L"システム領域作成中の自動スリープ防止を確立できないため、"
+            L"対象ディスクを変更せずに停止しました。";
+        post_payload(
+            window, kBootExecuteCompleteMessage, std::move(payload));
+        return;
+      }
+      const auto post_system_partition_creation = [&]() {
+        const auto sleep_prevention_release = sleep_prevention.release();
+        if (payload->success && sleep_prevention_release !=
+                ytec::clonecore::SleepPreventionReleaseState::released) {
+          payload->output +=
+              L"\r\n\r\n自動スリープ防止の解除を確認できません。"
+              L"この中間段階では完了後の電源操作を提示しません。";
+        }
+        post_payload(
+            window, kBootExecuteCompleteMessage, std::move(payload));
+      };
+      auto platform = ytec::bootrepair::
+          make_windows_system_partition_creation_platform();
+      if (platform == nullptr) {
+        payload->output =
+            L"システム領域作成のMicrosoft VDS安全境界を初期化できません。";
+        post_system_partition_creation();
+        return;
+      }
+      auto report = ytec::bootrepair::execute_system_partition_creation(
+          reviewed,
+          ytec::clonecore::TargetConfirmation{
+              .first_step_acknowledged = true,
+              .typed_token = L"OK",
+          },
+          *platform);
+      payload->output = format_system_partition_creation_report(report);
+      const bool committed =
+          report.outcome == ytec::bootrepair::
+              SystemPartitionCreationOutcome::committed &&
+          report.confirmation_verified &&
+          report.pre_mutation_revalidated && report.windows_shrunk &&
+          report.shrunken_layout_verified &&
+          report.system_partition_created_and_formatted &&
+          report.completed_plan_verified && !report.rollback_attempted &&
+          report.completed_plan.has_value();
+      payload->success = committed;
+      payload->partial = report.outcome == ytec::bootrepair::
+          SystemPartitionCreationOutcome::rollback_incomplete;
+      if (committed) {
+        payload->completed_creation_plan =
+            std::move(report.completed_plan);
+      } else if (report.outcome == ytec::bootrepair::
+                     SystemPartitionCreationOutcome::committed) {
+        payload->output +=
+            L"\r\n\r\n内部の必須完了フラグが一致しないため、起動修復へ進みません。";
+      }
+      if (report.primary_error.has_value()) {
+        payload->output += L"\r\n\r\n主失敗:\r\n" + format_error(
+            report.primary_error.value(), &payload->error_presentation);
+      }
+      if (report.rollback_error.has_value()) {
+        payload->output += L"\r\n\r\nrollback失敗:\r\n" +
+            format_error(report.rollback_error.value());
+      }
+      post_system_partition_creation();
+    }).detach();
+    return;
+  }
   if (state.operation_busy ||
       !state.inspected_boot_plan.has_value() ||
       !state.inspected_boot_choices.has_value() ||
@@ -6262,8 +9005,71 @@ void start_boot_execute(AppState& state) {
   }
   const std::wstring transaction_token =
       ytec::bootrepair::make_boot_repair_confirmation_token(
-          reviewed_choices.selected_identity(),
-          reviewed_choices.firmware());
+          reviewed_choices.selected_identity(), reviewed_choices.firmware());
+  std::wstring windows_binding;
+  for (std::size_t index = 0U;
+       index < reviewed_execution.requests_in_boot_priority.size();
+       ++index) {
+    const auto& request =
+        reviewed_execution.requests_in_boot_priority[index];
+    windows_binding +=
+        std::to_wstring(
+            reviewed_execution
+                .windows_partition_numbers_in_boot_priority[index]) +
+        L":" +
+        request.windows_root + L";";
+  }
+  auto admission_operation_id = make_operation_id(
+      L"WinPE automatic boot-repair resume-slot admission ID");
+  const std::array<std::wstring, 9U> admission_owned_fields{
+      L"automatic-boot-repair",
+      transaction_token,
+      L"windows-count=" +
+          std::to_wstring(reviewed_execution.requests_in_boot_priority.size()),
+      L"firmware=" + std::to_wstring(
+          static_cast<unsigned int>(reviewed_choices.firmware())),
+      L"store-policy=" + std::to_wstring(
+          static_cast<unsigned int>(reviewed_choices.bcd_store_policy())),
+      L"third-party-policy=" + std::to_wstring(
+          static_cast<unsigned int>(
+              reviewed_choices.third_party_efi_policy())),
+      L"nvram-policy=" + std::to_wstring(
+          static_cast<unsigned int>(reviewed_choices.nvram_policy())),
+      reviewed_efi_delete_plan.has_value()
+          ? L"reviewed-efi-delete"
+          : L"preserve-or-not-applicable-efi",
+      windows_binding,
+  };
+  const std::array<std::wstring_view, 9U> admission_fields{
+      admission_owned_fields[0],
+      admission_owned_fields[1],
+      admission_owned_fields[2],
+      admission_owned_fields[3],
+      admission_owned_fields[4],
+      admission_owned_fields[5],
+      admission_owned_fields[6],
+      admission_owned_fields[7],
+      admission_owned_fields[8],
+  };
+  auto resume_slot_admission = admission_operation_id
+      ? ytec::winpeapp::make_winpe_resume_slot_admission_plan(
+            admission_operation_id.take_value(),
+            ytec::operationcore::OperationKind::boot_repair,
+            std::nullopt,
+            reviewed_choices.selected_identity(),
+            reviewed_choices.selected_identity().size_bytes,
+            admission_fields)
+      : ytec::clonecore::Result<ytec::operationcore::OperationPlan>::failure(
+            admission_operation_id.error());
+  if (!guard_new_product_operation_start(
+          state.window, state.repair_output, resume_slot_admission)) {
+    return;
+  }
+  const std::uint64_t completion_power_binding =
+      ytec::winpeapp::take_winpe_completion_power_operation_binding(
+          state.next_completion_power_operation_binding);
+  const std::wstring completion_power_target =
+      format_completion_disk_target(reviewed_choices.selected_identity());
   state.operation_busy = true;
   state.boot_execution_active = true;
   state.repair_step = 3;
@@ -6282,23 +9088,53 @@ void start_boot_execute(AppState& state) {
   const HWND window = state.window;
   std::thread([
       window,
-      reviewed_choices,
-      reviewed_execution,
-      reviewed_efi_delete_plan,
-      transaction_token]() {
+       reviewed_choices,
+       reviewed_execution,
+       reviewed_efi_delete_plan,
+       completion_power_binding,
+       completion_power_target,
+       transaction_token]() {
     auto payload = std::make_unique<BootExecutePayload>();
+    payload->completion_power_target = completion_power_target;
+    ThreadSleepPrevention sleep_prevention;
+    if (!sleep_prevention.active()) {
+      payload->output =
+          L"起動修復中の自動スリープ防止を確立できないため、"
+          L"対象ディスクを変更せずに停止しました。";
+      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      return;
+    }
+    const auto post_boot_completion = [&]() {
+      const auto sleep_prevention_release = sleep_prevention.release();
+      payload->completion_power_proof =
+          ytec::winpeapp::make_winpe_completion_power_proof(
+              ytec::winpeapp::WinPeCompletionPowerOperation::boot_repair,
+              completion_operation_outcome(
+                  payload->success,
+                  payload->success && payload->partial),
+              payload->success && !payload->partial,
+              sleep_prevention_release,
+              completion_power_binding);
+      if (payload->success && sleep_prevention_release !=
+              ytec::clonecore::SleepPreventionReleaseState::released) {
+        payload->output +=
+            L"\r\n\r\n自動スリープ防止の解除を確認できないため、"
+            L"完了後の再起動／シャットダウンは提示しません。";
+      }
+      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+    };
     auto planner =
         ytec::bootrepair::make_windows_automatic_boot_repair_plan_service();
     if (planner == nullptr) {
       payload->output = L"実行直前の自動再解析を初期化できません。";
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     auto observed_plan = planner->plan(reviewed_choices.selected_identity());
     if (!observed_plan) {
       payload->output = format_error(
           observed_plan.error(), &payload->error_presentation);
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     auto observed_choices = ytec::bootrepair::
@@ -6307,7 +9143,7 @@ void start_boot_execute(AppState& state) {
     if (!observed_choices) {
       payload->output = format_error(
           observed_choices.error(), &payload->error_presentation);
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     auto observed_execution = ytec::winpeapp::
@@ -6316,7 +9152,7 @@ void start_boot_execute(AppState& state) {
     if (!observed_execution) {
       payload->output = format_error(
           observed_execution.error(), &payload->error_presentation);
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     auto bound_execution = carry_reviewed_boot_repair_winre_images(
@@ -6324,7 +9160,7 @@ void start_boot_execute(AppState& state) {
     if (!bound_execution) {
       payload->output = format_error(
           bound_execution.error(), &payload->error_presentation);
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     auto provider =
@@ -6335,7 +9171,7 @@ void start_boot_execute(AppState& state) {
               *provider);
     if (service == nullptr) {
       payload->output = L"起動修復の安全実行境界を初期化できません。";
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     std::vector<ytec::bootrepair::BootRepairTargetSelection> inspected;
@@ -6347,7 +9183,7 @@ void start_boot_execute(AppState& state) {
       if (!one) {
         payload->output = format_error(
             one.error(), &payload->error_presentation);
-        post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+        post_boot_completion();
         return;
       }
       inspected.push_back(one.take_value());
@@ -6361,7 +9197,7 @@ void start_boot_execute(AppState& state) {
     if (!inspection_status) {
       payload->output = format_error(
           inspection_status.error(), &payload->error_presentation);
-      post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+      post_boot_completion();
       return;
     }
     const bool partial =
@@ -6805,18 +9641,21 @@ void start_boot_execute(AppState& state) {
           result.error(), &payload->error_presentation);
       payload->output += efi_transaction_summary;
     }
-    post_payload(window, kBootExecuteCompleteMessage, std::move(payload));
+    post_boot_completion();
   }).detach();
 }
 
 void cancel_boot_review(AppState& state) {
-  if (state.operation_busy || !state.inspected_boot_execution.has_value()) {
+  if (state.operation_busy ||
+      (!state.inspected_system_partition_creation.has_value() &&
+       !state.inspected_boot_execution.has_value())) {
     return;
   }
   invalidate_boot_review(state);
   SetWindowTextW(
       state.repair_output,
-      L"確認済みの起動修復計画を破棄しました。ディスクは変更していません。\r\n"
+      L"確認済みのシステム領域作成／起動修復計画を破棄しました。"
+      L"ディスクは変更していません。\r\n"
       L"再開する場合は、対象ディスクを選んで自動解析をやり直してください。");
   update_action_state(state);
   InvalidateRect(state.window, nullptr, FALSE);
@@ -6970,6 +9809,8 @@ void paint_clone_page(const AppState& state, HDC dc) {
       ? L"救出クローン"
       : route == CloneRoute::mbr_to_gpt
       ? L"MBR→GPT移行"
+      : route == CloneRoute::shrink
+      ? L"縮小移行"
       : L"クローン";
   draw_stepper(
       state,
@@ -7206,6 +10047,9 @@ void paint_clone_page(const AppState& state, HDC dc) {
             ? L"救出モードは縮小・形式変換・起動修復を行わず、結果を常に「一部欠損の可能性あり」として扱います。"
             : route == CloneRoute::mbr_to_gpt
             ? L"MBR→GPTは別ディスクだけを対象にし、1～3基本領域と一意なActive領域を確認してからコピー先だけを変換します。"
+            : route == CloneRoute::shrink
+            ? L"縮小移行はWinPE専用です。GPT/512B/完全復号済みNTFSを再構築し、"
+              L"未対応FSのデータ領域は元サイズRAWで保持します。4Knや安全に特定・検証できない構成は停止します。"
             : L"通常モードは読取りエラーで停止します。読取り異常が疑われる場合だけ救出モードを選択してください。",
         guidance,
         state.small_font,
@@ -7910,8 +10754,8 @@ void initialize_controls(AppState& state) {
       state,
       L"EDIT",
       L"コピー元とコピー先を選択してください。\r\n"
-      L"方式は「通常」「救出」「MBR→GPT（別ディスク）」から明示選択します。\r\n"
-      L"救出と形式変換は同時に実行できません。\r\n"
+      L"方式は「通常」「救出」「MBR→GPT（別ディスク）」「縮小移行」から明示選択します。\r\n"
+      L"救出・形式変換・縮小移行は互いに同時実行できません。\r\n"
       L"読取り専用確認の後、このPE内で直接クローンを実行できます。",
       WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL |
       ES_READONLY,
@@ -8244,6 +11088,12 @@ void initialize_controls(AppState& state) {
       CB_ADDSTRING,
       0,
       reinterpret_cast<LPARAM>(L"MBR→GPT（別ディスク）"));
+  SendMessageW(
+      state.clone_rescue_mode,
+      CB_ADDSTRING,
+      0,
+      reinterpret_cast<LPARAM>(
+          L"縮小移行（WinPE / GPT / 512B）"));
   SendMessageW(state.clone_rescue_mode, CB_SETCURSEL, 0, 0);
   SendMessageW(
       state.image_verification_mode,
@@ -8273,23 +11123,172 @@ void initialize_controls(AppState& state) {
   layout_controls(state);
 }
 
+[[nodiscard]] bool inspect_image_create_resume_on_startup(AppState& state) {
+  auto inspected = inspect_product_image_create_resume();
+  if (!inspected) {
+    state.image_resume_platform_ready = false;
+    state.image_resume_slot_present = true;
+    state.restore_resume_platform_ready = false;
+    MessageBoxW(
+        state.window,
+        L"単一再開slotを通常イメージ作成用として安全に分類できません。\r\n"
+        L"unknown、corrupt、orphan、relink、またはidentity不一致は自動修復／削除せず保持し、"
+        L"全ての新しい書込み操作を開始しません。",
+        L"イメージ作成の再開情報を確認できません",
+        MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  state.image_resume_platform_ready = true;
+  if (inspected.value().object_state == ytec::operationcore::
+          PersistentPeExactImageCreateObjectState::no_slot ||
+      inspected.value().object_state == ytec::operationcore::
+          PersistentPeExactImageCreateObjectState::other_capability) {
+    state.image_resume_slot_present = false;
+    state.image_resume_requested = false;
+    state.reviewed_image_resume_observation.reset();
+    return true;
+  }
+
+  auto summary = ytec::winpeapp::
+      format_direct_image_create_resume_startup_review_v1(
+          inspected.value());
+  if (!summary || !inspected.value().binding ||
+      !inspected.value().continuity || !inspected.value().source) {
+    state.image_resume_platform_ready = false;
+    state.image_resume_slot_present = true;
+    state.restore_resume_platform_ready = false;
+    MessageBoxW(
+        state.window,
+        L"persistent exactイメージ作成の安全な要約または完全bindingを作れません。\r\n"
+        L"再開情報と所有ファイルは削除せず保持し、全ての新しい書込み操作を開始しません。",
+        L"イメージ作成の再開情報を表示できません",
+        MB_OK | MB_ICONWARNING);
+    return false;
+  }
+
+  state.image_resume_slot_present = true;
+  state.reviewed_image_resume_observation = inspected.value();
+  // The same fixed slot has been authenticated.  Restore routing must not try
+  // to reinterpret capability 8, while every new route remains blocked by
+  // the global fresh observation gate.
+  state.restore_resume_platform_ready = true;
+  const int decision = MessageBoxW(
+      state.window,
+      summary.value().c_str(),
+      L"前回中断した通常イメージ作成があります",
+      MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+  if (decision == IDYES) {
+    state.image_resume_requested = true;
+    state.page = Page::image_create;
+    state.image_step = 1;
+    SetWindowTextW(
+        state.image_destination, inspected.value().final_path.c_str());
+    SendMessageW(state.image_rescue_mode, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(
+        state.image_encryption,
+        BM_SETCHECK,
+        inspected.value().continuity->encrypted
+            ? BST_CHECKED
+            : BST_UNCHECKED,
+        0);
+    SendMessageW(
+        state.image_verification_mode,
+        CB_SETCURSEL,
+        inspected.value().continuity->verification_mode ==
+                ytec::imageformat::TsumugiCreateVerificationMode::complete
+            ? 0
+            : 1,
+        0);
+    SetWindowTextW(
+        state.image_output,
+        L"再開準備を選びました。同じSourceを読み取り専用一覧から再選択し、"
+        L"内容確認でsource状態・保存先・partial/journal File ID・計画を再証明します。\r\n"
+        L"暗号化されている場合、保存していないパスワードを再入力してください。");
+    show_page_controls(state);
+    update_action_state(state);
+    return false;
+  }
+  state.image_resume_requested = false;
+  if (decision != IDNO) {
+    return false;
+  }
+  if (inspected.value().object_state != ytec::operationcore::
+          PersistentPeExactImageCreateObjectState::staged) {
+    MessageBoxW(
+        state.window,
+        L"完成名へ公開済みのFile IDは破棄できません。\r\n"
+        L"再開を選び、完成 .tsumugi の全量検証とjournal／checkpoint整理を完了してください。"
+        L"既存の別ファイルを採用または上書きすることはありません。",
+        L"完全検証と整理の再開が必要です",
+        MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  const int discard_confirm = MessageBoxW(
+      state.window,
+      L"アプリが所有する、表示済みFile IDと一致する .tsumugi.partial、"
+      L"private journal、active.checkpointだけをfresh exact-open後に破棄します。\r\n"
+      L"完成 .tsumugi や別ファイルは削除しません。\r\n\r\n"
+      L"再開情報を破棄しますか？",
+      L"イメージ作成の再開情報を最終確認",
+      MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+  if (discard_confirm != IDYES) {
+    return false;
+  }
+  auto storage = ytec::winpeapp::
+      make_direct_image_create_windows_resume_storage_platform_v1();
+  auto platform = storage
+      ? ytec::operationcore::
+            make_current_executable_windows_resume_slot_platform(
+                storage.value().prove_data_backing)
+      : ytec::clonecore::Result<std::unique_ptr<
+            ytec::operationcore::IResumeSlotPlatform>>::failure(
+            storage.error());
+  auto discarded = platform
+      ? ytec::winpeapp::discard_direct_image_create_resume_v1(
+            *inspected.value().binding, *platform.value())
+      : ytec::clonecore::Status::failure(platform.error());
+  if (!discarded) {
+    state.image_resume_platform_ready = false;
+    MessageBoxW(
+        state.window,
+        L"表示後にbindingまたはFile IDが変化したため、何も削除せず保持しました。\r\n"
+        L"全ての新しい書込み操作を開始しません。",
+        L"再開情報を破棄できません",
+        MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  state.image_resume_slot_present = false;
+  state.reviewed_image_resume_observation.reset();
+  MessageBoxW(
+      state.window,
+      L"exact bindingが一致したアプリ所有のpartial、journal、checkpointだけを破棄しました。\r\n"
+      L"完成 .tsumugi、Source、その他のファイルは変更していません。",
+      L"イメージ作成の再開情報を破棄しました",
+      MB_OK | MB_ICONINFORMATION);
+  return false;
+}
+
 void inspect_restore_resume_on_startup(AppState& state) {
 #ifdef YTEC_UI_ACCEPTANCE_BUILD
   // The host-side acceptance executable has no product media marker and must
   // never inspect the host's portable data. Product wiring remains compiled
   // unchanged into ytec-winpe-gui.
+  state.image_resume_platform_ready = true;
   state.restore_resume_platform_ready = true;
   return;
 #else
+  if (!inspect_image_create_resume_on_startup(state)) {
+    return;
+  }
   auto storage = ytec::winpeapp::
       make_direct_image_restore_windows_storage_platform_v1();
   if (!storage) {
     state.restore_resume_platform_ready = false;
     MessageBoxW(
         state.window,
-        L"永続再開用の保存先を安全に確認できません。\r\n"
-        L"通常／救出イメージのディスク全体復元は開始しません。\r\n"
-        L"個別パーティション復元などの非対応経路には影響しません。",
+        L"単一再開slotの保存先を安全に確認できません。\r\n"
+        L"slotが空であることを証明できないため、クローン、イメージ作成／復元、"
+        L"媒体作成、起動修復を含む全ての新規書込み操作を開始しません。",
         L"復元の再開情報を確認できません",
         MB_OK | MB_ICONWARNING);
     return;
@@ -8302,7 +11301,7 @@ void inspect_restore_resume_on_startup(AppState& state) {
     MessageBoxW(
         state.window,
         L"実行ファイル隣の data を永続再開用として確認できません。\r\n"
-        L"通常／救出イメージのディスク全体復元は開始しません。",
+        L"slotが空であることを証明できないため、全ての新規書込み操作を開始しません。",
         L"復元の再開情報を確認できません",
         MB_OK | MB_ICONWARNING);
     return;
@@ -8323,7 +11322,8 @@ void inspect_restore_resume_on_startup(AppState& state) {
     MessageBoxW(
         state.window,
         L"再開情報が不明または破損しているため、自動削除せず保持しました。\r\n"
-        L"通常／救出イメージのディスク全体復元は開始しません。",
+        L"orphan、identity不一致を含め安全に空と証明できない状態では、"
+        L"全ての新規書込み操作を開始しません。",
         L"復元の再開情報を確認できません",
         MB_OK | MB_ICONWARNING);
     return;
@@ -8343,7 +11343,8 @@ void inspect_restore_resume_on_startup(AppState& state) {
     MessageBoxW(
         state.window,
         L"再開情報の安全な要約を作成できないため、自動削除せず保持しました。\r\n"
-        L"通常／救出イメージのディスク全体復元は開始しません。",
+        L"永続exact／rescue復元として安全に表示できないslotは再開せず、"
+        L"全ての新規書込み操作も開始しません。",
         L"復元の再開情報を確認できません",
         MB_OK | MB_ICONWARNING);
     return;
@@ -8552,6 +11553,10 @@ LRESULT CALLBACK window_proc(
                   ? L"MBR→GPT（別ディスク）を選択しました。"
                     L"コピー元MBRは変更せず、コピー先だけを消去・変換します。"
                     L"「読取り確認」を行ってください。"
+                  : route == CloneRoute::shrink
+                  ? L"縮小移行を選択しました。正式なWinPE上でコピー元をread-onlyに固定し、"
+                    L"自動解析後にパーティションと余剰容量配分を選択します。"
+                    L"「読取り確認」を行ってください。"
                   : L"通常モードを選択しました。読取りエラー時は停止します。"
                     L"「読取り確認」をもう一度行ってください。");
           update_action_state(*state);
@@ -8737,6 +11742,23 @@ LRESULT CALLBACK window_proc(
         state->dashboard =
             ytec::winpeapp::build_dashboard_view(state->inventory.value());
         populate_disk_controls(*state);
+        if (state->image_resume_requested &&
+            state->reviewed_image_resume_observation.has_value()) {
+          const bool source_selected =
+              state->reviewed_image_resume_observation->source.has_value() &&
+              selected_disk_number(state->image_source) ==
+                  std::optional<std::uint32_t>(
+                      state->reviewed_image_resume_observation->source
+                          ->disk_number);
+          SetWindowTextW(
+              state->image_output,
+              source_selected
+                  ? L"前回と同じdisk number候補を選択しました。"
+                    L"「内容を確認」でstable identity、source状態、保存先、"
+                    L"partial/journal File ID、計画を再証明してください。"
+                  : L"前回のSource候補を現在の一覧で選択できません。"
+                    L"checkpointと所有ファイルは変更せず保持しました。");
+        }
       } else {
         state->inventory.reset();
         state->dashboard =
@@ -8758,6 +11780,49 @@ LRESULT CALLBACK window_proc(
       }
       return 0;
     }
+    case kCloneShrinkInspectionCompleteMessage: {
+      std::unique_ptr<CloneShrinkInspectionPayload> payload(
+          reinterpret_cast<CloneShrinkInspectionPayload*>(lparam));
+      state->operation_busy = false;
+      if (payload == nullptr || !payload->inspection.has_value()) {
+        invalidate_clone_review(
+            *state,
+            payload == nullptr || payload->output.empty()
+                ? L"縮小移行の自動解析結果を取得できないため、"
+                  L"コピー先を変更せず停止しました。"
+                : payload->output);
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, FALSE);
+        if (payload != nullptr) {
+          show_captured_error(window, payload->error_presentation);
+        }
+        return 0;
+      }
+
+      SetWindowTextW(state->clone_output, payload->output.c_str());
+      const auto choice = show_direct_shrink_partition_review_dialog(
+          window, state->body_font, *payload->inspection);
+      if (!choice.has_value()) {
+        invalidate_clone_review(
+            *state,
+            L"パーティション選択と余剰容量設定を取り消しました。\r\n"
+            L"コピー先は変更していません。"
+            L"コピー元は安全のためOS-level read-onlyのままです。");
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+
+      payload->request.selected_source_table_indexes =
+          choice->selected_source_table_indexes;
+      payload->request.surplus_allocation = choice->surplus_allocation;
+      payload->request.surplus_target_source_table_index =
+          choice->surplus_target_source_table_index;
+      auto binding = payload->inspection->binding;
+      start_clone_shrink_plan_after_review(
+          *state, std::move(payload->request), std::move(binding));
+      return 0;
+    }
     case kCloneCheckCompleteMessage: {
       std::unique_ptr<CloneCheckPayload> payload(
           reinterpret_cast<CloneCheckPayload*>(lparam));
@@ -8766,15 +11831,23 @@ LRESULT CALLBACK window_proc(
           payload != nullptr && payload->execution_ready &&
           (payload->route == CloneRoute::rescue
                ? payload->reviewed_rescue_plan.has_value() &&
-                   !payload->reviewed_plan.has_value() &&
-                   !payload->reviewed_mbr2gpt_plan.has_value()
+                    !payload->reviewed_plan.has_value() &&
+                    !payload->reviewed_mbr2gpt_plan.has_value() &&
+                    payload->reviewed_direct_shrink_plan == nullptr
                : payload->route == CloneRoute::mbr_to_gpt
                ? payload->reviewed_mbr2gpt_plan.has_value() &&
-                   !payload->reviewed_plan.has_value() &&
-                   !payload->reviewed_rescue_plan.has_value()
+                    !payload->reviewed_plan.has_value() &&
+                    !payload->reviewed_rescue_plan.has_value() &&
+                    payload->reviewed_direct_shrink_plan == nullptr
+               : payload->route == CloneRoute::shrink
+               ? payload->reviewed_direct_shrink_plan != nullptr &&
+                    !payload->reviewed_plan.has_value() &&
+                    !payload->reviewed_rescue_plan.has_value() &&
+                    !payload->reviewed_mbr2gpt_plan.has_value()
                : payload->reviewed_plan.has_value() &&
-                   !payload->reviewed_rescue_plan.has_value() &&
-                   !payload->reviewed_mbr2gpt_plan.has_value());
+                    !payload->reviewed_rescue_plan.has_value() &&
+                    !payload->reviewed_mbr2gpt_plan.has_value() &&
+                    payload->reviewed_direct_shrink_plan == nullptr);
       state->reviewed_clone_plan =
           state->clone_execution_ready && payload->reviewed_plan.has_value()
           ? std::move(payload->reviewed_plan)
@@ -8789,6 +11862,10 @@ LRESULT CALLBACK window_proc(
               payload->reviewed_mbr2gpt_plan.has_value()
           ? std::move(payload->reviewed_mbr2gpt_plan)
           : std::nullopt;
+      state->reviewed_direct_shrink_clone_plan =
+          state->clone_execution_ready
+          ? std::move(payload->reviewed_direct_shrink_plan)
+          : nullptr;
       state->clone_confirmation_token =
           state->clone_execution_ready ? L"OK" : L"";
       state->clone_step = state->clone_execution_ready ? 3 : 1;
@@ -8830,6 +11907,7 @@ LRESULT CALLBACK window_proc(
       state->reviewed_clone_plan.reset();
       state->reviewed_rescue_clone_plan.reset();
       state->reviewed_mbr2gpt_clone_plan.reset();
+      state->reviewed_direct_shrink_clone_plan.reset();
       state->clone_cancellation.reset();
       state->clone_pause_controller.reset();
       state->clone_confirmation_token.clear();
@@ -8853,6 +11931,14 @@ LRESULT CALLBACK window_proc(
               : L"\r\n\r\n完了扱いにしていません。"
                 L"コピー先は可能な限りoffline、コピー元はread-onlyのまま保護しています。"
                 L"対象を取り違えず診断してください。";
+        } else if (payload->route == CloneRoute::shrink) {
+          text += payload->success
+              ? L"\r\n\r\n必須証拠検証完了・換装待ちです。"
+                L"コピー先はoffline、コピー元はOS-level read-onlyのままです。"
+                L"電源を切り、コピー元を外してから実機起動を確認してください。"
+              : L"\r\n\r\n縮小移行を完了扱いにしていません。"
+                L"コピー先は未変更、または書込み開始後ならabortしてofflineのまま、"
+                L"コピー元はOS-level read-onlyのまま保護されます。";
         } else {
           text += payload->success
               ? L"\r\n\r\n検証完了・換装待ちです。"
@@ -8867,6 +11953,19 @@ LRESULT CALLBACK window_proc(
       InvalidateRect(window, nullptr, FALSE);
       if (payload != nullptr) {
         show_captured_error(window, payload->error_presentation);
+        const std::wstring_view operation_name =
+            payload->route == CloneRoute::mbr_to_gpt
+            ? L"MBR→GPT別ディスク移行"
+            : payload->route == CloneRoute::shrink
+            ? L"WinPE縮小移行クローン"
+            : payload->route == CloneRoute::rescue
+            ? L"救出クローン"
+            : L"直接クローン";
+        static_cast<void>(offer_winpe_completion_power_action(
+            *state,
+            payload->completion_power_proof,
+            operation_name,
+            payload->completion_power_target));
       }
       return 0;
     }
@@ -8888,6 +11987,7 @@ LRESULT CALLBACK window_proc(
       state->image_progress_active = false;
       state->image_execution_ready = false;
       state->reviewed_image_source.reset();
+      state->reviewed_image_partition_selection.reset();
       state->reviewed_image_path.clear();
       state->reviewed_image_replace_existing = false;
       state->reviewed_image_encrypted = false;
@@ -8895,6 +11995,15 @@ LRESULT CALLBACK window_proc(
       state->reviewed_image_verification_mode =
           ytec::imageformat::TsumugiCreateVerificationMode::complete;
       state->reviewed_image_password.reset();
+      if (payload != nullptr && payload->persistent_resume_attempt) {
+        state->image_resume_platform_ready =
+            payload->resume_platform_ready;
+        state->image_resume_slot_present = payload->resume_slot_present;
+        state->reviewed_image_resume_observation =
+            payload->resume_observation_after_operation;
+        state->image_resume_requested = payload->resume_slot_present &&
+            payload->resume_observation_after_operation.has_value();
+      }
       state->image_cancellation.reset();
       state->image_pause_controller.reset();
       SetWindowTextW(state->image_token, L"");
@@ -8907,6 +12016,14 @@ LRESULT CALLBACK window_proc(
             ? L"\r\n\r\n完成名へ確定済みです。復元前にも完全検証します。"
             : L"\r\n\r\n完了扱いにしていません。"
               L"コピー元はread-onlyのまま保護されている場合があります。";
+        if (!payload->success && payload->persistent_resume_attempt &&
+            payload->resume_slot_present) {
+          text += payload->resume_observation_after_operation.has_value()
+              ? L"\r\n確認済みのpartial/journalとactive.checkpointを保持しました。"
+                L"同じSource・保存先を再選択し、パスワードを再入力して再開できます。"
+              : L"\r\n再開情報の安全な再観測に失敗したため、再起動後の確認まで"
+                L"新しい書込み操作を開始しないでください。";
+        }
         SetWindowTextW(state->image_output, text.c_str());
       } else {
         SetWindowTextW(
@@ -8918,6 +12035,11 @@ LRESULT CALLBACK window_proc(
       InvalidateRect(window, nullptr, FALSE);
       if (payload != nullptr) {
         show_captured_error(window, payload->error_presentation);
+        static_cast<void>(offer_winpe_completion_power_action(
+            *state,
+            payload->completion_power_proof,
+            L".tsumugiイメージ作成",
+            payload->completion_power_target));
       }
       return 0;
     }
@@ -9050,6 +12172,11 @@ LRESULT CALLBACK window_proc(
       InvalidateRect(window, nullptr, FALSE);
       if (payload != nullptr) {
         show_captured_error(window, payload->error_presentation);
+        static_cast<void>(offer_winpe_completion_power_action(
+            *state,
+            payload->completion_power_proof,
+            L".tsumugiイメージ復元",
+            payload->completion_power_target));
       }
       return 0;
     }
@@ -9059,8 +12186,37 @@ LRESULT CALLBACK window_proc(
       state->operation_busy = false;
       state->boot_execution_active = false;
       if (payload != nullptr && payload->plan.has_value() &&
+          !payload->system_partition_creation.has_value() &&
           !payload->choices.has_value() &&
           !payload->execution.has_value() && payload->error.empty()) {
+        if (payload->plan->system_partition_create_plan_needed) {
+          const auto selected_windows =
+              prompt_system_partition_creation_windows_choice(
+                  window, payload->plan.value());
+          if (selected_windows.has_value()) {
+            auto plan = std::move(payload->plan.value());
+            start_system_partition_creation_review(
+                *state, std::move(plan), selected_windows.value());
+          } else {
+            state->repair_step = 1;
+            state->inspected_boot_plan.reset();
+            state->inspected_system_partition_creation.reset();
+            state->inspected_boot_choices.reset();
+            state->inspected_boot_execution.reset();
+            state->inspected_efi_delete_plan.reset();
+            state->inspected_boot_selections.clear();
+            state->boot_confirmation_token.clear();
+            std::wstring output = payload->output;
+            output +=
+                L"\r\n\r\nシステム領域作成の対象／追加確認を確定しなかったため、"
+                L"ディスクは変更していません。";
+            SetWindowTextW(state->repair_output, output.c_str());
+            show_page_controls(*state);
+            update_action_state(*state);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          return 0;
+        }
         const auto windows_choice =
             prompt_automatic_boot_repair_windows_choice(
                 window, payload->plan.value());
@@ -9078,6 +12234,7 @@ LRESULT CALLBACK window_proc(
         } else {
           state->repair_step = 1;
           state->inspected_boot_plan.reset();
+          state->inspected_system_partition_creation.reset();
           state->inspected_boot_choices.reset();
           state->inspected_boot_execution.reset();
           state->inspected_efi_delete_plan.reset();
@@ -9094,6 +12251,27 @@ LRESULT CALLBACK window_proc(
         }
         return 0;
       }
+      if (payload != nullptr &&
+          payload->system_partition_creation.has_value() &&
+          !payload->plan.has_value() && !payload->choices.has_value() &&
+          !payload->execution.has_value() && payload->error.empty()) {
+        state->inspected_boot_plan.reset();
+        state->inspected_system_partition_creation =
+            std::move(payload->system_partition_creation);
+        state->inspected_boot_choices.reset();
+        state->inspected_boot_execution.reset();
+        state->inspected_efi_delete_plan.reset();
+        state->inspected_boot_selections.clear();
+        state->boot_confirmation_token = L"OK";
+        state->repair_step = 3;
+        std::wstring output = payload->output;
+        output += L"\r\n\r\n最終確認語: OK";
+        SetWindowTextW(state->repair_output, output.c_str());
+        show_page_controls(*state);
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (payload != nullptr && payload->plan.has_value() &&
           payload->choices.has_value() &&
           payload->execution.has_value() &&
@@ -9101,6 +12279,7 @@ LRESULT CALLBACK window_proc(
           (payload->execution->third_party_efi_delete_requested ==
            payload->efi_delete_plan.has_value())) {
         state->inspected_boot_plan = std::move(payload->plan);
+        state->inspected_system_partition_creation.reset();
         state->inspected_boot_choices = std::move(payload->choices);
         state->inspected_boot_execution = std::move(payload->execution);
         state->inspected_efi_delete_plan =
@@ -9117,6 +12296,7 @@ LRESULT CALLBACK window_proc(
       } else {
         state->repair_step = 1;
         state->inspected_boot_plan.reset();
+        state->inspected_system_partition_creation.reset();
         state->inspected_boot_choices.reset();
         state->inspected_boot_execution.reset();
         state->inspected_efi_delete_plan.reset();
@@ -9167,6 +12347,60 @@ LRESULT CALLBACK window_proc(
           reinterpret_cast<BootExecutePayload*>(lparam));
       state->operation_busy = false;
       state->boot_execution_active = false;
+      if (payload != nullptr && payload->system_partition_creation_stage) {
+        state->inspected_boot_plan.reset();
+        state->inspected_system_partition_creation.reset();
+        state->inspected_boot_choices.reset();
+        state->inspected_boot_execution.reset();
+        state->inspected_efi_delete_plan.reset();
+        state->inspected_boot_selections.clear();
+        state->boot_confirmation_token.clear();
+        SendMessageW(
+            state->repair_acknowledge,
+            BM_SETCHECK,
+            BST_UNCHECKED,
+            0);
+        SetWindowTextW(state->repair_token, L"");
+        if (payload->success &&
+            payload->completed_creation_plan.has_value()) {
+          auto plan = std::move(payload->completed_creation_plan.value());
+          SetWindowTextW(state->repair_output, payload->output.c_str());
+          const auto windows_choice =
+              prompt_automatic_boot_repair_windows_choice(window, plan);
+          const auto efi_choice = windows_choice.has_value()
+              ? prompt_automatic_boot_repair_efi_choice(
+                    window, plan, windows_choice.value())
+              : std::nullopt;
+          const auto choice = efi_choice.has_value()
+              ? prompt_automatic_boot_repair_nvram_choice(
+                    window, plan, efi_choice.value())
+              : std::nullopt;
+          if (choice.has_value()) {
+            start_boot_review(*state, std::move(plan), choice.value());
+            return 0;
+          }
+          state->repair_step = 1;
+          std::wstring output = payload->output;
+          output +=
+              L"\r\n\r\n新しいシステム領域は作成・読戻し済みです。"
+              L"後続のWindows登録／NVRAM方針を確定しなかったため、"
+              L"BCD、WinRE、NVRAMは変更していません。"
+              L"自動解析から安全に再開できます。";
+          SetWindowTextW(state->repair_output, output.c_str());
+        } else {
+          state->repair_step = 1;
+          std::wstring output = payload->output;
+          output += payload->partial
+              ? L"\r\n\r\nrollback未確認のため、後続の起動修復を開始しません。"
+              : L"\r\n\r\n後続の起動修復を開始していません。";
+          SetWindowTextW(state->repair_output, output.c_str());
+        }
+        show_page_controls(*state);
+        update_action_state(*state);
+        InvalidateRect(window, nullptr, FALSE);
+        show_captured_error(window, payload->error_presentation);
+        return 0;
+      }
       if (payload != nullptr) {
         state->repair_step = payload->success ? 4 : 1;
         std::wstring output = payload->output;
@@ -9178,6 +12412,7 @@ LRESULT CALLBACK window_proc(
         state->repair_step = 1;
       }
       state->inspected_boot_plan.reset();
+      state->inspected_system_partition_creation.reset();
       state->inspected_boot_choices.reset();
       state->inspected_boot_execution.reset();
       state->inspected_efi_delete_plan.reset();
@@ -9194,6 +12429,11 @@ LRESULT CALLBACK window_proc(
       InvalidateRect(window, nullptr, FALSE);
       if (payload != nullptr) {
         show_captured_error(window, payload->error_presentation);
+        static_cast<void>(offer_winpe_completion_power_action(
+            *state,
+            payload->completion_power_proof,
+            L"起動修復",
+            payload->completion_power_target));
       }
       return 0;
     }
@@ -9220,8 +12460,11 @@ LRESULT CALLBACK window_proc(
                     ? L"イメージ復元が安全に停止または完了するまで画面を閉じられません。"
                     : L"イメージの完全検証が停止または完了するまで画面を閉じられません。"
                 : state->boot_execution_active
-                ? L"BCD安全トランザクションが完了するまで画面を閉じられません。"
-                  L"確定処理は途中取消できません。"
+                ? state->inspected_system_partition_creation.has_value()
+                    ? L"システム領域作成トランザクションが完了するまで画面を閉じられません。"
+                      L"確定処理は途中取消できません。"
+                    : L"BCD安全トランザクションが完了するまで画面を閉じられません。"
+                      L"確定処理は途中取消できません。"
                 : L"実行中の確認処理が完了するまで画面を閉じられません。",
             L"処理中です",
             MB_OK | MB_ICONINFORMATION);
@@ -9251,6 +12494,13 @@ int WINAPI wWinMain(
       DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
   SetDefaultDllDirectories(
       LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
+  INITCOMMONCONTROLSEX common_controls{
+      .dwSize = sizeof(INITCOMMONCONTROLSEX),
+      .dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+  };
+  if (InitCommonControlsEx(&common_controls) == FALSE) {
+    return 1;
+  }
 
   WNDCLASSEXW window_class{};
   window_class.cbSize = sizeof(window_class);

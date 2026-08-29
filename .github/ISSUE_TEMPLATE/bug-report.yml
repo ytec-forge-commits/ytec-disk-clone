@@ -17,7 +17,7 @@ body:
     attributes:
       label: Version or commit
       description: Use the displayed app version or a Git commit ID.
-      placeholder: 0.2.0-dev or commit ID
+      placeholder: 1.0.0-internal-beta or commit ID
     validations:
       required: true
 

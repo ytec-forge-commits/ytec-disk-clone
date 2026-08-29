@@ -18,6 +18,7 @@ namespace {
 constexpr std::uint16_t kCheckpointMajor = 1U;
 constexpr std::uint16_t kCheckpointMinorV1 = 0U;
 constexpr std::uint16_t kCheckpointMinorV2 = 1U;
+constexpr std::uint16_t kCheckpointMinorV3 = 2U;
 constexpr std::size_t kDigestBytes = Sha256Digest{}.size();
 constexpr std::size_t kPreparationSectorWireBytes =
     sizeof(std::uint64_t) + sizeof(std::uint64_t) + kDigestBytes;
@@ -330,13 +331,16 @@ clonecore::Status validate_preparation_evidence(
       checkpoint.schema_version == kCheckpointSchemaVersionV1;
   const bool schema_v2 =
       checkpoint.schema_version == kCheckpointSchemaVersionV2;
+  const bool schema_v3 =
+      checkpoint.schema_version == kCheckpointSchemaVersionV3;
   const bool legacy_phase = legacy_checkpoint_phase(checkpoint.phase);
   const bool preparation_phase =
       preparation_checkpoint_phase(checkpoint.phase);
-  if ((!schema_v1 && !schema_v2) ||
+  if ((!schema_v1 && !schema_v2 && !schema_v3) ||
       (schema_v1 && (!legacy_phase || checkpoint.preparation_evidence)) ||
       (schema_v2 &&
-       (preparation_phase != checkpoint.preparation_evidence.has_value()))) {
+       (preparation_phase != checkpoint.preparation_evidence.has_value())) ||
+      (schema_v3 && checkpoint.preparation_evidence)) {
     return checkpoint_failure(
         clonecore::ErrorCode::invalid_data,
         ERROR_REVISION_MISMATCH,
@@ -385,6 +389,39 @@ clonecore::Status validate_preparation_evidence(
     }
     previous_end = sector.offset + sector.length;
     first = false;
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status validate_output_progress_evidence(
+    const InterruptionCheckpoint& checkpoint) {
+  const bool schema_v3 =
+      checkpoint.schema_version == kCheckpointSchemaVersionV3;
+  if (schema_v3 != checkpoint.output_progress_evidence.has_value()) {
+    return checkpoint_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_REVISION_MISMATCH,
+        L"中断チェックポイント出力進捗証跡版",
+        L"schema v3だけが出力進捗証跡を必須とします");
+  }
+  if (!schema_v3) {
+    return clonecore::success_status();
+  }
+  const auto& evidence = *checkpoint.output_progress_evidence;
+  if (checkpoint.kind != OperationKind::image_create ||
+      checkpoint.environment != OperationEnvironment::winpe ||
+      !preparation_checkpoint_phase(checkpoint.phase) ||
+      detail::digest_is_zero(evidence.verified_prefix_hash) ||
+      evidence.auxiliary_output_length != 0U ||
+      (checkpoint.phase != CheckpointPhase::preparing &&
+       evidence.journal_length == 0U) ||
+      (checkpoint.verified_work_bytes != 0U &&
+       evidence.primary_output_length == 0U)) {
+    return checkpoint_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"中断チェックポイント出力進捗証跡",
+        L"WinPE exact image-createの段階、prefix Hash、または所有オブジェク長が不正です");
   }
   return clonecore::success_status();
 }
@@ -655,7 +692,8 @@ clonecore::Status verify_committed_file(
 clonecore::Status validate_checkpoint(
     const InterruptionCheckpoint& checkpoint) {
   if ((checkpoint.schema_version != kCheckpointSchemaVersionV1 &&
-       checkpoint.schema_version != kCheckpointSchemaVersionV2) ||
+       checkpoint.schema_version != kCheckpointSchemaVersionV2 &&
+       checkpoint.schema_version != kCheckpointSchemaVersionV3) ||
       !checkpoint_phase_known(checkpoint.phase) || checkpoint.revision == 0U ||
       checkpoint.expected_work_bytes == 0U ||
       checkpoint.verified_work_bytes > checkpoint.expected_work_bytes ||
@@ -682,6 +720,11 @@ clonecore::Status validate_checkpoint(
   const auto preparation_valid = validate_preparation_evidence(checkpoint);
   if (!preparation_valid) {
     return preparation_valid;
+  }
+  const auto output_progress_valid =
+      validate_output_progress_evidence(checkpoint);
+  if (!output_progress_valid) {
+    return output_progress_valid;
   }
 
   OperationPlan shape{
@@ -728,6 +771,9 @@ clonecore::Status validate_checkpoint_transition(
        (next.phase == CheckpointPhase::preparing &&
         current.verified_work_bytes == 0U &&
         current.verified_chunk_count == 0U));
+  const bool output_schema_v3 =
+      current.schema_version == kCheckpointSchemaVersionV3 &&
+      next.schema_version == kCheckpointSchemaVersionV3;
   bool allowed_phase_transition = false;
   switch (current.phase) {
     case CheckpointPhase::executing:
@@ -754,6 +800,28 @@ clonecore::Status validate_checkpoint_transition(
       allowed_phase_transition = false;
       break;
   }
+  if (output_schema_v3) {
+    const auto& current_output = *current.output_progress_evidence;
+    const auto& next_output = *next.output_progress_evidence;
+    const bool output_lengths_monotonic =
+        next_output.primary_output_length >=
+            current_output.primary_output_length &&
+        next_output.journal_length >= current_output.journal_length &&
+        next_output.auxiliary_output_length >=
+            current_output.auxiliary_output_length;
+    const bool output_evidence_changed =
+        next_output != current_output;
+    if (!output_lengths_monotonic ||
+        (advanced_progress && !output_evidence_changed) ||
+        (current.phase == CheckpointPhase::preparing &&
+         next.phase == CheckpointPhase::prepared &&
+         !output_evidence_changed) ||
+        (current.phase == CheckpointPhase::prepared &&
+         next.phase == CheckpointPhase::commit_ready &&
+         !output_evidence_changed)) {
+      allowed_phase_transition = false;
+    }
+  }
   if ((current.schema_version != next.schema_version &&
        !legacy_schema_upgrade) ||
       !operation_id_equal(current.operation_id, next.operation_id) ||
@@ -767,6 +835,8 @@ clonecore::Status validate_checkpoint_transition(
       current.continuity_token != next.continuity_token ||
       (current.preparation_evidence != next.preparation_evidence &&
        !legacy_schema_upgrade) ||
+      (!output_schema_v3 &&
+       current.output_progress_evidence != next.output_progress_evidence) ||
       current.revision == std::numeric_limits<std::uint64_t>::max() ||
       next.revision != current.revision + 1U ||
       next.verified_work_bytes < current.verified_work_bytes ||
@@ -832,14 +902,20 @@ clonecore::Result<std::vector<std::byte>> serialize_checkpoint(
           checkpoint.preparation_evidence->original_sectors.size() *
               kPreparationSectorWireBytes
       : 0U;
-  bytes.reserve(512U + preparation_bytes);
+  constexpr std::size_t kOutputProgressWireBytes =
+      kDigestBytes + (3U * sizeof(std::uint64_t));
+  const std::size_t output_progress_bytes =
+      checkpoint.output_progress_evidence ? kOutputProgressWireBytes : 0U;
+  bytes.reserve(512U + preparation_bytes + output_progress_bytes);
   append_array(bytes, kCheckpointMagic);
   append_u16(bytes, kCheckpointMajor);
   append_u16(
       bytes,
       checkpoint.schema_version == kCheckpointSchemaVersionV1
           ? kCheckpointMinorV1
-          : kCheckpointMinorV2);
+          : (checkpoint.schema_version == kCheckpointSchemaVersionV2
+                 ? kCheckpointMinorV2
+                 : kCheckpointMinorV3));
   constexpr std::size_t kTotalSizeOffset = 12U;
   append_u32(bytes, 0U);
   append_u8(bytes, static_cast<std::uint8_t>(checkpoint.kind));
@@ -850,7 +926,8 @@ clonecore::Result<std::vector<std::byte>> serialize_checkpoint(
       static_cast<std::uint8_t>(
           (checkpoint.source ? 0x01U : 0U) |
           (checkpoint.target ? 0x02U : 0U) |
-          (checkpoint.preparation_evidence ? 0x04U : 0U)));
+          (checkpoint.preparation_evidence ? 0x04U : 0U) |
+          (checkpoint.output_progress_evidence ? 0x08U : 0U)));
   append_u32(bytes, 0U);
   append_u64(bytes, checkpoint.revision);
   append_u64(bytes, checkpoint.expected_work_bytes);
@@ -881,6 +958,15 @@ clonecore::Result<std::vector<std::byte>> serialize_checkpoint(
       append_u64(bytes, sector.length);
       append_array(bytes, sector.original_hash);
     }
+  }
+  if (checkpoint.output_progress_evidence) {
+    append_array(
+        bytes, checkpoint.output_progress_evidence->verified_prefix_hash);
+    append_u64(
+        bytes, checkpoint.output_progress_evidence->primary_output_length);
+    append_u64(bytes, checkpoint.output_progress_evidence->journal_length);
+    append_u64(
+        bytes, checkpoint.output_progress_evidence->auxiliary_output_length);
   }
 
   if (bytes.size() > kMaximumCheckpointBytes - kDigestBytes) {
@@ -930,7 +1016,8 @@ clonecore::Result<ParsedCheckpoint> parse_checkpoint(
   if (!reader.read_array(magic) || magic != kCheckpointMagic ||
       !reader.read_u16(major) || !reader.read_u16(minor) ||
       !reader.read_u32(total_size) || major != kCheckpointMajor ||
-      (minor != kCheckpointMinorV1 && minor != kCheckpointMinorV2) ||
+      (minor != kCheckpointMinorV1 && minor != kCheckpointMinorV2 &&
+       minor != kCheckpointMinorV3) ||
       total_size != bytes.size()) {
     return clonecore::Result<ParsedCheckpoint>::failure(checkpoint_error(
         clonecore::ErrorCode::invalid_data,
@@ -955,8 +1042,9 @@ clonecore::Result<ParsedCheckpoint> parse_checkpoint(
   std::uint8_t flags{};
   std::uint32_t reserved{};
   InterruptionCheckpoint checkpoint;
-  const std::uint8_t allowed_flags =
-      minor == kCheckpointMinorV1 ? 0x03U : 0x07U;
+  const std::uint8_t allowed_flags = minor == kCheckpointMinorV1
+      ? 0x03U
+      : (minor == kCheckpointMinorV2 ? 0x07U : 0x0BU);
   if (!reader.read_u8(kind) || !reader.read_u8(environment) ||
       !reader.read_u8(phase) || !reader.read_u8(flags) ||
       (flags & ~allowed_flags) != 0U || !reader.read_u32(reserved) ||
@@ -977,7 +1065,9 @@ clonecore::Result<ParsedCheckpoint> parse_checkpoint(
   }
   checkpoint.schema_version = minor == kCheckpointMinorV1
       ? kCheckpointSchemaVersionV1
-      : kCheckpointSchemaVersionV2;
+      : (minor == kCheckpointMinorV2
+             ? kCheckpointSchemaVersionV2
+             : kCheckpointSchemaVersionV3);
   checkpoint.kind = static_cast<OperationKind>(kind);
   checkpoint.environment = static_cast<OperationEnvironment>(environment);
   checkpoint.phase = static_cast<CheckpointPhase>(phase);
@@ -1037,6 +1127,20 @@ clonecore::Result<ParsedCheckpoint> parse_checkpoint(
       evidence.original_sectors.push_back(std::move(sector));
     }
     checkpoint.preparation_evidence = std::move(evidence);
+  }
+  if ((flags & 0x08U) != 0U) {
+    CheckpointOutputProgressEvidence evidence;
+    if (!reader.read_array(evidence.verified_prefix_hash) ||
+        !reader.read_u64(evidence.primary_output_length) ||
+        !reader.read_u64(evidence.journal_length) ||
+        !reader.read_u64(evidence.auxiliary_output_length)) {
+      return clonecore::Result<ParsedCheckpoint>::failure(checkpoint_error(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"中断チェックポイント出力進捗証跡構造",
+          L"出力進捗証跡が宣言寸法より短いか不正です"));
+    }
+    checkpoint.output_progress_evidence = evidence;
   }
   if (!reader.at_end()) {
     return clonecore::Result<ParsedCheckpoint>::failure(checkpoint_error(

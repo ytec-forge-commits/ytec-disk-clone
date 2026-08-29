@@ -519,6 +519,56 @@ clonecore::Status validate_repair_selection(
   return clonecore::success_status();
 }
 
+struct CloneEfiOwnershipBinding final {
+  std::wstring system_volume_identity_root;
+  EfiBootOwnershipEvidence evidence;
+};
+
+clonecore::Result<CloneEfiOwnershipBinding>
+inspect_clone_efi_ownership(
+    const BcdBootFirmware firmware,
+    const BootVolumeObservation& system_volume,
+    IEfiBootOwnershipInspector& inspector) {
+  if (firmware != BcdBootFirmware::uefi) {
+    return clonecore::Result<CloneEfiOwnershipBinding>::success(
+        CloneEfiOwnershipBinding{});
+  }
+
+  const auto identity_root =
+      normalize_offline_windows_volume_root(system_volume.volume_name);
+  if (!identity_root || is_drive_root(system_volume.volume_name)) {
+    return clonecore::Result<CloneEfiOwnershipBinding>::failure(
+        identity_root
+            ? finalization_error(
+                  clonecore::ErrorCode::invalid_argument,
+                  ERROR_INVALID_NAME,
+                  L"クローン後ESP Volume GUID識別",
+                  L"UEFI起動再構築には厳密なESP Volume GUIDルートが必要です")
+            : identity_root.error());
+  }
+
+  auto ownership = inspector.inspect_existing_esp_read_only(
+      identity_root.value());
+  if (!ownership) {
+    return clonecore::Result<CloneEfiOwnershipBinding>::failure(
+        ownership.error());
+  }
+  if (ownership.value().state !=
+          EfiBootOwnershipState::microsoft_only_or_empty ||
+      !efi_boot_ownership_allows_microsoft_rebuild(ownership.value())) {
+    return clonecore::Result<CloneEfiOwnershipBinding>::failure(
+        finalization_error(
+            clonecore::ErrorCode::unsupported_layout,
+            ERROR_NOT_SUPPORTED,
+            L"クローン後ESP EFI所有権診断",
+            L"クローン先ESPが空またはMicrosoft所有と一意に確認できないため起動再構築を開始しません"));
+  }
+  return clonecore::Result<CloneEfiOwnershipBinding>::success({
+      .system_volume_identity_root = identity_root.value(),
+      .evidence = ownership.take_value(),
+  });
+}
+
 class WindowsCloneBootFinalizationVolumeProvider final
     : public ICloneBootFinalizationVolumeProvider {
  public:
@@ -595,13 +645,16 @@ class WindowsCloneBootFinalizationService final
       : inventory_(inventory),
         volume_provider_(
             std::make_unique<WindowsCloneBootFinalizationVolumeProvider>()),
+        efi_ownership_inspector_(
+            make_windows_efi_boot_ownership_inspector()),
         mount_api_(make_windows_system_volume_mount_api()),
         boot_repair_service_(
             make_windows_standalone_boot_repair_service(inventory)) {}
 
   clonecore::Result<CloneBootFinalizationReport> execute(
       const CloneBootFinalizationRequest& request) override {
-    if (volume_provider_ == nullptr || mount_api_ == nullptr ||
+    if (volume_provider_ == nullptr ||
+        efi_ownership_inspector_ == nullptr || mount_api_ == nullptr ||
         boot_repair_service_ == nullptr) {
       return clonecore::Result<CloneBootFinalizationReport>::failure(
           finalization_error(
@@ -614,6 +667,7 @@ class WindowsCloneBootFinalizationService final
         request,
         inventory_,
         *volume_provider_,
+        *efi_ownership_inspector_,
         *mount_api_,
         *boot_repair_service_);
   }
@@ -621,6 +675,7 @@ class WindowsCloneBootFinalizationService final
  private:
   diskmodel::IDiskInventoryProvider& inventory_;
   std::unique_ptr<ICloneBootFinalizationVolumeProvider> volume_provider_;
+  std::unique_ptr<IEfiBootOwnershipInspector> efi_ownership_inspector_;
   std::unique_ptr<ISystemVolumeMountApi> mount_api_;
   std::unique_ptr<IStandaloneBootRepairService> boot_repair_service_;
 };
@@ -632,6 +687,7 @@ finalize_cloned_windows_boot(
     const CloneBootFinalizationRequest& request,
     diskmodel::IDiskInventoryProvider& inventory,
     ICloneBootFinalizationVolumeProvider& volume_provider,
+    IEfiBootOwnershipInspector& efi_ownership_inspector,
     ISystemVolumeMountApi& mount_api,
     IStandaloneBootRepairService& boot_repair_service) {
   if (request.expected_style != diskmodel::PartitionStyle::gpt &&
@@ -683,6 +739,13 @@ finalize_cloned_windows_boot(
   const auto& windows = located.value().windows;
   const auto& system_partition = located.value().system_partition;
   const auto& system_volume = located.value().system_volume;
+
+  auto efi_ownership_binding = inspect_clone_efi_ownership(
+      firmware, system_volume, efi_ownership_inspector);
+  if (!efi_ownership_binding) {
+    return clonecore::Result<CloneBootFinalizationReport>::failure(
+        efi_ownership_binding.error());
+  }
 
   auto unavailable = volume_provider.unavailable_drive_letters();
   if (!unavailable) {
@@ -793,6 +856,17 @@ finalize_cloned_windows_boot(
       .firmware = firmware,
       .store_policy = BcdBootStorePolicy::rebuild_fresh,
       .auto_mount_system_partition = false,
+      .system_volume_identity_root =
+          std::move(
+              efi_ownership_binding.value().system_volume_identity_root),
+      .require_efi_ownership_recheck =
+          firmware == BcdBootFirmware::uefi,
+      .expected_efi_ownership =
+          std::move(efi_ownership_binding.value().evidence),
+      .third_party_efi_policy =
+          BootRepairThirdPartyEfiPolicy::not_applicable,
+      .reviewed_multi_windows_batch = false,
+      .update_current_pc_nvram = false,
   };
   auto selection = boot_repair_service.inspect(boot_request);
   if (!selection) {
@@ -835,12 +909,14 @@ finalize_cloned_windows_boot(
       !repaired.value().bcdboot.fresh_store_verified ||
       !repaired.value().boot_store_verified ||
       repaired.value().system_partition_temporarily_mounted ||
-      repaired.value().temporary_mount_released) {
+      repaired.value().temporary_mount_released ||
+      !repaired.value().efi_ownership_revalidated ||
+      !repaired.value().nvram_unchanged) {
     return fail_after_cleanup(finalization_error(
         clonecore::ErrorCode::verification_failed,
         ERROR_INVALID_DATA,
         L"クローン後の新規BCD再構築トランザクション",
-        L"Microsoft署名、BCDBoot /c、新規BCD読戻し、または限定マウント境界を確認できません"));
+        L"Microsoft署名、BCDBoot /c、新規BCD読戻し、EFI所有権再検証、NVRAM不変、または限定マウント境界を確認できません"));
   }
 
   const auto cleanup = release_all();

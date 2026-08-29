@@ -106,6 +106,7 @@ bool known_surplus_allocation(
   switch (allocation) {
     case ShrinkSurplusAllocation::automatic_proportional:
     case ShrinkSurplusAllocation::leave_unallocated:
+    case ShrinkSurplusAllocation::selected_data_partition:
       return true;
   }
   return false;
@@ -146,6 +147,16 @@ clonecore::Result<NormalizedPlanningInput> normalize_request(
         ERROR_INVALID_DATA,
         L"直接クローン計画の共通条件",
         L"方式、形式、容量、論理セクター、またはパーティション数が不正です");
+  }
+  const bool targets_selected_data = request.surplus_allocation ==
+      ShrinkSurplusAllocation::selected_data_partition;
+  if (targets_selected_data !=
+      request.surplus_target_source_table_index.has_value()) {
+    return failure<NormalizedPlanningInput>(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_PARAMETER,
+        L"直接クローン計画の余剰容量対象",
+        L"指定データ領域への配分にはコピー元パーティション表番号が1つ必要です");
   }
 
   MigrationPartitionStyle target_style = request.source_style;
@@ -298,14 +309,6 @@ clonecore::Result<NormalizedPlanningInput> normalize_request(
          (role == MigrationPartitionRole::recovery &&
           entry.required_for_windows));
     const bool selected = entry.selected || required;
-    if (selected &&
-        entry.partition.file_system == MigrationFileSystem::unsupported) {
-      return failure<NormalizedPlanningInput>(
-          clonecore::ErrorCode::unsupported_layout,
-          ERROR_NOT_SUPPORTED,
-          L"直接クローン計画のファイルシステム",
-          L"選択された未対応ファイルシステムの実行経路は未接続のため開始できません");
-    }
     if (selected) {
       ++selected_count;
     }
@@ -324,6 +327,39 @@ clonecore::Result<NormalizedPlanningInput> normalize_request(
         ERROR_INVALID_PARAMETER,
         L"直接クローン計画のパーティション選択",
         L"コピー対象パーティションが選択されていません");
+  }
+  if (targets_selected_data) {
+    const auto source = std::find_if(
+        request.source_partitions.begin(),
+        request.source_partitions.end(),
+        [&request](const DirectCloneSourcePartition& candidate) {
+          return candidate.partition.source_table_index ==
+              *request.surplus_target_source_table_index;
+        });
+    const auto selection = std::find_if(
+        normalized.selections.begin(),
+        normalized.selections.end(),
+        [&request](const DirectClonePartitionSelection& candidate) {
+          return candidate.source_table_index ==
+              *request.surplus_target_source_table_index;
+        });
+    if (source == request.source_partitions.end() ||
+        selection == normalized.selections.end() || !selection->selected) {
+      return failure<NormalizedPlanningInput>(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_PARAMETER,
+          L"直接クローン計画の余剰容量対象",
+          L"余剰容量の指定先は選択済みパーティション表番号と一致する必要があります");
+    }
+    if (source->partition.role != MigrationPartitionRole::data ||
+        classify_shrink_file_system(source->partition.file_system) !=
+            ShrinkFileSystemDisposition::file_archive) {
+      return failure<NormalizedPlanningInput>(
+          clonecore::ErrorCode::unsupported_layout,
+          ERROR_NOT_SUPPORTED,
+          L"直接クローン計画の余剰容量対象",
+          L"余剰容量の指定先は選択済みのNTFS・exFAT・FAT32データ領域に限ります");
+    }
   }
   return clonecore::Result<NormalizedPlanningInput>::success(
       std::move(normalized));
@@ -353,6 +389,10 @@ clonecore::Result<ShrinkMigrationPlan> build_layout(
       .windows_is_amd64 = request.windows_is_amd64,
       .bitlocker_fully_decrypted = request.bitlocker_fully_decrypted,
       .surplus_allocation = surplus_allocation,
+      .surplus_target_source_table_index = surplus_allocation ==
+              ShrinkSurplusAllocation::selected_data_partition
+          ? request.surplus_target_source_table_index
+          : std::nullopt,
   };
   layout_request.source_partitions.reserve(request.source_partitions.size());
   for (std::size_t index = 0U;
@@ -504,6 +544,8 @@ clonecore::Result<DirectClonePlan> plan_direct_clone(
   plan.source_logical_sector_size_ = request.source_logical_sector_size;
   plan.target_logical_sector_size_ = request.target_logical_sector_size;
   plan.surplus_allocation_ = request.surplus_allocation;
+  plan.surplus_target_source_table_index_ =
+      request.surplus_target_source_table_index;
   plan.minimum_target_size_bytes_ =
       selected_layout.minimum_target_size_bytes;
   plan.target_size_bytes_ = selected_layout.target_size_bytes;
@@ -553,7 +595,8 @@ clonecore::Result<DirectClonePlan> plan_direct_clone(
         .file_system = partition.file_system,
         .transfer = source == nullptr
             ? DirectClonePartitionTransfer::recreate
-            : selected_mode == DirectCloneMode::exact
+            : selected_mode == DirectCloneMode::exact ||
+                    partition.action == MigrationPartitionAction::copy_exact_raw
                 ? DirectClonePartitionTransfer::exact_content
                 : DirectClonePartitionTransfer::file_system_content,
         .offset_bytes = partition.offset_bytes,

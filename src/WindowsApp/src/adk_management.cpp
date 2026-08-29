@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <set>
@@ -450,7 +451,14 @@ AdkManagementView build_adk_management_view(
   AdkManagementView view{
       .title = L"ADK取得・管理",
   };
+  const auto structure =
+      validate_adk_release_manifest_structure(manifest);
   const auto valid = validate_adk_release_manifest(manifest);
+  view.manifest_structure_valid = static_cast<bool>(structure);
+  view.primary_source_pins_confirmed =
+      manifest.primary_source_pins_confirmed;
+  view.unattended_no_restart_confirmed =
+      manifest.unattended_install_no_unexpected_restart_confirmed;
   view.execution_gate_open = static_cast<bool>(valid);
   view.platform_creation_permitted = view.execution_gate_open;
   view.path_selection_permitted = view.execution_gate_open;
@@ -465,6 +473,13 @@ AdkManagementView build_adk_management_view(
   summary << L"対象ADK: " << manifest.tested_adk_version
           << L"\n固定取得物: " << manifest.payloads.size()
           << L"件\n取得元: Microsoft固定HTTPS URL または検証済みローカルlayout"
+          << L"\n一次資料pin: "
+          << (manifest.primary_source_pins_confirmed ? L"確認済み"
+                                                    : L"未確認（停止）")
+          << L"\nquiet導入の予期しない再起動なし: "
+          << (manifest.unattended_install_no_unexpected_restart_confirmed
+                  ? L"確認済み"
+                  : L"未確認（停止）")
           << L"\n既存ADK: 自動削除しない"
           << L"\n削除対象: Tsumugiが同じmanifestで導入し、固定記録が残るものだけ";
   if (!valid) {
@@ -472,13 +487,160 @@ AdkManagementView build_adk_management_view(
   }
   view.summary = summary.str();
   view.payload_rows.reserve(manifest.payloads.size());
-  for (const auto& payload : manifest.payloads) {
-    view.payload_rows.push_back(
-        payload.display_name + L" — " +
-        std::to_wstring(payload.expected_byte_count) + L" bytes — SHA-256 " +
-        widen_ascii(payload.expected_sha256));
+  if (structure) {
+    for (const auto& payload : manifest.payloads) {
+      view.payload_rows.push_back(
+          payload.display_name + L"\n  URL: " + payload.exact_source_url +
+          L"\n  offline: " + payload.offline_relative_path.native() +
+          L"\n  signer: " + payload.expected_signer_subject +
+          L"\n  version: " + payload.expected_payload_version +
+          L"\n  length: " +
+          std::to_wstring(payload.expected_byte_count) +
+          L" bytes\n  SHA-256: " +
+          widen_ascii(payload.expected_sha256));
+    }
   }
   return view;
+}
+
+AdkManagementActionReview build_adk_management_action_review(
+    const AdkReleaseManifest& manifest,
+    const AdkManagementAction action) {
+  const auto structure =
+      validate_adk_release_manifest_structure(manifest);
+  const auto release = validate_adk_release_manifest(manifest);
+  AdkManagementActionReview review{
+      .action = action,
+      .manifest_structure_valid = static_cast<bool>(structure),
+      .execution_gate_open = static_cast<bool>(release),
+  };
+  switch (action) {
+    case AdkManagementAction::official_download_install:
+      review.requires_eula_review = true;
+      review.requires_network_retrieval = true;
+      review.title = L"Microsoft公式取得物からADKを導入";
+      review.summary =
+          L"固定bootstrapからADK固有EULA全文を検証表示し、明示同意後だけ取得・導入します。";
+      break;
+    case AdkManagementAction::offline_layout_install:
+      review.path_selection =
+          AdkManagementPathSelection::existing_offline_layout;
+      review.requires_eula_review = true;
+      review.title = L"検証済みオフラインレイアウトからADKを導入";
+      review.summary =
+          L"利用者が選んだ既存ローカルlayoutの固定位置だけを読み、ADK固有EULA全文への明示同意後に導入します。";
+      break;
+    case AdkManagementAction::create_offline_layout:
+      review.path_selection =
+          AdkManagementPathSelection::new_offline_layout_parent;
+      review.requires_eula_review = true;
+      review.requires_network_retrieval = true;
+      review.title = L"公式ADKオフラインレイアウトを新規作成";
+      review.summary =
+          L"利用者が選んだ既存ローカル親フォルダー直下へ固定名の新規layoutを作成し、既存先は上書きしません。";
+      break;
+    case AdkManagementAction::uninstall_managed:
+      review.requires_explicit_uninstall_confirmation = true;
+      review.title = L"Tsumugi管理対象ADKを削除";
+      review.summary =
+          L"同じmanifestの固定管理記録にあるMSI/MSP登録だけを対象とし、既存・管理外ADKは削除しません。";
+      break;
+    default:
+      review.title = L"未対応のADK管理操作";
+      review.summary = L"固定された製品操作ではありません。";
+      review.execution_gate_open = false;
+      break;
+  }
+  review.path_picker_permitted =
+      review.execution_gate_open &&
+      review.path_selection != AdkManagementPathSelection::none;
+  if (!release) {
+    review.summary += L"\n\n安全ゲート停止理由: " +
+                      release.error().message;
+  }
+  return review;
+}
+
+clonecore::Result<std::filesystem::path>
+make_adk_offline_layout_destination(
+    const AdkReleaseManifest& manifest,
+    const std::filesystem::path& selected_parent) {
+  const auto release = validate_adk_release_manifest(manifest);
+  if (!release) {
+    return clonecore::Result<std::filesystem::path>::failure(
+        release.error());
+  }
+  if (!is_local_absolute_path(selected_parent)) {
+    return failure<std::filesystem::path>(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_NAME,
+        L"ADKオフラインレイアウト 親フォルダー",
+        L"既存のローカル絶対親フォルダーだけを選択できます");
+  }
+  const std::filesystem::path child =
+      selected_parent /
+      (L"Tsumugi-ADK-Offline-" + manifest.tested_adk_version);
+  if (!is_local_absolute_path(child) ||
+      child.parent_path().lexically_normal() !=
+          selected_parent.lexically_normal()) {
+    return failure<std::filesystem::path>(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_INVALID_NAME,
+        L"ADKオフラインレイアウト 固定保存先",
+        L"選択した親直下の固定新規保存先を構成できません");
+  }
+  return clonecore::Result<std::filesystem::path>::success(child);
+}
+
+clonecore::Result<std::wstring> format_adk_evidence_event(
+    const AdkReleaseManifest& manifest,
+    const AdkEvidenceFacts& facts) {
+  const auto structure =
+      validate_adk_release_manifest_structure(manifest);
+  if (!structure) {
+    return clonecore::Result<std::wstring>::failure(structure.error());
+  }
+  constexpr std::array<std::wstring_view, 4U> kActionNames{
+      L"official-install", L"offline-install", L"offline-export",
+      L"managed-uninstall"};
+  constexpr std::array<std::wstring_view, 9U> kStageNames{
+      L"review-opened", L"gate-blocked", L"path-selected",
+      L"eula-retrieval-started", L"eula-verified",
+      L"consent-accepted", L"action-started", L"action-succeeded",
+      L"action-failed"};
+  const auto action_index = static_cast<std::size_t>(facts.action);
+  const auto stage_index = static_cast<std::size_t>(facts.stage);
+  if (action_index >= kActionNames.size() ||
+      stage_index >= kStageNames.size()) {
+    return failure<std::wstring>(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_PARAMETER,
+        L"ADK管理 証拠ログ",
+        L"固定されていないactionまたはstageです");
+  }
+  std::wostringstream text;
+  text << L"ADK_EVIDENCE manifest=" << widen_ascii(manifest.manifest_id)
+       << L" action=" << kActionNames[action_index]
+       << L" stage=" << kStageNames[stage_index]
+       << L" payloads=" << manifest.payloads.size()
+       << L" pins_confirmed="
+       << (manifest.primary_source_pins_confirmed ? 1 : 0)
+       << L" no_restart_confirmed="
+       << (manifest.unattended_install_no_unexpected_restart_confirmed ? 1
+                                                                        : 0)
+       << L" path_selected=" << (facts.path_selected ? 1 : 0)
+       << L" full_eula=" << (facts.complete_eula_presented ? 1 : 0)
+       << L" explicit_consent=" << (facts.explicit_consent ? 1 : 0)
+       << L" native=" << facts.native_code;
+  std::wstring result = text.str();
+  if (result.size() > 1'024U) {
+    return failure<std::wstring>(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_BUFFER_OVERFLOW,
+        L"ADK管理 証拠ログ",
+        L"証拠ログが固定長上限を超えます");
+  }
+  return clonecore::Result<std::wstring>::success(std::move(result));
 }
 
 AdkManagementLayout calculate_adk_management_layout(

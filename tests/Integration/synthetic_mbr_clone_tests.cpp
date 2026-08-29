@@ -210,6 +210,36 @@ void write_ntfs_boot_sector(
   sector[511] = std::byte{0xAA};
 }
 
+void write_exfat_boot_sector(
+    const std::span<std::byte> disk,
+    const std::uint32_t first_lba,
+    const std::uint32_t sector_count) {
+  auto sector = disk.subspan(static_cast<std::size_t>(first_lba) * 512, 512);
+  std::fill(sector.begin(), sector.end(), std::byte{0});
+  const char signature[] = "EXFAT   ";
+  std::memcpy(sector.data() + 3, signature, 8);
+  constexpr std::uint32_t fat_offset = 24U;
+  constexpr std::uint32_t fat_length = 8U;
+  constexpr std::uint32_t heap_offset = fat_offset + fat_length;
+  constexpr std::uint32_t sectors_per_cluster = 8U;
+  const std::uint32_t cluster_count =
+      (sector_count - heap_offset) / sectors_per_cluster;
+  write_little<std::uint64_t>(sector, 64, first_lba);
+  write_little<std::uint64_t>(sector, 72, sector_count);
+  write_little<std::uint32_t>(sector, 80, fat_offset);
+  write_little<std::uint32_t>(sector, 84, fat_length);
+  write_little<std::uint32_t>(sector, 88, heap_offset);
+  write_little<std::uint32_t>(sector, 92, cluster_count);
+  write_little<std::uint32_t>(sector, 96, 2U);
+  write_little<std::uint16_t>(sector, 104, 0x0100U);
+  sector[108] = std::byte{9};
+  sector[109] = std::byte{3};
+  sector[110] = std::byte{1};
+  sector[112] = std::byte{0};
+  sector[510] = std::byte{0x55};
+  sector[511] = std::byte{0xAA};
+}
+
 std::vector<std::byte> source_disk() {
   std::vector<std::byte> disk(
       static_cast<std::size_t>(kSourceSectors) * 512, std::byte{0});
@@ -236,6 +266,25 @@ std::vector<std::byte> source_disk() {
       bytes.begin() + static_cast<std::ptrdiff_t>(
           recovery_offset + static_cast<std::size_t>(kRecoverySectors) * 512),
       std::byte{0xA5});
+  return disk;
+}
+
+std::vector<std::byte> source_disk_with_mbr_0x07_exfat() {
+  std::vector<std::byte> disk(
+      static_cast<std::size_t>(kSourceSectors) * 512, std::byte{0});
+  std::span<std::byte> bytes(disk);
+  write_little<std::uint32_t>(bytes, 440, 0x11223344U);
+  write_partition(
+      bytes.first(512), 0, false, 0x07, kNtfsStart, kNtfsSectors);
+  bytes[510] = std::byte{0x55};
+  bytes[511] = std::byte{0xAA};
+  const auto partition_offset =
+      static_cast<std::size_t>(kNtfsStart) * 512U;
+  std::fill_n(
+      bytes.begin() + static_cast<std::ptrdiff_t>(partition_offset),
+      static_cast<std::size_t>(kNtfsSectors) * 512U,
+      std::byte{0x6E});
+  write_exfat_boot_sector(bytes, kNtfsStart, kNtfsSectors);
   return disk;
 }
 
@@ -309,6 +358,58 @@ void test_plan_uses_known_partition_modes() {
   check(
       plan.value().target_mbr.target_disk.disk_signature == 0xAABBCCDDU,
       "A connected signature collision must be skipped");
+}
+
+void test_mbr_0x07_exfat_uses_whole_partition_exact_copy() {
+  MemorySource source(source_disk_with_mbr_0x07_exfat());
+  MemoryTarget target(static_cast<std::size_t>(kSourceSectors + 1024) * 512);
+  FixedRanges no_ntfs_ranges;
+  SequenceSignature plan_signatures({0xAABBCCDDU});
+  const std::array<std::uint32_t, 1> connected{0x55667788U};
+  const auto plan = ytec::clonecore::build_offline_mbr_clone_plan(
+      source, target, no_ntfs_ranges, plan_signatures, connected);
+  check(
+      plan.has_value(),
+      "MBR 0x07 exFAT should plan without NTFS bitmap; code=" +
+          std::to_string(
+              plan.has_value()
+                  ? 0
+                  : static_cast<int>(plan.error().code)) +
+          ", native=" +
+          std::to_string(plan.has_value() ? 0U : plan.error().native_code));
+  const ByteRange partition{
+      .offset = static_cast<std::uint64_t>(kNtfsStart) * 512U,
+      .length = static_cast<std::uint64_t>(kNtfsSectors) * 512U,
+  };
+  check(plan.value().partition_copies.size() == 1U &&
+            plan.value().partition_copies.front().mode ==
+                ytec::clonecore::MbrPartitionCopyMode::exfat_raw &&
+            plan.value().partition_copies.front().source_ranges.size() == 1U &&
+            plan.value().partition_copies.front().source_ranges.front().offset ==
+                partition.offset &&
+            plan.value().partition_copies.front().source_ranges.front().length ==
+                partition.length,
+        "MBR 0x07 exFAT must cover the complete partition");
+
+  FixedRanges execute_ranges;
+  SequenceSignature execute_signatures({0xAABBCCDDU});
+  const auto report = ytec::clonecore::execute_offline_mbr_clone(
+      valid_request(source, target),
+      source,
+      target,
+      execute_ranges,
+      execute_signatures);
+  check(report.has_value(), "MBR 0x07 exFAT exact clone should execute");
+  check(report.value().copied_data_bytes == partition.length,
+        "MBR 0x07 exFAT must report the full partition length");
+  check(std::equal(
+            source.bytes().begin() +
+                static_cast<std::ptrdiff_t>(partition.offset),
+            source.bytes().begin() + static_cast<std::ptrdiff_t>(
+                partition.offset + partition.length),
+            target.bytes().begin() +
+                static_cast<std::ptrdiff_t>(partition.offset)),
+        "MBR 0x07 exFAT must preserve every partition byte");
 }
 
 void test_execute_commits_mbr_last_and_verifies_data() {
@@ -589,6 +690,8 @@ void test_bitlocker_signature_is_rejected_before_write() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"plan_uses_known_partition_modes", test_plan_uses_known_partition_modes},
+      {"mbr_0x07_exfat_uses_whole_partition_exact_copy",
+       test_mbr_0x07_exfat_uses_whole_partition_exact_copy},
       {"execute_commits_mbr_last_and_verifies_data",
        test_execute_commits_mbr_last_and_verifies_data},
       {"verified_write_digest_changes_with_copied_data",

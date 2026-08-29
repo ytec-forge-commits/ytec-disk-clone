@@ -1,4 +1,5 @@
 #include "ytec/winpeapp/direct_image_create.h"
+#include "ytec/winpeapp/direct_image_create_resume.h"
 
 #include "ytec/clonecore/gpt.h"
 #include "ytec/imageformat/tsumugi_image_service.h"
@@ -70,9 +71,12 @@ class SharedDiskReader final : public ytec::clonecore::ISourceDiskReader {
  public:
   SharedDiskReader(
       std::shared_ptr<std::vector<std::byte>> storage,
-      const bool mutate_mbr_after_payload)
+      const bool mutate_mbr_after_payload,
+      std::shared_ptr<std::vector<std::pair<std::uint64_t, std::size_t>>>
+          reads)
       : storage_(std::move(storage)),
-        mutate_mbr_after_payload_(mutate_mbr_after_payload) {}
+        mutate_mbr_after_payload_(mutate_mbr_after_payload),
+        reads_(std::move(reads)) {}
 
   std::uint64_t size_bytes() const noexcept override {
     return storage_->size();
@@ -93,6 +97,7 @@ class SharedDiskReader final : public ytec::clonecore::ISourceDiskReader {
           .message = L"範囲外です",
       });
     }
+    reads_->emplace_back(offset, length);
     const auto first = storage_->begin() + static_cast<std::ptrdiff_t>(offset);
     std::vector<std::byte> result(
         first, first + static_cast<std::ptrdiff_t>(length));
@@ -107,6 +112,7 @@ class SharedDiskReader final : public ytec::clonecore::ISourceDiskReader {
  private:
   std::shared_ptr<std::vector<std::byte>> storage_;
   bool mutate_mbr_after_payload_{};
+  std::shared_ptr<std::vector<std::pair<std::uint64_t, std::size_t>>> reads_;
   mutable bool mutated_{};
 };
 
@@ -401,6 +407,9 @@ ytec::diskmodel::DiskInfo source_disk(
 
 struct DependencyState final {
   std::size_t read_only_calls{};
+  std::shared_ptr<std::vector<std::pair<std::uint64_t, std::size_t>>> reads{
+      std::make_shared<
+          std::vector<std::pair<std::uint64_t, std::size_t>>>()};
   std::vector<ytec::imageformat::WindowsTsumugiDestinationGuardRequest>
       guards;
   std::shared_ptr<RescueStagingState> rescue_staging{
@@ -428,7 +437,10 @@ ytec::winpeapp::DirectImageCreateDependencies dependencies_for(
             return ytec::clonecore::success_status();
           },
       .open_read_only_source =
-          [reviewed, storage = std::move(storage), mutate_mbr_after_payload](
+          [reviewed,
+           storage = std::move(storage),
+           mutate_mbr_after_payload,
+           state](
               const ytec::clonecore::StableDiskIdentity& expected) {
             auto observed = reviewed;
             observed.read_only = true;
@@ -450,7 +462,7 @@ ytec::winpeapp::DirectImageCreateDependencies dependencies_for(
                     .identity = identity.take_value(),
                 },
                 .reader = std::make_unique<SharedDiskReader>(
-                    storage, mutate_mbr_after_payload),
+                    storage, mutate_mbr_after_payload, state->reads),
             });
           },
       .query_destination_file_system =
@@ -492,6 +504,127 @@ ytec::winpeapp::DirectImageCreateRequest request_for(
     };
   }
   return request;
+}
+
+ytec::winpeapp::DirectImageCreateResumeContinuityV1 continuity_fixture(
+    const bool encrypted) {
+  ytec::winpeapp::DirectImageCreateResumeContinuityV1 continuity{
+      .created_utc = "2026-08-24T10:20:30Z",
+      .app_version = "1.0.0-test",
+      .verification_mode =
+          ytec::imageformat::TsumugiCreateVerificationMode::fast,
+      .encrypted = encrypted,
+  };
+  continuity.image_id[0] = std::byte{0xAB};
+  continuity.image_id[15] = std::byte{0x5C};
+  if (encrypted) {
+    continuity.argon2.salt[0] = std::byte{0x91};
+    continuity.argon2.salt[15] = std::byte{0x2E};
+    continuity.base_nonce[0] = std::byte{0x77};
+    continuity.base_nonce[11] = std::byte{0x08};
+  }
+  return continuity;
+}
+
+void resume_continuity_roundtrips_without_secret_material() {
+  for (const bool encrypted : {false, true}) {
+    auto input = continuity_fixture(encrypted);
+    if (encrypted) {
+      input.selected_partition_numbers = {2U, 4U, 128U};
+    }
+    const auto token = ytec::winpeapp::
+        build_direct_image_create_resume_continuity_v1(input);
+    check(token.has_value(), "canonical continuity token must build");
+    check(token.value().find(L"password") == std::wstring::npos &&
+              token.value().find(L"key=") == std::wstring::npos,
+          "continuity token must not persist password or key fields");
+    const auto parsed = ytec::winpeapp::
+        parse_direct_image_create_resume_continuity_v1(token.value());
+    check(parsed.has_value() &&
+              parsed.value().created_utc == input.created_utc &&
+              parsed.value().app_version == input.app_version &&
+              parsed.value().verification_mode == input.verification_mode &&
+              parsed.value().encrypted == encrypted &&
+              parsed.value().selected_partition_numbers ==
+                  input.selected_partition_numbers &&
+              parsed.value().image_id == input.image_id &&
+              parsed.value().argon2.memory_kib == input.argon2.memory_kib &&
+              parsed.value().argon2.iterations == input.argon2.iterations &&
+              parsed.value().argon2.parallelism == input.argon2.parallelism &&
+              parsed.value().argon2.salt == input.argon2.salt &&
+              parsed.value().base_nonce == input.base_nonce,
+          "canonical continuity fields must roundtrip exactly");
+    check(
+        (encrypted && token.value().find(L"|Q") != std::wstring::npos) ||
+            (!encrypted && token.value().find(L"|Q") == std::wstring::npos),
+        "partial selection must use the private Q bitmap while legacy whole-disk tokens remain unchanged");
+  }
+}
+
+void resume_continuity_rejects_noncanonical_unknown_and_oversized_input() {
+  const auto input = continuity_fixture(true);
+  const auto built = ytec::winpeapp::
+      build_direct_image_create_resume_continuity_v1(input);
+  check(built.has_value(), "encrypted continuity fixture must build");
+
+  auto unknown = built.value();
+  const auto version = unknown.find(L"V1");
+  check(version != std::wstring::npos, "continuity version marker must exist");
+  unknown.replace(version, 2U, L"V2");
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             unknown),
+        "unknown continuity version must fail closed");
+
+  auto uppercase = built.value();
+  const auto lowercase_hex = uppercase.find(L"ab");
+  check(lowercase_hex != std::wstring::npos,
+        "continuity fixture must contain lowercase hex");
+  uppercase.replace(lowercase_hex, 2U, L"AB");
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             uppercase),
+        "noncanonical uppercase hex must fail closed");
+
+  auto extra_secret_field = built.value() + L"|password=not-persisted";
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             extra_secret_field),
+        "unrecognized or secret-shaped fields must fail closed");
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             std::wstring(513U, L'A')),
+        "oversized continuity input must fail before unbounded parsing");
+
+  auto zero_image_id = continuity_fixture(false);
+  zero_image_id.image_id.fill(std::byte{0});
+  check(!ytec::winpeapp::build_direct_image_create_resume_continuity_v1(
+             zero_image_id),
+        "zero image identity must not be persisted");
+  auto missing_encryption_material = continuity_fixture(true);
+  missing_encryption_material.argon2.salt.fill(std::byte{0});
+  check(!ytec::winpeapp::build_direct_image_create_resume_continuity_v1(
+             missing_encryption_material),
+        "encrypted continuity must bind public salt and nonce material");
+
+  auto selected = continuity_fixture(false);
+  selected.selected_partition_numbers = {2U, 4U, 128U};
+  const auto selected_token = ytec::winpeapp::
+      build_direct_image_create_resume_continuity_v1(selected);
+  check(selected_token.has_value(), "partial continuity fixture must build");
+  const auto q = selected_token.value().find(L"|Q");
+  check(q != std::wstring::npos, "partial continuity must contain Q bitmap");
+  auto zero_bitmap = selected_token.value();
+  zero_bitmap.replace(q + 2U, 32U, 32U, L'0');
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             zero_bitmap),
+        "empty partition bitmap must fail closed");
+  auto uppercase_bitmap = selected_token.value();
+  const auto first_bitmap_hex = uppercase_bitmap.find_first_of(
+      L"abcdef", q + 2U);
+  check(first_bitmap_hex != std::wstring::npos,
+        "partial bitmap fixture must contain lowercase hex");
+  uppercase_bitmap[first_bitmap_hex] = static_cast<wchar_t>(
+      uppercase_bitmap[first_bitmap_hex] - L'a' + L'A');
+  check(!ytec::winpeapp::parse_direct_image_create_resume_continuity_v1(
+             uppercase_bitmap),
+        "noncanonical uppercase partition bitmap must fail closed");
 }
 
 void mbr_exact_image_is_fully_verified_and_committed() {
@@ -602,6 +735,96 @@ void gpt_exact_image_preserves_partition_roles() {
             verified.value().manifest.partitions[1].role ==
                 ytec::imageformat::TsumugiManifestPartitionRole::data,
         "GPT type GUID roles must be retained in the typed manifest");
+}
+
+void gpt_partial_image_reads_only_selected_partition_payload() {
+  TemporaryDirectory temporary;
+  const auto path = temporary.image(L"gpt-partition-2.tsumugi");
+  auto source = source_disk(ytec::diskmodel::PartitionStyle::gpt);
+  auto state = std::make_shared<DependencyState>();
+  auto request = request_for(source, path);
+  request.selected_partition_numbers = {2U};
+  const auto result = ytec::winpeapp::execute_direct_image_create(
+      request, dependencies_for(source, gpt_storage(), state));
+  check(result.has_value(), "selected GPT partition image must succeed");
+  check(
+      result.value().imaged_partition_count == 1U &&
+          result.value().logical_payload_bytes == 1024U * 1024U,
+      "partial GPT report must count only the selected partition");
+
+  const auto verified = ytec::imageformat::verify_tsumugi_image_v1({
+      .image_path = path,
+      .storage_file_system =
+          ytec::imageformat::TsumugiImageStorageFileSystem::ntfs,
+  });
+  check(verified.has_value(), "partial GPT image must reopen and verify");
+  const auto& manifest = verified.value().manifest;
+  const auto manifest_flags = static_cast<std::uint32_t>(manifest.flags);
+  const auto selection_flag = static_cast<std::uint32_t>(
+      ytec::imageformat::TsumugiManifestFlags::partition_selection);
+  const auto selected_flag = static_cast<std::uint32_t>(
+      ytec::imageformat::TsumugiManifestPartitionFlags::selected);
+  check(
+      manifest.partitions.size() == 2U &&
+          (manifest_flags & selection_flag) != 0U &&
+          (static_cast<std::uint32_t>(manifest.partitions[0].flags) &
+           selected_flag) == 0U &&
+          manifest.partitions[0].minimum_target_bytes == 0U &&
+          manifest.partitions[0].planned_target_bytes == 0U &&
+          manifest.partitions[0].payload_logical_offset == 0U &&
+          manifest.partitions[0].payload_logical_length == 0U &&
+          (static_cast<std::uint32_t>(manifest.partitions[1].flags) &
+           selected_flag) != 0U &&
+          manifest.partitions[1].source_partition_number == 2U &&
+          manifest.partitions[1].payload_logical_offset ==
+              2U * 1024U * 1024U &&
+          manifest.partitions[1].payload_logical_length ==
+              1024U * 1024U,
+      "manifest must retain the full layout while binding payload only to partition 2");
+
+  const bool read_unselected_esp_payload = std::any_of(
+      state->reads->begin(),
+      state->reads->end(),
+      [](const auto& read) {
+        constexpr std::uint64_t esp_begin = 1024U * 1024U;
+        constexpr std::uint64_t esp_end = 1536U * 1024U;
+        const auto read_end = read.first + read.second;
+        return read.first < esp_end && read_end > esp_begin;
+      });
+  check(
+      !read_unselected_esp_payload,
+      "unselected ESP payload must never be read by the direct image stream");
+}
+
+void invalid_or_rescue_partition_selection_stops_before_environment_io() {
+  TemporaryDirectory temporary;
+  auto source = source_disk(ytec::diskmodel::PartitionStyle::gpt);
+  for (const auto selection : {
+           std::vector<std::uint32_t>{99U},
+           std::vector<std::uint32_t>{2U, 2U}}) {
+    auto state = std::make_shared<DependencyState>();
+    auto request = request_for(
+        source, temporary.image(L"invalid-partition-selection.tsumugi"));
+    request.selected_partition_numbers = selection;
+    const auto result = ytec::winpeapp::execute_direct_image_create(
+        request, dependencies_for(source, gpt_storage(), state));
+    check(
+        !result.has_value() && state->read_only_calls == 0U &&
+            state->guards.empty(),
+        "unknown or duplicate partition selection must fail before environment I/O");
+  }
+
+  auto state = std::make_shared<DependencyState>();
+  auto rescue = request_for(
+      source, temporary.image(L"partial-rescue-not-supported.tsumugi"));
+  rescue.rescue_mode = true;
+  rescue.selected_partition_numbers = {2U};
+  const auto result = ytec::winpeapp::execute_direct_image_create(
+      rescue, dependencies_for(source, gpt_storage(), state));
+  check(
+      !result.has_value() && state->read_only_calls == 0U &&
+          state->guards.empty(),
+      "rescue mode must remain whole-disk and reject partial selection before I/O");
 }
 
 void mbr_rescue_image_uses_owned_staging_without_final_source_reread() {
@@ -747,6 +970,10 @@ int main() {
        mbr_fast_image_keeps_required_gates_without_complete_claim},
       {"gpt_exact_image_preserves_partition_roles",
        gpt_exact_image_preserves_partition_roles},
+      {"gpt_partial_image_reads_only_selected_partition_payload",
+       gpt_partial_image_reads_only_selected_partition_payload},
+      {"invalid_or_rescue_partition_selection_stops_before_environment_io",
+       invalid_or_rescue_partition_selection_stops_before_environment_io},
       {"mbr_rescue_image_uses_owned_staging_without_final_source_reread",
        mbr_rescue_image_uses_owned_staging_without_final_source_reread},
       {"same_physical_destination_stops_before_source_change",
@@ -759,6 +986,10 @@ int main() {
        cancellation_before_start_performs_no_environment_call},
       {"unknown_verification_mode_performs_no_environment_call",
        unknown_verification_mode_performs_no_environment_call},
+      {"resume_continuity_roundtrips_without_secret_material",
+       resume_continuity_roundtrips_without_secret_material},
+      {"resume_continuity_rejects_noncanonical_unknown_and_oversized_input",
+       resume_continuity_rejects_noncanonical_unknown_and_oversized_input},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {

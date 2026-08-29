@@ -546,15 +546,84 @@ void test_pending_view_explains_zero_io_gate() {
   const auto view = build_adk_management_view(
       tsumugi_1_0_0_adk_manifest());
   check(
-      !view.execution_gate_open && !view.platform_creation_permitted &&
+      view.manifest_structure_valid &&
+          !view.primary_source_pins_confirmed &&
+          !view.unattended_no_restart_confirmed &&
+          !view.execution_gate_open && !view.platform_creation_permitted &&
           !view.path_selection_permitted,
       "pending product pins must block platform and path selection");
   check(
       view.status.find(L"通信") != std::wstring::npos &&
           view.status.find(L"UAC") != std::wstring::npos &&
           view.summary.find(L"停止理由") != std::wstring::npos &&
+          view.summary.find(L"予期しない再起動なし") !=
+              std::wstring::npos &&
           view.payload_rows.size() == 3U,
       "blocked view must explain the gate and fixed payload summary");
+}
+
+void test_action_review_path_contract_and_evidence_are_pure() {
+  const auto pending = tsumugi_1_0_0_adk_manifest();
+  const auto pending_review = build_adk_management_action_review(
+      pending, AdkManagementAction::offline_layout_install);
+  check(
+      pending_review.manifest_structure_valid &&
+          !pending_review.execution_gate_open &&
+          pending_review.path_selection ==
+              AdkManagementPathSelection::existing_offline_layout &&
+          !pending_review.path_picker_permitted &&
+          pending_review.requires_eula_review,
+      "closed release gate must preserve action explanation but forbid the picker");
+  check(
+      !make_adk_offline_layout_destination(
+          pending, L"\\\\server\\must-not-be-observed"),
+      "closed release gate must stop before a hostile parent path is accepted");
+
+  const auto manifest = make_manifest();
+  const auto export_review = build_adk_management_action_review(
+      manifest, AdkManagementAction::create_offline_layout);
+  check(
+      export_review.execution_gate_open &&
+          export_review.path_picker_permitted &&
+          export_review.path_selection ==
+              AdkManagementPathSelection::new_offline_layout_parent &&
+          export_review.requires_network_retrieval &&
+          export_review.requires_eula_review,
+      "confirmed export must require EULA, network, and a new-layout parent picker");
+  const auto destination = make_adk_offline_layout_destination(
+      manifest, L"C:\\Synthetic\\Exports");
+  check(
+      destination.has_value() &&
+          destination.value() ==
+              std::filesystem::path(
+                  L"C:\\Synthetic\\Exports\\Tsumugi-ADK-Offline-10.1.26100.2454"),
+      "offline export must derive one fixed direct child without I/O");
+
+  const auto uninstall_review = build_adk_management_action_review(
+      manifest, AdkManagementAction::uninstall_managed);
+  check(
+      uninstall_review.requires_explicit_uninstall_confirmation &&
+          !uninstall_review.requires_eula_review &&
+          uninstall_review.path_selection ==
+              AdkManagementPathSelection::none,
+      "managed uninstall must have its own explicit confirmation and no picker");
+
+  const auto evidence = format_adk_evidence_event(
+      manifest,
+      AdkEvidenceFacts{
+          .action = AdkManagementAction::create_offline_layout,
+          .stage = AdkEvidenceStage::consent_accepted,
+          .path_selected = true,
+          .complete_eula_presented = true,
+          .explicit_consent = true,
+      });
+  check(
+      evidence.has_value() && evidence.value().size() <= 1'024U &&
+          evidence.value().find(L"manifest=") != std::wstring::npos &&
+          evidence.value().find(L"full_eula=1") != std::wstring::npos &&
+          evidence.value().find(L"C:\\") == std::wstring::npos &&
+          evidence.value().find(L"https://") == std::wstring::npos,
+      "evidence must retain bounded facts without paths, URLs, or EULA body");
 }
 
 void test_managed_record_fixed_schema_roundtrip_and_rejects_unknown() {
@@ -755,6 +824,8 @@ int main() {
        test_ui_contract_and_compact_layout},
       {"pending_view_explains_zero_io_gate",
        test_pending_view_explains_zero_io_gate},
+      {"action_review_path_contract_and_evidence_are_pure",
+       test_action_review_path_contract_and_evidence_are_pure},
       {"managed_record_fixed_schema_roundtrip_and_rejects_unknown",
        test_managed_record_fixed_schema_roundtrip_and_rejects_unknown},
       {"mock_official_and_offline_install_routes",

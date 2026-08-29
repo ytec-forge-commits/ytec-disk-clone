@@ -16,14 +16,17 @@ Zstandard／LINE Seed JP／Argon2のライセンス本文をWIMへ追加し、�
 同じローカルADKの`WinPE-FontSupport-JA-JP.cab`をDISMで適用します。
 CAB、WIM、ISO、ADKツールを配布ZIPまたはリポジトリへ含めません。
 
-現在は1.0.0再設計中であり、配布候補の生成だけで正式リリース可能とは扱いません。
+現在は`1.0.0-internal-beta`という開発識別子の公開前検証候補であり、正式版1.0.0では
+ありません。本製品は会社・勤務先の社内ソフトではなく、Y-TEC名義で個人開発・公開する
+オープンソースソフトウェアです。
+配布候補の生成だけで正式リリース可能とは扱いません。
 全製品経路、正式OS VM、代表実機、文書・Hash監査の合格後に候補を封印します。
 
 リポジトリ外の新規パスへ配布候補を作る例:
 
 ```powershell
 ./scripts/New-PortablePackage.ps1 `
-  -OutputRoot C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-candidate `
+  -OutputRoot C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-internal-beta `
   -BuildPackage
 ```
 
@@ -32,8 +35,8 @@ CAB、WIM、ISO、ADKツールを配布ZIPまたはリポジトリへ含めま�
 
 ```powershell
 ./scripts/Test-PortablePackageArtifact.ps1 `
-  -PackageRoot C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-candidate `
-  -ZipPath C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-candidate.zip
+  -PackageRoot C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-internal-beta `
+  -ZipPath C:\TsumugiRelease\Y-TEC-Tsumugi-Drive-1.0.0-internal-beta.zip
 ```
 
 CIは一意な一時フォルダーで実ZIPを作成し、日本語ファイル名を保持する

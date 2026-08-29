@@ -590,7 +590,11 @@ query_windows_volume_bitmap_bindings(
 
   std::vector<ExpectedVolumePartition> expected;
   for (const auto& partition : source_mbr.partitions) {
-    if (partition.type != 0x07) {
+    const bool snapshot_or_locked_basic = partition.type == 0x07;
+    const bool locked_non_system_fat32 =
+        (partition.type == 0x0B || partition.type == 0x0C) &&
+        !partition.active;
+    if (!snapshot_or_locked_basic && !locked_non_system_fat32) {
       continue;
     }
     const auto offset = checked_partition_offset(

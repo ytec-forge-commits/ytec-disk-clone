@@ -37,6 +37,23 @@ struct Fat32Geometry final {
   }
 };
 
+struct ExFatGeometry final {
+  std::uint32_t bytes_per_sector{};
+  std::uint32_t sectors_per_cluster{};
+  std::uint64_t total_sectors{};
+  std::uint32_t fat_offset_sectors{};
+  std::uint32_t fat_length_sectors{};
+  std::uint32_t cluster_heap_offset_sectors{};
+  std::uint32_t cluster_count{};
+  std::uint32_t root_directory_cluster{};
+};
+
+enum class BasicDataFileSystem : std::uint8_t {
+  ntfs,
+  fat32,
+  exfat,
+};
+
 class INtfsUsedRangeProvider {
  public:
   virtual ~INtfsUsedRangeProvider() = default;
@@ -50,6 +67,8 @@ enum class PartitionCopyMode : std::uint8_t {
   efi_fat32_raw,
   microsoft_reserved_recreate,
   ntfs_used_clusters,
+  basic_fat32_raw,
+  basic_exfat_raw,
   recovery_ntfs_raw,
 };
 
@@ -97,6 +116,20 @@ struct OfflineGptCloneReport final {
     std::uint64_t partition_size_bytes);
 
 [[nodiscard]] Result<Fat32Geometry> parse_fat32_geometry(
+    std::span<const std::byte> boot_sector,
+    std::uint32_t expected_sector_size,
+    std::uint64_t partition_size_bytes);
+
+[[nodiscard]] Result<ExFatGeometry> parse_exfat_geometry(
+    std::span<const std::byte> boot_sector,
+    std::uint32_t expected_sector_size,
+    std::uint64_t partition_size_bytes);
+
+// Re-identifies a Microsoft basic-data filesystem from the on-disk boot
+// sector.  A partition-table type alone is never sufficient because GPT basic
+// data and MBR type 0x07 can each carry more than one filesystem.
+[[nodiscard]] Result<BasicDataFileSystem>
+classify_basic_data_file_system(
     std::span<const std::byte> boot_sector,
     std::uint32_t expected_sector_size,
     std::uint64_t partition_size_bytes);

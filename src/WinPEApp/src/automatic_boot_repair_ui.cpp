@@ -499,7 +499,7 @@ build_executable_automatic_boot_repair_review(
         clonecore::ErrorCode::confirmation_required,
         ERROR_NOT_FOUND,
         L"自動起動修復のシステム領域作成",
-        L"ESPまたはBIOSシステム領域の新設は追加確認UIが未接続のため実行しません");
+        L"ESPまたはBIOSシステム領域の新設は、独立した追加確認トランザクション完了後の再解析が必要です");
   }
   if (plan.system_partition_selection_policy_needed ||
       plan.system_partition_candidates.size() != 1U) {
@@ -545,7 +545,7 @@ build_executable_automatic_boot_repair_review(
         ERROR_NOT_SUPPORTED,
         L"UEFI起動修復のWinRE方針",
         L"同じ対象ディスク内の既存WinRE登録とWinre.wimを完全確認できません。"
-        L"WinRE再登録UIが未接続のため、通常起動だけを修復して完了扱いにはしません");
+        L"この単一対象shortcutはWinRE再登録を所有しません。製品の選択・再登録経路を使用してください");
   }
   if (uefi && !bootrepair::efi_boot_ownership_allows_microsoft_rebuild(
                   system.efi_ownership)) {
@@ -557,7 +557,7 @@ build_executable_automatic_boot_repair_review(
                 bootrepair::EfiBootOwnershipState::
                     non_microsoft_or_untrusted_present
             ? L"第三者または未検証のEFI内容を検出しました。保持／削除選択が"
-              L"未接続のため、既定で保持して修復を開始しません"
+              L"ない単一対象shortcutでは修復を開始しません。製品の保持／専用削除経路を使用してください"
             : L"ESPのEFI所有権を一意に確認できません。曖昧な状態では修復を開始しません");
   }
   if (bios && system.efi_ownership.state !=
@@ -640,7 +640,7 @@ build_product_automatic_boot_repair_choice_request(
         clonecore::ErrorCode::confirmation_required,
         ERROR_NOT_FOUND,
         L"自動起動修復のシステム領域作成",
-        L"既存ESPまたはActive領域がありません。新設トランザクションは未接続のため実行しません");
+        L"既存ESPまたはActive領域がありません。先に独立した追加確認トランザクションを完了し、再解析してください");
   }
   if (plan.system_partition_candidates.size() != 1U ||
       plan.system_partition_selection_policy_needed) {

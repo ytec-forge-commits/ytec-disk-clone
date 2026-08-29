@@ -1,9 +1,16 @@
 #include "ytec/windowsapp/adk_consent_review.h"
 
+#include "ytec/imageformat/sha256.h"
+
+#include <array>
+#include <cstddef>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -19,6 +26,41 @@ void check(const bool condition, std::string message) {
 
 std::string hash_of(const char value) {
   return std::string(64U, value);
+}
+
+std::vector<std::byte> synthetic_eula() {
+  constexpr std::string_view body =
+      "{\\rtf1\\ansi Synthetic verified ADK EULA for product review.}";
+  std::vector<std::byte> bytes;
+  bytes.reserve(body.size());
+  for (const char character : body) {
+    bytes.push_back(static_cast<std::byte>(
+        static_cast<unsigned char>(character)));
+  }
+  return bytes;
+}
+
+std::string hex_digest(const ytec::imageformat::Sha256Digest& digest) {
+  constexpr std::array<char, 16U> hex{
+      '0', '1', '2', '3', '4', '5', '6', '7',
+      '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+  std::string text;
+  text.reserve(digest.size() * 2U);
+  for (const std::byte value : digest) {
+    const auto byte = std::to_integer<unsigned int>(value);
+    text.push_back(hex[(byte >> 4U) & 0x0FU]);
+    text.push_back(hex[byte & 0x0FU]);
+  }
+  return text;
+}
+
+void bind_synthetic_eula(
+    ytec::windowsapp::AdkReleaseManifest& manifest,
+    const std::span<const std::byte> body) {
+  const auto digest = ytec::imageformat::sha256(body);
+  check(digest.has_value(), "synthetic EULA hash must be available");
+  manifest.embedded_eula.expected_byte_count = body.size();
+  manifest.embedded_eula.expected_sha256 = hex_digest(digest.value());
 }
 
 ytec::windowsapp::AdkReleaseManifest confirmed_manifest() {
@@ -162,9 +204,9 @@ void test_product_manifest_names_exact_eula_ui_blocker() {
           !view.ready_to_present && !view.consent_permitted,
       "The product must remain blocked until the verified receipt reaches the UI");
   check(
-      view.message.find(L"製品UIは未接続") !=
+      view.message.find(L"EULA全文レビュー") !=
           std::wstring::npos,
-      "The blocker must name the exact remaining presentation UI gap");
+      "The blocker must name the complete product review requirement");
 
   const auto fabricated_receipt = receipt_for(manifest);
   const auto blocked_consent =
@@ -306,6 +348,268 @@ void test_receipt_requires_matching_container_range_and_member() {
       "A different Burn UX member must fail");
 }
 
+void test_verified_document_requires_full_scroll_and_explicit_acceptance() {
+  auto manifest = confirmed_manifest();
+  auto body = synthetic_eula();
+  bind_synthetic_eula(manifest, body);
+  ytec::windowsapp::AdkVerifiedEulaDocument document{
+      .receipt = receipt_for(manifest),
+      .rtf_document = body,
+      .staging_removed = true,
+  };
+  check(
+      static_cast<bool>(
+          ytec::windowsapp::validate_adk_eula_document_for_presentation(
+              manifest, document)),
+      "exact verified in-memory RTF should reach the presentation boundary");
+
+  for (const auto [width, height] :
+       std::array<std::pair<int, int>, 3U>{
+           std::pair{640, 480},
+           std::pair{960, 516},
+           std::pair{1280, 720},
+       }) {
+    const auto layout =
+        ytec::windowsapp::calculate_adk_consent_dialog_layout(
+            width, height);
+    check(layout.bounded, "supported EULA dialog layout must be bounded");
+  }
+
+  auto result = ytec::windowsapp::complete_adk_consent_presentation(
+      manifest,
+      document,
+      ytec::windowsapp::AdkConsentPresentationFacts{
+          .official_sources_presented = true,
+          .acquired_components_presented = true,
+          .eula_body_opened = true,
+          .eula_body_end_reached = false,
+          .explicit_acceptance = true,
+      });
+  check(!result, "checkbox acceptance before the document end must fail");
+  result = ytec::windowsapp::complete_adk_consent_presentation(
+      manifest,
+      document,
+      ytec::windowsapp::AdkConsentPresentationFacts{
+          .official_sources_presented = true,
+          .acquired_components_presented = true,
+          .eula_body_opened = true,
+          .eula_body_end_reached = true,
+          .explicit_acceptance = false,
+      });
+  check(!result, "full scroll without explicit acceptance must fail");
+  result = ytec::windowsapp::complete_adk_consent_presentation(
+      manifest,
+      document,
+      ytec::windowsapp::AdkConsentPresentationFacts{
+          .official_sources_presented = true,
+          .acquired_components_presented = true,
+          .eula_body_opened = true,
+          .eula_body_end_reached = true,
+          .explicit_acceptance = true,
+      });
+  check(result.has_value(), "full exact review plus acceptance should bind acknowledgement");
+
+  document.rtf_document.back() ^= std::byte{0x01};
+  check(
+      !ytec::windowsapp::validate_adk_eula_document_for_presentation(
+          manifest, document),
+      "tampered in-memory RTF must fail before presentation");
+}
+
+struct PreparationState final {
+  const ytec::windowsapp::AdkReleaseManifest* manifest{};
+  std::size_t create_count{};
+  std::size_t download_count{};
+  std::size_t offline_count{};
+  std::size_t installer_count{};
+  std::size_t cleanup_count{};
+};
+
+class PreparationPlatform final
+    : public ytec::windowsapp::IAdkAcquisitionPlatform {
+ public:
+  explicit PreparationPlatform(std::shared_ptr<PreparationState> state)
+      : state_(std::move(state)) {}
+
+  ytec::clonecore::Result<ytec::windowsapp::AdkInstalledState>
+  inspect_installed_state(
+      const ytec::windowsapp::AdkReleaseManifest&) override {
+    return unexpected<ytec::windowsapp::AdkInstalledState>();
+  }
+
+  ytec::clonecore::Result<ytec::windowsapp::AdkStagingArea>
+  create_new_staging_area(std::uint64_t) override {
+    ++state_->create_count;
+    return ytec::clonecore::Result<
+        ytec::windowsapp::AdkStagingArea>::success(
+        ytec::windowsapp::AdkStagingArea{
+            .root = L"C:\\Synthetic\\adk-eula-stage",
+            .created_new = true,
+            .reparse_point = false,
+        });
+  }
+
+  ytec::clonecore::Result<ytec::windowsapp::AdkStagedPayloadReceipt>
+  download_to_new_file(
+      const ytec::windowsapp::AdkDownloadRequest& request) override {
+    ++state_->download_count;
+    const auto& pin = state_->manifest->payloads.front();
+    return ytec::clonecore::Result<
+        ytec::windowsapp::AdkStagedPayloadReceipt>::success(
+        ytec::windowsapp::AdkStagedPayloadReceipt{
+            .staged_path = request.create_new_destination,
+            .byte_count = pin.expected_byte_count,
+            .created_new = true,
+            .source_regular_file = true,
+            .source_reparse_point = false,
+            .visited_urls = {request.exact_source_url},
+            .effective_url = request.exact_source_url,
+        });
+  }
+
+  ytec::clonecore::Result<ytec::windowsapp::AdkStagedPayloadReceipt>
+  stage_offline_payload(
+      const ytec::windowsapp::AdkOfflineStageRequest& request) override {
+    ++state_->offline_count;
+    const auto& pin = state_->manifest->payloads.front();
+    return ytec::clonecore::Result<
+        ytec::windowsapp::AdkStagedPayloadReceipt>::success(
+        ytec::windowsapp::AdkStagedPayloadReceipt{
+            .staged_path = request.create_new_destination,
+            .offline_source_path =
+                request.layout_root / request.exact_relative_path,
+            .byte_count = pin.expected_byte_count,
+            .created_new = true,
+            .source_regular_file = true,
+            .source_reparse_point = false,
+        });
+  }
+
+  ytec::clonecore::Result<std::string> sha256_file(
+      const std::filesystem::path&,
+      std::uint64_t) override {
+    return ytec::clonecore::Result<std::string>::success(
+        state_->manifest->payloads.front().expected_sha256);
+  }
+
+  ytec::clonecore::Status verify_authenticode(
+      const std::filesystem::path&,
+      std::wstring_view) override {
+    return ytec::clonecore::success_status();
+  }
+
+  ytec::clonecore::Result<std::wstring> query_payload_version(
+      const std::filesystem::path&) override {
+    return ytec::clonecore::Result<std::wstring>::success(
+        state_->manifest->payloads.front().expected_payload_version);
+  }
+
+  ytec::clonecore::Result<std::vector<ytec::windowsapp::AdkVerifiedPayload>>
+  expand_and_verify_patch_archive(
+      const ytec::windowsapp::AdkPatchArchiveExpandRequest&) override {
+    return unexpected<std::vector<ytec::windowsapp::AdkVerifiedPayload>>();
+  }
+
+  ytec::clonecore::Result<std::uint32_t> run_verified_silent_installer(
+      const ytec::windowsapp::AdkSilentInstallRequest&) override {
+    ++state_->installer_count;
+    return unexpected<std::uint32_t>();
+  }
+
+  ytec::clonecore::Status remove_staging_area(
+      const ytec::windowsapp::AdkStagingArea&) override {
+    ++state_->cleanup_count;
+    return ytec::clonecore::success_status();
+  }
+
+ private:
+  template <typename T>
+  ytec::clonecore::Result<T> unexpected() const {
+    return ytec::clonecore::Result<T>::failure(ytec::clonecore::Error{
+        .code = ytec::clonecore::ErrorCode::internal_error,
+        .native_code = 1U,
+        .operation = L"synthetic unexpected call",
+        .message = L"synthetic unexpected call",
+    });
+  }
+
+  std::shared_ptr<PreparationState> state_;
+};
+
+void test_document_preparation_is_single_bootstrap_and_no_installer() {
+  auto manifest = confirmed_manifest();
+  auto body = synthetic_eula();
+  bind_synthetic_eula(manifest, body);
+  auto state = std::make_shared<PreparationState>();
+  state->manifest = &manifest;
+  PreparationPlatform platform(state);
+  const auto extractor = [&body, &manifest](
+                             const ytec::windowsapp::AdkPinnedPayload&,
+                             const ytec::windowsapp::AdkVerifiedPayload&,
+                             const ytec::windowsapp::AdkEmbeddedEulaPin&) {
+    return ytec::clonecore::Result<
+        ytec::windowsapp::AdkVerifiedEulaDocument>::success(
+        ytec::windowsapp::AdkVerifiedEulaDocument{
+            .receipt = receipt_for(manifest),
+            .rtf_document = body,
+        });
+  };
+  auto prepared = ytec::windowsapp::prepare_adk_consent_document(
+      manifest,
+      ytec::windowsapp::AdkConsentDocumentPreparationRequest{
+          .source = ytec::windowsapp::AdkAcquisitionSource::official_download,
+          .explicit_eula_retrieval_confirmed = true,
+      },
+      platform,
+      extractor);
+  check(
+      prepared.has_value() && prepared.value().staging_removed &&
+          state->create_count == 1U && state->download_count == 1U &&
+          state->offline_count == 0U && state->installer_count == 0U &&
+          state->cleanup_count == 1U,
+      "official preparation must verify one bootstrap, remove staging, and never install");
+
+  state->create_count = 0U;
+  state->download_count = 0U;
+  state->offline_count = 0U;
+  state->cleanup_count = 0U;
+  prepared = ytec::windowsapp::prepare_adk_consent_document(
+      manifest,
+      ytec::windowsapp::AdkConsentDocumentPreparationRequest{
+          .source =
+              ytec::windowsapp::AdkAcquisitionSource::official_offline_layout,
+          .offline_layout_root = L"C:\\Synthetic\\OfficialAdkLayout",
+          .explicit_eula_retrieval_confirmed = true,
+      },
+      platform,
+      extractor);
+  check(
+      prepared.has_value() && state->create_count == 1U &&
+          state->download_count == 0U && state->offline_count == 1U &&
+          state->installer_count == 0U && state->cleanup_count == 1U,
+      "offline preparation must read one fixed local bootstrap and never install");
+
+  state->create_count = 0U;
+  state->offline_count = 0U;
+  state->cleanup_count = 0U;
+  auto pending_manifest =
+      ytec::windowsapp::tsumugi_1_0_0_adk_manifest();
+  state->manifest = &pending_manifest;
+  prepared = ytec::windowsapp::prepare_adk_consent_document(
+      pending_manifest,
+      ytec::windowsapp::AdkConsentDocumentPreparationRequest{
+          .source = ytec::windowsapp::AdkAcquisitionSource::official_download,
+          .explicit_eula_retrieval_confirmed = true,
+      },
+      platform,
+      extractor);
+  check(
+      !prepared && state->create_count == 0U &&
+          state->download_count == 0U && state->offline_count == 0U &&
+          state->cleanup_count == 0U,
+      "closed product gate must stop before every platform method");
+}
+
 }  // namespace
 
 int main() {
@@ -316,6 +620,8 @@ int main() {
     test_ready_review_contains_every_exact_source_and_component();
     test_consent_requires_full_same_review_and_explicit_acceptance();
     test_receipt_requires_matching_container_range_and_member();
+    test_verified_document_requires_full_scroll_and_explicit_acceptance();
+    test_document_preparation_is_single_bootstrap_and_no_installer();
     std::cout << "adk consent review tests: PASS\n";
     return 0;
   } catch (const TestFailure& failure) {

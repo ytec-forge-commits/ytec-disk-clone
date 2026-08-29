@@ -21,9 +21,12 @@ Y-TEC Tsumugi Drive セキュリティ報告
 報告先
 ------
 
-GitHubリポジトリのSecurityタブで「Report a vulnerability」が利用できる場合は、
-Private Vulnerability Reportingから非公開で報告してください。利用できない場合も
-公開Issueへ連絡要求や技術詳細を投稿せず、リポジトリのSECURITY.mdに記載された
-最新の非公開報告経路を確認してください。応答時間のSLAや報奨金制度はありません。
+GitHub Private Vulnerability Reportingの非公開報告フォームを使用してください。
+
+https://github.com/ytec-commits/ytec-disk-clone/security/advisories/new
+
+フォームが利用できない場合も、公開Issueへ連絡要求や技術詳細を投稿せず、
+リポジトリのSECURITY.mdに記載された最新の非公開報告経路を確認して
+ください。応答時間のSLAや報奨金制度はありません。
 
 公開Issueへexploit、ログ、画像、識別子、秘密情報を投稿しないでください。

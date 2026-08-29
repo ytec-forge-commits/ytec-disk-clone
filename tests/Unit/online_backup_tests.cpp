@@ -192,9 +192,11 @@ class MockWorkflowBackend final
         ytec::vssrequester::SnapshotMapping{
             .original_volume_guid_path =
                 volumes.front().volume_guid_path,
-            .snapshot_id = L"snapshot-71",
+            .snapshot_id = L"{00000000-0000-0000-0000-000000000071}",
             .snapshot_device_path =
                 L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy71",
+            .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+            .creation_timestamp = 1'071,
         },
     });
   }

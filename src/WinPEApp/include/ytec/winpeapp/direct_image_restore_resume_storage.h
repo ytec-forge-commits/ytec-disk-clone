@@ -14,6 +14,7 @@ enum class ResumeStoragePathRole : std::uint8_t {
   checkpoint_data,
   image,
   active_rescue,
+  image_output_parent,
 };
 
 // One normalized storage domain obtained while the relevant file/directory,

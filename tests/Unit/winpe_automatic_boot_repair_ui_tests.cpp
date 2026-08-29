@@ -2,7 +2,9 @@
 
 #include <cstdlib>
 #include <cstddef>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -423,7 +425,7 @@ void exact_ok_and_review_cancellation_are_explicit() {
         "the non-interruptible BCD transaction must hide review actions");
 }
 
-void ambiguous_and_unimplemented_plans_fail_closed() {
+void ambiguous_and_separate_plans_fail_closed() {
   auto plan = mbr_plan();
   plan.windows_installations.push_back(plan.windows_installations.front());
   plan.windows_selection_policy_needed = true;
@@ -480,7 +482,7 @@ void ambiguous_and_unimplemented_plans_fail_closed() {
   check(!result.has_value() &&
             result.error().code ==
                 ytec::clonecore::ErrorCode::confirmation_required,
-        "UEFI must stop when WinRE repair would be required but is unconnected");
+        "the single-target shortcut must defer WinRE repair to the product choice route");
 }
 
 void execution_recheck_requires_the_complete_reviewed_plan() {
@@ -958,6 +960,46 @@ void verified_winre_fallback_is_bound_to_the_registration_transaction() {
         "WinRE evidence drift must invalidate the bound registration action");
 }
 
+void product_gui_routes_missing_system_partition_transaction() {
+  std::ifstream input(YTEC_WINPE_GUI_SOURCE_PATH, std::ios::binary);
+  check(input.is_open(), "WinPE product GUI source must be readable");
+  const std::string source{
+      std::istreambuf_iterator<char>(input),
+      std::istreambuf_iterator<char>()};
+
+  const auto prompt = source.find(
+      "prompt_system_partition_creation_windows_choice(");
+  const auto observation = source.find(
+      "make_windows_system_partition_creation_platform()", prompt);
+  const auto review = source.find(
+      "review_system_partition_creation(", observation);
+  const auto retained = source.find(
+      "inspected_system_partition_creation", review);
+  const auto exact_ok = source.find(
+      "control_text(state.repair_token) != L\"OK\"", retained);
+  const auto execute = source.find(
+      "execute_system_partition_creation(", exact_ok);
+  const auto completed = source.find(
+      "completed_creation_plan", execute);
+  const auto next_review = source.find(
+      "start_boot_review(*state, std::move(plan), choice.value())",
+      completed);
+
+  check(prompt != std::string::npos,
+        "missing-system route must expose a dedicated Windows shrink choice");
+  check(observation != std::string::npos && review != std::string::npos,
+        "product route must observe with VDS and retain the pure creation review");
+  check(retained != std::string::npos && exact_ok != std::string::npos &&
+            execute != std::string::npos,
+        "product route must require exact uppercase OK before creation execution");
+  check(completed != std::string::npos && next_review != std::string::npos,
+        "a verified created system partition must feed the normal BCD review route");
+  check(source.find(
+            "rollback未確認のため、後続の起動修復を開始しません。",
+            completed) != std::string::npos,
+        "rollback-incomplete creation must fail closed before BCD repair");
+}
+
 }  // namespace
 
 int main() {
@@ -967,13 +1009,14 @@ int main() {
     unambiguous_gpt_plan_builds_existing_esp_transaction_request();
     initial_standalone_inspection_requires_every_reviewed_field();
     exact_ok_and_review_cancellation_are_explicit();
-    ambiguous_and_unimplemented_plans_fail_closed();
+    ambiguous_and_separate_plans_fail_closed();
     execution_recheck_requires_the_complete_reviewed_plan();
     reviewed_multi_windows_partial_maps_to_one_safe_batch();
     current_pc_nvram_requires_separate_explicit_uefi_choice();
     windows_priority_requires_explicit_user_choice();
     third_party_efi_defaults_to_preserve_and_delete_is_explicit();
     verified_winre_fallback_is_bound_to_the_registration_transaction();
+    product_gui_routes_missing_system_partition_transaction();
     std::cout << "winpe automatic boot repair ui tests: PASS\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

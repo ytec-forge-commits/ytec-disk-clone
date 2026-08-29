@@ -1,6 +1,7 @@
 #include "ytec/windowsapp/online_direct_shrink_clone.h"
 
 #include "ytec/diskmodel/disk_inventory.h"
+#include "ytec/imageformat/partition_snapshot.h"
 #include "ytec/imageformat/tsumugi_physical_restore.h"
 
 #include <Windows.h>
@@ -26,6 +27,10 @@ constexpr std::wstring_view kVolumeOne =
     L"\\\\?\\Volume{11111111-2222-3333-4444-555555555555}\\";
 constexpr std::wstring_view kVolumeTwo =
     L"\\\\?\\Volume{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}\\";
+constexpr std::wstring_view kVolumeThree =
+    L"\\\\?\\Volume{12345678-1234-5678-9ABC-123456789ABC}\\";
+constexpr std::wstring_view kVolumeFour =
+    L"\\\\?\\Volume{87654321-4321-8765-CBA9-CBA987654321}\\";
 
 struct TestFailure final {
   std::string message;
@@ -42,6 +47,68 @@ std::array<std::byte, Size> filled(const std::uint8_t value) {
   std::array<std::byte, Size> result{};
   result.fill(static_cast<std::byte>(value));
   return result;
+}
+
+std::array<std::byte, 16U> mbr_type(const std::uint8_t value) {
+  std::array<std::byte, 16U> result{};
+  result[0] = static_cast<std::byte>(value);
+  return result;
+}
+
+void write_u32_le(
+    std::vector<std::byte>& bytes,
+    const std::size_t offset,
+    const std::uint32_t value) {
+  for (std::size_t index = 0U; index < 4U; ++index) {
+    bytes[offset + index] = static_cast<std::byte>(
+        (value >> static_cast<unsigned int>(index * 8U)) & 0xFFU);
+  }
+}
+
+std::vector<std::byte> canonical_mbr_snapshot(
+    const ytec::diskmodel::DiskInfo& disk,
+    const std::array<std::byte, 440U>& bootstrap,
+    const std::uint32_t signature) {
+  std::vector<std::byte> sector(512U, std::byte{0});
+  std::copy(bootstrap.begin(), bootstrap.end(), sector.begin());
+  write_u32_le(sector, 440U, signature);
+  for (const auto& source : disk.partitions) {
+    check(source.number >= 1U && source.number <= 4U,
+          "synthetic MBR primary number must fit");
+    const std::size_t offset = 446U + (source.number - 1U) * 16U;
+    sector[offset] = source.bootable ? std::byte{0x80} : std::byte{0};
+    sector[offset + 1U] = std::byte{0xFE};
+    sector[offset + 2U] = std::byte{0xFF};
+    sector[offset + 3U] = std::byte{0xFF};
+    sector[offset + 4U] = source.type == L"0x27"
+        ? std::byte{0x27}
+        : std::byte{0x07};
+    sector[offset + 5U] = std::byte{0xFE};
+    sector[offset + 6U] = std::byte{0xFF};
+    sector[offset + 7U] = std::byte{0xFF};
+    write_u32_le(
+        sector,
+        offset + 8U,
+        static_cast<std::uint32_t>(source.offset_bytes / 512U));
+    write_u32_le(
+        sector,
+        offset + 12U,
+        static_cast<std::uint32_t>(source.size_bytes / 512U));
+  }
+  sector[510] = std::byte{0x55};
+  sector[511] = std::byte{0xAA};
+  auto encoded = ytec::imageformat::build_partition_snapshot_v1(
+      ytec::imageformat::PartitionSnapshot{
+          .style = ytec::imageformat::PartitionTableStyle::mbr,
+          .source_disk_size = disk.size_bytes,
+          .logical_sector_size = 512U,
+          .regions = {ytec::imageformat::PartitionTableRegion{
+              .disk_offset = 0U,
+              .data = std::move(sector),
+          }},
+      });
+  check(encoded.has_value(), "synthetic canonical MBR snapshot must build");
+  return encoded.take_value();
 }
 
 ytec::clonecore::Error mock_error(
@@ -415,6 +482,179 @@ std::unique_ptr<GptProductFixture> gpt_product_fixture() {
   });
 }
 
+struct MbrProductFixture final {
+  ytec::diskmodel::DiskInfo source;
+  ytec::diskmodel::DiskInfo target;
+  ytec::windowsshrink::ShrinkSourceAnalysis analysis;
+  ytec::windowsapp::WindowsDirectShrinkProductPlanningRequest request;
+};
+
+std::unique_ptr<MbrProductFixture> mbr_product_fixture() {
+  constexpr std::uint64_t kSystemOffset = 1ULL * kMiB;
+  constexpr std::uint64_t kSystemSize = 512ULL * kMiB;
+  constexpr std::uint64_t kWindowsOffset = kSystemOffset + kSystemSize;
+  constexpr std::uint64_t kWindowsSize = 40ULL * kGiB;
+  constexpr std::uint64_t kRecoveryOffset = kWindowsOffset + kWindowsSize;
+  constexpr std::uint64_t kRecoverySize = 1ULL * kGiB;
+  constexpr std::uint64_t kDataOffset = kRecoveryOffset + kRecoverySize;
+  constexpr std::uint64_t kDataSize = 4ULL * kGiB;
+
+  auto source = source_disk(true);
+  source.size_bytes = 64ULL * kGiB;
+  source.sector_count = source.size_bytes / source.logical_sector_size;
+  source.partitions = {
+      partition(1U, kSystemOffset, kSystemSize, L"System", true),
+      partition(2U, kWindowsOffset, kWindowsSize, L"Windows"),
+      partition(3U, kRecoveryOffset, kRecoverySize, L"Recovery"),
+      partition(4U, kDataOffset, kDataSize, L"Data"),
+  };
+  source.partitions[2].type = L"0x27";
+  auto target = target_disk(32ULL * kGiB);
+
+  auto source_identity_result =
+      ytec::diskmodel::make_stable_disk_identity(source, true);
+  check(
+      source_identity_result.has_value(),
+      "synthetic MBR source identity must build");
+  auto source_identity = source_identity_result.take_value();
+  ytec::windowsshrink::ShrinkSourceAnalysis analysis{
+      .source = source_identity,
+      .physical_sector_size = source.physical_sector_size,
+      .partition_style =
+          ytec::migrationcore::MigrationPartitionStyle::mbr,
+      .windows_version = ytec::windowsshrink::WindowsSourceVersion{
+          .major = 10U,
+          .minor = 0U,
+          .build = 22631U,
+          .architecture = "AMD64",
+      },
+      .bitlocker_fully_decrypted = true,
+      .created_utc = "2026-08-20T00:00:00Z",
+      .app_version = "1.0.0-beta",
+      .partition_snapshot = std::vector<std::byte>(
+          4096U, static_cast<std::byte>(0x5AU)),
+      .partitions = {
+          ytec::windowsshrink::AnalyzedShrinkPartition{
+              .source_table_index = 1U,
+              .role =
+                  ytec::migrationcore::MigrationPartitionRole::bios_system,
+              .file_system =
+                  ytec::migrationcore::MigrationFileSystem::ntfs,
+              .source_offset_bytes = kSystemOffset,
+              .source_size_bytes = kSystemSize,
+              .used_bytes = 100ULL * kMiB,
+              .cluster_size = 4096U,
+              .active = true,
+              .label = L"System Reserved",
+              .type_id = mbr_type(0x07U),
+          },
+          ytec::windowsshrink::AnalyzedShrinkPartition{
+              .source_table_index = 2U,
+              .role = ytec::migrationcore::MigrationPartitionRole::windows,
+              .file_system =
+                  ytec::migrationcore::MigrationFileSystem::ntfs,
+              .source_offset_bytes = kWindowsOffset,
+              .source_size_bytes = kWindowsSize,
+              .used_bytes = 8ULL * kGiB,
+              .cluster_size = 4096U,
+              .label = L"Windows",
+              .type_id = mbr_type(0x07U),
+          },
+          ytec::windowsshrink::AnalyzedShrinkPartition{
+              .source_table_index = 3U,
+              .role = ytec::migrationcore::MigrationPartitionRole::recovery,
+              .file_system =
+                  ytec::migrationcore::MigrationFileSystem::ntfs,
+              .source_offset_bytes = kRecoveryOffset,
+              .source_size_bytes = kRecoverySize,
+              .used_bytes = 700ULL * kMiB,
+              .cluster_size = 4096U,
+              .label = L"Recovery",
+              .type_id = mbr_type(0x27U),
+          },
+          ytec::windowsshrink::AnalyzedShrinkPartition{
+              .source_table_index = 4U,
+              .role = ytec::migrationcore::MigrationPartitionRole::data,
+              .file_system =
+                  ytec::migrationcore::MigrationFileSystem::ntfs,
+              .source_offset_bytes = kDataOffset,
+              .source_size_bytes = kDataSize,
+              .used_bytes = 1ULL * kGiB,
+              .cluster_size = 4096U,
+              .label = L"Data",
+              .type_id = mbr_type(0x07U),
+          },
+      },
+      .content_volumes = {
+          ytec::windowsshrink::AnalyzedShrinkVolume{
+              .source_table_index = 1U,
+              .volume_guid_path = std::wstring(kVolumeOne),
+          },
+          ytec::windowsshrink::AnalyzedShrinkVolume{
+              .source_table_index = 2U,
+              .volume_guid_path = std::wstring(kVolumeTwo),
+          },
+          ytec::windowsshrink::AnalyzedShrinkVolume{
+              .source_table_index = 3U,
+              .volume_guid_path = std::wstring(kVolumeThree),
+          },
+          ytec::windowsshrink::AnalyzedShrinkVolume{
+              .source_table_index = 4U,
+              .volume_guid_path = std::wstring(kVolumeFour),
+          },
+      },
+  };
+  auto request = ytec::windowsapp::WindowsDirectShrinkProductPlanningRequest{
+      .administrator = true,
+      .target_is_active_rescue_media = false,
+      .reviewed_source = source,
+      .reviewed_target = target,
+      .operation_id = filled<16U>(0x7BU),
+      .mode_choice = ytec::migrationcore::DirectCloneModeChoice::shrink,
+      .partition_style_choice = ytec::migrationcore::
+          DirectClonePartitionStyleChoice::mbr_to_gpt,
+      .surplus_allocation = ytec::migrationcore::
+          ShrinkSurplusAllocation::automatic_proportional,
+      .windows_major = 10U,
+      .windows_minor = 0U,
+      .windows_build = 22631U,
+      .windows_architecture = "AMD64",
+      .analysis_created_utc = "2026-08-20T00:00:00Z",
+      .app_version = "1.0.0-beta",
+  };
+  return std::make_unique<MbrProductFixture>(MbrProductFixture{
+      .source = std::move(source),
+      .target = std::move(target),
+      .analysis = std::move(analysis),
+      .request = std::move(request),
+  });
+}
+
+void bind_mbr_preserve_analysis(MbrProductFixture& fixture) {
+  fixture.request.partition_style_choice = ytec::migrationcore::
+      DirectClonePartitionStyleChoice::preserve;
+  const auto bootstrap = filled<440U>(0xB7U);
+  fixture.analysis.mbr_bootstrap = bootstrap;
+  fixture.analysis.partition_snapshot = canonical_mbr_snapshot(
+      fixture.source, bootstrap, 0x10203040U);
+  auto inspected = ytec::imageformat::inspect_partition_snapshot_v1(
+      fixture.analysis.partition_snapshot);
+  check(
+      inspected.has_value() && inspected.value().regions.size() == 1U,
+      "synthetic MBR snapshot must inspect");
+  auto sector_hash = ytec::imageformat::sha256(
+      inspected.value().regions.front().data);
+  check(sector_hash.has_value(), "synthetic MBR sector hash must build");
+  fixture.request.mbr_preserve_binding =
+      ytec::windowsapp::WindowsDirectShrinkMbrPlanBinding{
+          .source_sector0_hash = sector_hash.take_value(),
+          .source_bootstrap = bootstrap,
+          .source_disk_signature = 0x10203040U,
+          .target_disk_signature = 0x50607080U,
+          .planning_signature_inventory_hash = filled<32U>(0xC1U),
+      };
+}
+
 ytec::clonecore::StableDiskIdentity identity(
     const ytec::diskmodel::DiskInfo& disk) {
   auto result = ytec::diskmodel::make_stable_disk_identity(
@@ -440,7 +680,7 @@ ytec::migrationcore::DirectClonePlan direct_plan(const Fixture& fixture) {
 
 ytec::windowsapp::WindowsDirectShrinkPlanningRequest planning_request(
     const Fixture& fixture) {
-  return ytec::windowsapp::WindowsDirectShrinkPlanningRequest{
+  ytec::windowsapp::WindowsDirectShrinkPlanningRequest request{
       .administrator = true,
       .bitlocker_fully_decrypted = true,
       .target_is_active_rescue_media = false,
@@ -453,6 +693,19 @@ ytec::windowsapp::WindowsDirectShrinkPlanningRequest planning_request(
       .operation_id = filled<16U>(0x31U),
       .ntfs_volumes = fixture.volumes,
   };
+  if (fixture.direct_request.source_style ==
+      ytec::migrationcore::MigrationPartitionStyle::mbr) {
+    request.expected_source_partition_snapshot_hash = filled<32U>(0xA1U);
+    request.mbr_preserve_binding =
+        ytec::windowsapp::WindowsDirectShrinkMbrPlanBinding{
+            .source_sector0_hash = filled<32U>(0xA1U),
+            .source_bootstrap = filled<440U>(0xB1U),
+            .source_disk_signature = 0x10203040U,
+            .target_disk_signature = 0x50607080U,
+            .planning_signature_inventory_hash = filled<32U>(0xA2U),
+        };
+  }
+  return request;
 }
 
 ytec::windowsapp::WindowsDirectShrinkClonePlan product_plan(
@@ -483,11 +736,23 @@ struct MockState final {
   bool final_commit_called{};
   bool malformed_apply_readback{};
   bool malformed_boot_readback{};
+  bool fail_prepare_final_extents{};
+  bool drift_checkpoint_during_prepare{};
+  bool malformed_final_ordering_evidence{};
+  bool leave_checkpoint_retirement_pending{};
   bool fail_final_commit{};
   bool mismatch_workflow_snapshot_set{};
   bool duplicate_snapshot_device_path{};
   bool fail_capture_capacity{};
   bool partial_archive_cleaned{};
+  bool drift_source_after_snapshot_cleanup{};
+  bool final_extents_prepared{};
+  bool boot_completed{};
+  bool final_revalidated{};
+  std::uint32_t selection_reidentify_count{};
+  std::uint32_t mbr_safety_observer_count{};
+  bool collide_mbr_signature_after_cleanup{};
+  bool target_already_has_planned_mbr_signature{};
 };
 
 class MockPlatform final
@@ -531,12 +796,16 @@ class MockPlatform final
     const auto count = static_cast<std::uint64_t>(std::count_if(
         tasks.begin(), tasks.end(), [](const auto& task) {
           return task.kind != ytec::windowsapp::
-              WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim;
+                  WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim &&
+              task.kind != ytec::windowsapp::
+                  WindowsDirectShrinkPartitionTaskKind::copy_exact_raw;
         }));
     std::uint64_t verified_bytes{};
     for (const auto& task : tasks) {
       if (task.kind != ytec::windowsapp::
-              WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim) {
+                  WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim &&
+          task.kind != ytec::windowsapp::
+                  WindowsDirectShrinkPartitionTaskKind::copy_exact_raw) {
         verified_bytes += (std::min)(task.target_size_bytes, 1ULL * kMiB);
       }
     }
@@ -609,6 +878,34 @@ class MockPlatform final
     });
   }
 
+  ytec::clonecore::Result<
+      ytec::windowsapp::WindowsDirectShrinkExactRawPartitionEvidence>
+  copy_exact_raw_and_verify(
+      const ytec::windowsapp::WindowsDirectShrinkPartitionTask& task,
+      const ytec::clonecore::ISourceDiskReader&) override {
+    state_->events.push_back(
+        "copy_raw_" +
+        std::to_string(task.source_table_index.value_or(0U)));
+    const auto digest = filled<32U>(
+        static_cast<std::uint8_t>(0xA0U + task.target_number));
+    return ytec::clonecore::Result<ytec::windowsapp::
+        WindowsDirectShrinkExactRawPartitionEvidence>::success({
+        .source_table_index = task.source_table_index.value_or(0U),
+        .target_number = task.target_number,
+        .verified_target_bytes = task.source_size_bytes,
+        .verified_chunk_count = 1U,
+        .source_sha256 = digest,
+        .target_sha256 = digest,
+        .target_write_digest = digest,
+        .source_reader_read_only = true,
+        .source_extent_exact = true,
+        .every_write_flushed = true,
+        .every_chunk_read_back = true,
+        .complete_target_hash_verified = true,
+        .target_offline = true,
+    });
+  }
+
   ytec::clonecore::Status discard_exact_staged_archive(
       const ytec::windowsapp::
           WindowsDirectShrinkStagedArchiveEvidence& archive) override {
@@ -661,8 +958,15 @@ class MockPlatform final
 
   ytec::clonecore::Result<ytec::windowsapp::WindowsDirectShrinkBootEvidence>
   finalize_boot_from_staged_layout_and_verify(
-      const ytec::windowsapp::WindowsDirectShrinkClonePlan&) override {
+      const ytec::windowsapp::WindowsDirectShrinkClonePlan& plan) override {
     state_->events.push_back("finalize_boot");
+    if (!state_->snapshots_deleted || !state_->final_extents_prepared) {
+      return mock_failure<ytec::windowsapp::WindowsDirectShrinkBootEvidence>(
+          ytec::clonecore::ErrorCode::verification_failed,
+          ERROR_INVALID_STATE,
+          L"合成boot順序");
+    }
+    state_->boot_completed = true;
     return ytec::clonecore::Result<
         ytec::windowsapp::WindowsDirectShrinkBootEvidence>::success({
         .required = true,
@@ -672,6 +976,11 @@ class MockPlatform final
         .recovery_configuration_verified =
             !state_->malformed_boot_readback,
         .target_offline = true,
+        .target_only_reconstruction = true,
+        .exact_target_volume_extents = true,
+        .legacy_bios = plan.partition_style() ==
+            ytec::migrationcore::MigrationPartitionStyle::mbr,
+        .real_boot_not_claimed = true,
     });
   }
 
@@ -698,11 +1007,45 @@ class MockPlatform final
 
   ytec::clonecore::Result<
       ytec::windowsapp::WindowsDirectShrinkCheckpointEvidence>
-  revalidate_before_final_commit(
+  prepare_final_extents_keep_incomplete_and_verify(
       const ytec::windowsapp::WindowsDirectShrinkClonePlan&,
       const ytec::windowsapp::
           WindowsDirectShrinkCheckpointEvidence& expected) override {
+    state_->events.push_back("prepare_final_extents_incomplete");
+    if (state_->fail_prepare_final_extents || !state_->snapshots_deleted) {
+      return mock_failure<ytec::windowsapp::
+          WindowsDirectShrinkCheckpointEvidence>(
+          ytec::clonecore::ErrorCode::io_failed,
+          ERROR_WRITE_FAULT,
+          L"合成final extent準備");
+    }
+    state_->final_extents_prepared = true;
+    auto observed = expected;
+    if (state_->drift_checkpoint_during_prepare) {
+      ++observed.revision;
+      observed.record_hash = filled<32U>(0xE1U);
+    }
+    return ytec::clonecore::Result<ytec::windowsapp::
+        WindowsDirectShrinkCheckpointEvidence>::success(
+        std::move(observed));
+  }
+
+  ytec::clonecore::Result<
+      ytec::windowsapp::WindowsDirectShrinkCheckpointEvidence>
+  revalidate_before_final_commit(
+      const ytec::windowsapp::WindowsDirectShrinkClonePlan& plan,
+      const ytec::windowsapp::
+          WindowsDirectShrinkCheckpointEvidence& expected) override {
     state_->events.push_back("revalidate_after_snapshot_delete");
+    if (!state_->final_extents_prepared ||
+        (plan.boot_finalization_required() && !state_->boot_completed)) {
+      return mock_failure<ytec::windowsapp::
+          WindowsDirectShrinkCheckpointEvidence>(
+          ytec::clonecore::ErrorCode::verification_failed,
+          ERROR_INVALID_STATE,
+          L"合成最終再検証順序");
+    }
+    state_->final_revalidated = true;
     return ytec::clonecore::Result<ytec::windowsapp::
         WindowsDirectShrinkCheckpointEvidence>::success(expected);
   }
@@ -715,29 +1058,91 @@ class MockPlatform final
           WindowsDirectShrinkCheckpointEvidence& commit_ready) override {
     state_->events.push_back("commit_final_layout");
     state_->final_commit_called = true;
-    if (state_->fail_final_commit || !state_->snapshots_deleted) {
+    if (state_->fail_final_commit || !state_->snapshots_deleted ||
+        !state_->final_extents_prepared || !state_->final_revalidated ||
+        (plan.boot_finalization_required() && !state_->boot_completed)) {
       return mock_failure<ytec::windowsapp::
           WindowsDirectShrinkFinalCommitEvidence>(
           ytec::clonecore::ErrorCode::io_failed,
           ERROR_WRITE_FAULT,
           L"合成最終commit");
     }
+    const bool targeted = plan.surplus_allocation() ==
+        ytec::migrationcore::ShrinkSurplusAllocation::
+            selected_data_partition;
+    const bool mbr = plan.partition_style() ==
+        ytec::migrationcore::MigrationPartitionStyle::mbr;
+    const auto targeted_task = targeted
+        ? std::find_if(
+              plan.tasks().begin(),
+              plan.tasks().end(),
+              [&plan](const auto& task) {
+                return task.source_table_index ==
+                        plan.surplus_target_source_table_index() &&
+                    plan.staging().final_growth_owner_target_number ==
+                        task.target_number;
+              })
+        : plan.tasks().end();
     return ytec::clonecore::Result<ytec::windowsapp::
         WindowsDirectShrinkFinalCommitEvidence>::success({
         .committed_layout_hash = plan.final_layout_hash(),
         .aggregate_write_digest = commit_ready.aggregate_write_digest,
+        .source_reidentified = true,
+        .source_layout_unchanged = true,
         .target_reidentified = true,
         .staging_identity_reverified = true,
         .checkpoint_reverified = true,
         .staging_removed = true,
-        .checkpoint_retired = true,
+        .checkpoint_retired =
+            !state_->leave_checkpoint_retirement_pending,
+        .checkpoint_retirement_pending =
+            state_->leave_checkpoint_retirement_pending,
+        .construction_layout_non_bootable =
+            !state_->malformed_final_ordering_evidence,
+        .checkpoint_retained_through_extensions_and_boot =
+            !state_->malformed_final_ordering_evidence,
+        .boot_completed_before_final_layout_publication =
+            !state_->malformed_final_ordering_evidence,
+        .final_layout_published_before_checkpoint_retirement =
+            !state_->malformed_final_ordering_evidence,
         .hidden_final_layout_published_and_read_back = true,
         .extended_ntfs_partition_count = plan.ntfs_extension_task_count(),
         .every_required_ntfs_extension_verified = true,
+        .targeted_surplus_source_table_index = targeted_task !=
+                plan.tasks().end()
+            ? targeted_task->source_table_index
+            : std::nullopt,
+        .targeted_surplus_target_number = targeted_task != plan.tasks().end()
+            ? std::optional<std::uint32_t>{targeted_task->target_number}
+            : std::nullopt,
+        .targeted_surplus_previous_file_system_bytes = targeted_task !=
+                plan.tasks().end()
+            ? targeted_task->construction_size_bytes
+            : 0U,
+        .targeted_surplus_final_file_system_bytes = targeted_task !=
+                plan.tasks().end()
+            ? targeted_task->target_size_bytes
+            : 0U,
+        .targeted_surplus_owner_verified =
+            targeted_task != plan.tasks().end(),
+        .targeted_surplus_exact_size_verified =
+            targeted_task != plan.tasks().end(),
+        .targeted_surplus_readback_verified =
+            targeted_task != plan.tasks().end(),
         .every_write_flushed = true,
         .every_write_read_back = true,
         .primary_layout_committed_last = true,
         .target_offline = true,
+        .final_partition_style = plan.partition_style(),
+        .source_mbr_sector0_unchanged = mbr,
+        .source_mbr_bootstrap_unchanged = mbr,
+        .target_mbr_signature_collision_free = mbr,
+        .final_mbr_sector0_read_back_verified = mbr,
+        .final_mbr_disk_signature = mbr
+            ? plan.mbr_preserve_binding()->target_disk_signature
+            : 0U,
+        .final_mbr_active_partition_count =
+            mbr && plan.boot_finalization_required() ? 1U : 0U,
     });
   }
 
@@ -751,6 +1156,35 @@ class MockPlatform final
 
  private:
   std::shared_ptr<MockState> state_;
+};
+
+class SyntheticReadOnlyDisk final : public ytec::clonecore::ISourceDiskReader {
+ public:
+  SyntheticReadOnlyDisk(
+      const std::uint64_t size_bytes,
+      const std::uint32_t logical_sector_size) noexcept
+      : size_bytes_(size_bytes), logical_sector_size_(logical_sector_size) {}
+
+  std::uint64_t size_bytes() const noexcept override { return size_bytes_; }
+  std::uint32_t logical_sector_size() const noexcept override {
+    return logical_sector_size_;
+  }
+  ytec::clonecore::Result<std::vector<std::byte>> read(
+      const std::uint64_t offset,
+      const std::size_t length) const override {
+    if (offset > size_bytes_ || length > size_bytes_ - offset) {
+      return mock_failure<std::vector<std::byte>>(
+          ytec::clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_PARAMETER,
+          L"synthetic read-only source");
+    }
+    return ytec::clonecore::Result<std::vector<std::byte>>::success(
+        std::vector<std::byte>(length, std::byte{0x5A}));
+  }
+
+ private:
+  std::uint64_t size_bytes_{};
+  std::uint32_t logical_sector_size_{};
 };
 
 std::size_t event_index(
@@ -789,14 +1223,49 @@ ExecutionHarness harness(
   result.dependencies.reidentify_selection =
       [state, observed](const auto&, const auto&) mutable {
         state->events.push_back("reidentify_selection");
+        ++state->selection_reidentify_count;
+        if (state->selection_reidentify_count >= 2U) {
+          state->events.push_back(
+              "reidentify_source_after_snapshot_cleanup");
+        }
+        auto current = observed;
+        if (state->drift_source_after_snapshot_cleanup &&
+            state->selection_reidentify_count >= 2U) {
+          current.source.partitions.front().size_bytes -= kMiB;
+        }
         return ytec::clonecore::Result<
-            ytec::diskmodel::ReidentifiedPhysicalClone>::success(observed);
+            ytec::diskmodel::ReidentifiedPhysicalClone>::success(
+                std::move(current));
       };
   result.dependencies.reidentify_confirmed =
       [state, observed](const auto&, const auto&, const auto&) mutable {
         state->events.push_back("reidentify_confirmed");
         return ytec::clonecore::Result<
             ytec::diskmodel::ReidentifiedPhysicalClone>::success(observed);
+      };
+  result.dependencies.observe_mbr_safety =
+      [state, request](const auto&, const auto&, const bool include_target) {
+        ++state->mbr_safety_observer_count;
+        const auto& binding = request.mbr_preserve_binding.value();
+        std::vector<std::uint32_t> connected{
+            binding.source_disk_signature};
+        if (state->collide_mbr_signature_after_cleanup &&
+            state->mbr_safety_observer_count >= 3U) {
+          connected.push_back(binding.target_disk_signature);
+        }
+        return ytec::clonecore::Result<ytec::windowsapp::
+            WindowsDirectShrinkMbrSafetyEvidence>::success({
+            .source_sector0_hash = binding.source_sector0_hash,
+            .source_bootstrap = binding.source_bootstrap,
+            .source_disk_signature = binding.source_disk_signature,
+            .connected_mbr_signatures_excluding_target = std::move(connected),
+            .target_mbr_signature = include_target
+                ? std::optional<std::uint32_t>{
+                      state->target_already_has_planned_mbr_signature
+                          ? binding.target_disk_signature
+                          : 0x90ABCDEFU}
+                : std::nullopt,
+        });
       };
   result.dependencies.make_platform =
       [state](const auto&, const auto&) {
@@ -816,7 +1285,8 @@ ExecutionHarness harness(
           ytec::vssrequester::SnapshotCopyCallback callback) {
         state->events.push_back("vss_begin");
         ytec::vssrequester::SnapshotCopyContext context{
-            .snapshot_set_id = L"SYNTHETIC-SET-A",
+            .snapshot_set_id =
+                L"{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}",
         };
         for (std::size_t index = 0U;
              index < workflow.volumes.size();
@@ -824,11 +1294,18 @@ ExecutionHarness harness(
           context.mappings.push_back(ytec::vssrequester::SnapshotMapping{
               .original_volume_guid_path =
                   workflow.volumes[index].volume_guid_path,
-              .snapshot_id = L"SNAP-" + std::to_wstring(index + 1U),
+              .snapshot_id =
+                  std::wstring(L"{00000000-0000-0000-0000-") +
+                  std::wstring(11U, L'0') +
+                  static_cast<wchar_t>(L'1' + index) + L"}",
               .snapshot_device_path =
                   L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy" +
                   std::to_wstring(
                       state->duplicate_snapshot_device_path ? 1U : index + 1U),
+              .provider_id =
+                  L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+              .creation_timestamp =
+                  static_cast<std::int64_t>(1'000U + index),
           });
         }
         const auto copied = callback(context);
@@ -851,6 +1328,21 @@ ExecutionHarness harness(
             .backup_completed = true,
             .snapshots_deleted = true,
         });
+      };
+  result.dependencies.open_read_only_raw_source =
+      [observed](const auto&) {
+        ytec::diskmodel::ReadOnlyPhysicalDiskHandle opened{
+            .observed = {
+                .observed = observed.source,
+                .identity = observed.source_identity,
+            },
+            .reader = std::make_unique<SyntheticReadOnlyDisk>(
+                observed.source.size_bytes,
+                observed.source.logical_sector_size),
+        };
+        return ytec::clonecore::Result<
+            ytec::diskmodel::ReadOnlyPhysicalDiskHandle>::success(
+            std::move(opened));
       };
   return result;
 }
@@ -877,13 +1369,60 @@ void test_safe_plan_binds_reviewed_extents_and_disjoint_staging() {
   const std::uint64_t final_end =
       plan.tasks()[0].target_offset_bytes + plan.tasks()[0].target_size_bytes;
   check(
-      plan.staging().offset_bytes == final_end &&
+      plan.checkpoint_offset_bytes() ==
+              ytec::windowsapp::kWindowsDirectShrinkCheckpointOffsetBytes &&
+          plan.checkpoint_offset_bytes() +
+                  ytec::windowsapp::
+                      kWindowsDirectShrinkCheckpointRecordBytes <=
+              kMiB &&
+          plan.tasks()[0].target_offset_bytes >= kMiB &&
+          plan.checkpoint_offset_bytes() +
+                  ytec::windowsapp::
+                      kWindowsDirectShrinkCheckpointRecordBytes <=
+              plan.tasks()[0].target_offset_bytes &&
+          plan.staging().offset_bytes == final_end &&
           plan.staging().archive_offset_bytes > plan.staging().offset_bytes &&
           plan.staging().archive_capacity_bytes ==
               plan.maximum_archive_upper_bound_bytes() &&
           plan.staging().offset_bytes + plan.staging().length_bytes <=
               fixture.target.size_bytes - 1ULL * kMiB,
-      "target-owned staging must be final-layout-disjoint and preserve tail metadata");
+      "fixed checkpoint must be final/growth-disjoint while target-owned staging preserves tail metadata");
+}
+
+void test_selected_data_surplus_is_bound_into_windows_plan_hashes() {
+  using ytec::migrationcore::ShrinkSurplusAllocation;
+  using ytec::windowsapp::build_windows_direct_shrink_clone_plan;
+
+  auto automatic_fixture = data_fixture();
+  automatic_fixture.direct_request.surplus_allocation =
+      ShrinkSurplusAllocation::automatic_proportional;
+  const auto automatic_direct = direct_plan(automatic_fixture);
+  auto automatic_request = planning_request(automatic_fixture);
+  const auto automatic = build_windows_direct_shrink_clone_plan(
+      automatic_request, automatic_direct);
+  check(automatic.has_value(), "Automatic single-data plan should build");
+
+  auto targeted_fixture = data_fixture();
+  targeted_fixture.direct_request.surplus_allocation =
+      ShrinkSurplusAllocation::selected_data_partition;
+  targeted_fixture.direct_request.surplus_target_source_table_index = 1U;
+  const auto targeted_direct = direct_plan(targeted_fixture);
+  auto targeted_request = planning_request(targeted_fixture);
+  const auto targeted = build_windows_direct_shrink_clone_plan(
+      targeted_request, targeted_direct);
+  check(targeted.has_value(), "Selected-data single-data plan should build");
+  check(
+      targeted.value().surplus_allocation() ==
+              ShrinkSurplusAllocation::selected_data_partition &&
+          targeted.value().surplus_target_source_table_index() == 1U &&
+          targeted.value().tasks().size() == automatic.value().tasks().size() &&
+          targeted.value().tasks()[0].target_size_bytes ==
+              automatic.value().tasks()[0].target_size_bytes &&
+          targeted.value().final_layout_hash() !=
+              automatic.value().final_layout_hash() &&
+          targeted.value().operation_plan().immutable_payload_hash !=
+              automatic.value().operation_plan().immutable_payload_hash,
+      "Equal single-data geometry must still hash the explicit policy and source table index");
 }
 
 void test_product_analysis_builds_representative_gpt_windows_plan() {
@@ -935,6 +1474,256 @@ void test_product_analysis_builds_representative_gpt_windows_plan() {
                          WindowsDirectShrinkPartitionTaskKind::
                              apply_ntfs_wim) == 2U,
       "product plan must recreate ESP/MSR, capture Windows/Recovery, and reserve verified automatic staging");
+}
+
+void test_product_analysis_builds_target_only_mbr_to_gpt_plan() {
+  const auto fixture = mbr_product_fixture();
+  const auto result = ytec::windowsapp::
+      build_windows_direct_shrink_clone_plan_from_analysis(
+          fixture->request, fixture->analysis);
+  check(
+      result.has_value(),
+      "read-only MBR analysis must build a target-only GPT reconstruction plan");
+  const auto& plan = result.value();
+  const auto mapping_for = [&](const std::uint32_t source_index) {
+    return std::find_if(
+        plan.source_partition_mappings().begin(),
+        plan.source_partition_mappings().end(),
+        [source_index](const auto& mapping) {
+          return mapping.source_table_index == source_index;
+        });
+  };
+  const auto bios = mapping_for(1U);
+  check(
+      plan.source_partition_style() ==
+              ytec::migrationcore::MigrationPartitionStyle::mbr &&
+          plan.partition_style() ==
+              ytec::migrationcore::MigrationPartitionStyle::gpt &&
+          plan.partition_style_choice() == ytec::migrationcore::
+              DirectClonePartitionStyleChoice::mbr_to_gpt &&
+          std::any_of(
+              plan.source_partition_snapshot_hash().begin(),
+              plan.source_partition_snapshot_hash().end(),
+              [](const std::byte value) { return value != std::byte{0}; }) &&
+          plan.source_partition_mappings().size() == 4U &&
+          bios != plan.source_partition_mappings().end() &&
+          bios->disposition == ytec::windowsapp::
+              WindowsDirectShrinkSourcePartitionDisposition::
+                  replaced_by_generated_uefi_boot &&
+          !bios->target_number.has_value() && bios->selected &&
+          bios->required,
+      "plan must bind MBR source, GPT target, raw snapshot, and deliberate BIOS-system replacement");
+  const auto generated_count = std::count_if(
+      plan.tasks().begin(), plan.tasks().end(), [](const auto& task) {
+        return !task.source_table_index.has_value() &&
+            (task.kind == ytec::windowsapp::
+                              WindowsDirectShrinkPartitionTaskKind::
+                                  recreate_efi_system ||
+             task.kind == ytec::windowsapp::
+                              WindowsDirectShrinkPartitionTaskKind::
+                                  recreate_microsoft_reserved);
+      });
+  const bool bios_volume_was_filtered = std::none_of(
+      plan.workflow().volumes.begin(),
+      plan.workflow().volumes.end(),
+      [](const auto& volume) {
+        return volume.volume_guid_path == kVolumeOne;
+      });
+  check(
+      generated_count == 2U && plan.archive_task_count() == 3U &&
+          plan.workflow().volumes.size() == 3U && bios_volume_was_filtered,
+      "target GPT must generate ESP/MSR, omit BIOS payload, and capture only surviving NTFS sources");
+}
+
+void test_product_analysis_builds_mbr_preserve_with_raw_binding() {
+  auto fixture = mbr_product_fixture();
+  bind_mbr_preserve_analysis(*fixture);
+  fixture->request.selected_source_table_indexes = {2U, 4U};
+  const auto result = ytec::windowsapp::
+      build_windows_direct_shrink_clone_plan_from_analysis(
+          fixture->request, fixture->analysis);
+  const auto active_count = result.has_value()
+      ? static_cast<std::size_t>(std::count_if(
+            result.value().tasks().begin(),
+            result.value().tasks().end(),
+            [](const auto& task) { return task.active; }))
+      : 0U;
+  check(
+      result.has_value() &&
+          result.value().source_partition_style() ==
+              ytec::migrationcore::MigrationPartitionStyle::mbr &&
+          result.value().partition_style() ==
+              ytec::migrationcore::MigrationPartitionStyle::mbr &&
+          result.value().mbr_preserve_binding().has_value() &&
+          result.value().mbr_preserve_binding()->target_disk_signature ==
+              0x50607080U &&
+          active_count == 1U && result.value().tasks().size() <= 4U,
+      "MBR preserve must bind raw sector0/bootstrap/fresh signature and exactly one Active primary into the immutable plan");
+
+  auto drifted = fixture->request;
+  drifted.mbr_preserve_binding->source_sector0_hash[0] ^= std::byte{0x01};
+  const auto rejected = ytec::windowsapp::
+      build_windows_direct_shrink_clone_plan_from_analysis(
+          drifted, fixture->analysis);
+  check(
+      !rejected.has_value() && rejected.error().code ==
+          ytec::clonecore::ErrorCode::identity_mismatch,
+      "raw MBR sector0 drift must fail before VSS or target I/O");
+}
+
+void test_mbr_active_windows_maps_without_separate_bios_payload() {
+  auto fixture = mbr_product_fixture();
+  fixture->request.reviewed_source.partitions.erase(
+      fixture->request.reviewed_source.partitions.begin());
+  fixture->analysis.partitions.erase(fixture->analysis.partitions.begin());
+  fixture->analysis.content_volumes.erase(
+      fixture->analysis.content_volumes.begin());
+  fixture->request.reviewed_source.partitions.front().bootable = true;
+  fixture->analysis.partitions.front().active = true;
+
+  const auto result = ytec::windowsapp::
+      build_windows_direct_shrink_clone_plan_from_analysis(
+          fixture->request, fixture->analysis);
+  check(
+      result.has_value(),
+      "an active Windows partition without separate System Reserved must be convertible");
+  const auto& mappings = result.value().source_partition_mappings();
+  const auto windows = std::find_if(
+      mappings.begin(), mappings.end(), [](const auto& mapping) {
+        return mapping.source_table_index == 2U;
+      });
+  check(
+      windows != mappings.end() &&
+          windows->disposition == ytec::windowsapp::
+              WindowsDirectShrinkSourcePartitionDisposition::
+                  transferred_to_target &&
+          windows->target_number.has_value() &&
+          std::none_of(
+              mappings.begin(), mappings.end(), [](const auto& mapping) {
+                return mapping.disposition == ytec::windowsapp::
+                    WindowsDirectShrinkSourcePartitionDisposition::
+                        replaced_by_generated_uefi_boot;
+              }),
+      "active Windows must transfer as Windows and must not invent a dropped BIOS source partition");
+}
+
+void test_mbr_to_gpt_same_capacity_without_staging_fails_closed() {
+  auto fixture = mbr_product_fixture();
+  fixture->request.reviewed_source.partitions.erase(
+      fixture->request.reviewed_source.partitions.begin());
+  fixture->request.reviewed_source.partitions.pop_back();
+  fixture->analysis.partitions.erase(fixture->analysis.partitions.begin());
+  fixture->analysis.partitions.pop_back();
+  fixture->analysis.content_volumes.erase(
+      fixture->analysis.content_volumes.begin());
+  fixture->analysis.content_volumes.pop_back();
+
+  auto& reviewed_windows = fixture->request.reviewed_source.partitions[0];
+  auto& reviewed_recovery = fixture->request.reviewed_source.partitions[1];
+  reviewed_windows.offset_bytes = 1ULL * kMiB;
+  reviewed_windows.size_bytes = 62ULL * kGiB;
+  reviewed_windows.bootable = true;
+  reviewed_recovery.offset_bytes = 1ULL * kMiB + 62ULL * kGiB;
+  reviewed_recovery.size_bytes = 1ULL * kGiB;
+  auto& analyzed_windows = fixture->analysis.partitions[0];
+  auto& analyzed_recovery = fixture->analysis.partitions[1];
+  analyzed_windows.source_offset_bytes = reviewed_windows.offset_bytes;
+  analyzed_windows.source_size_bytes = reviewed_windows.size_bytes;
+  analyzed_windows.used_bytes = analyzed_windows.source_size_bytes;
+  analyzed_windows.active = true;
+  analyzed_recovery.source_offset_bytes = reviewed_recovery.offset_bytes;
+  analyzed_recovery.source_size_bytes = reviewed_recovery.size_bytes;
+  analyzed_recovery.used_bytes = 900ULL * kMiB;
+  fixture->request.reviewed_target.size_bytes =
+      fixture->request.reviewed_source.size_bytes;
+  fixture->request.reviewed_target.sector_count =
+      fixture->request.reviewed_target.size_bytes / kSectorSize;
+
+  const auto result = ytec::windowsapp::
+      build_windows_direct_shrink_clone_plan_from_analysis(
+          fixture->request, fixture->analysis);
+  check(
+      !result.has_value() && result.error().native_code == ERROR_DISK_FULL,
+      "same-capacity conversion must fail when generated GPT boot regions leave no disjoint target-owned staging");
+}
+
+void test_mbr_to_gpt_rejects_unknown_type_snapshot_and_unsafe_selection() {
+  {
+    auto fixture = mbr_product_fixture();
+    fixture->request.reviewed_source.partitions[3].type = L"0x83";
+    fixture->analysis.partitions[3].type_id = mbr_type(0x83U);
+    const auto result = ytec::windowsapp::
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
+    check(
+        !result.has_value() && result.error().native_code ==
+            ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        "unknown MBR partition types must fail before a plan can reach VSS");
+  }
+  {
+    auto fixture = mbr_product_fixture();
+    fixture->request.reviewed_source.partitions[3].bootable = true;
+    fixture->analysis.partitions[3].active = true;
+    const auto result = ytec::windowsapp::
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
+    check(
+        !result.has_value(),
+        "an active basic partition cannot be forged as data instead of the analyzer-derived BIOS role");
+  }
+  {
+    auto fixture = mbr_product_fixture();
+    fixture->analysis.partition_snapshot.clear();
+    const auto result = ytec::windowsapp::
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
+    check(
+        !result.has_value(),
+        "MBR-to-GPT must require a raw partition snapshot digest");
+  }
+  {
+    auto fixture = mbr_product_fixture();
+    fixture->request.selected_source_table_indexes = {2U};
+    const auto result = ytec::windowsapp::
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
+    check(
+        result.has_value(),
+        "selecting Windows must force its BIOS and recovery dependencies while allowing optional data omission");
+    const auto& mappings = result.value().source_partition_mappings();
+    const auto data = std::find_if(
+        mappings.begin(), mappings.end(), [](const auto& mapping) {
+          return mapping.source_table_index == 4U;
+        });
+    const auto bios = std::find_if(
+        mappings.begin(), mappings.end(), [](const auto& mapping) {
+          return mapping.source_table_index == 1U;
+        });
+    const auto recovery = std::find_if(
+        mappings.begin(), mappings.end(), [](const auto& mapping) {
+          return mapping.source_table_index == 3U;
+        });
+    check(
+        data != mappings.end() && !data->selected && !data->required &&
+            data->disposition == ytec::windowsapp::
+                WindowsDirectShrinkSourcePartitionDisposition::
+                    omitted_unselected &&
+            bios != mappings.end() && !bios->requested && bios->selected &&
+            bios->required && recovery != mappings.end() &&
+            !recovery->requested && recovery->selected && recovery->required &&
+            result.value().archive_task_count() == 2U,
+        "complete mappings must distinguish forced boot/recovery dependencies from omitted optional data");
+  }
+  {
+    auto fixture = mbr_product_fixture();
+    fixture->request.selected_source_table_indexes = {4U};
+    const auto result = ytec::windowsapp::
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
+    check(
+        !result.has_value() && result.error().native_code == ERROR_NOT_FOUND,
+        "a system-disk plan must not omit the analyzed Windows partition");
+  }
 }
 
 void test_product_analysis_fails_closed_before_execution() {
@@ -1003,21 +1792,19 @@ void test_product_analysis_fails_closed_before_execution() {
         "final minimum layout and disjoint staging must fit before VSS or target I/O");
   }
   {
-    auto fixture = gpt_product_fixture();
-    fixture->request.reviewed_source.partition_style =
-        ytec::diskmodel::PartitionStyle::mbr;
-    for (auto& partition : fixture->request.reviewed_source.partitions) {
-      partition.style = ytec::diskmodel::PartitionStyle::mbr;
-    }
+    auto fixture = mbr_product_fixture();
+    bind_mbr_preserve_analysis(*fixture);
+    fixture->request.mbr_preserve_binding.reset();
     const auto result = ytec::windowsapp::
-        plan_windows_direct_shrink_clone_with_windows_apis(fixture->request);
+        build_windows_direct_shrink_clone_plan_from_analysis(
+            fixture->request, fixture->analysis);
     check(
         !result.has_value() && result.error().native_code == ERROR_NOT_SUPPORTED,
-        "MBR preserve and MBR-to-GPT must be rejected before opening a physical source");
+        "MBR preserve without a fresh raw/source/signature binding must be rejected by the pure planner before VSS or target I/O");
   }
 }
 
-void test_planner_rejects_unsupported_or_unbound_inputs_before_execution() {
+void exercise_planner_storage_bounds_and_automatic_surplus() {
   {
     auto fixture = std::make_unique<Fixture>(data_fixture(5ULL * kGiB));
     const auto direct = direct_plan(*fixture);
@@ -1060,6 +1847,9 @@ void test_planner_rejects_unsupported_or_unbound_inputs_before_execution() {
                 .has_value(),
         "automatic surplus must reserve staging inside one reviewed NTFS growth extent");
   }
+}
+
+void exercise_planner_unsupported_or_unbound_inputs() {
   {
     auto fixture = std::make_unique<Fixture>(data_fixture());
     const auto direct = direct_plan(*fixture);
@@ -1105,6 +1895,11 @@ void test_planner_rejects_unsupported_or_unbound_inputs_before_execution() {
              .has_value(),
         "exFAT must not silently enter the NTFS-only executor");
   }
+}
+
+void test_planner_rejects_unsupported_or_unbound_inputs_before_execution() {
+  exercise_planner_storage_bounds_and_automatic_surplus();
+  exercise_planner_unsupported_or_unbound_inputs();
 }
 
 void test_planner_rejects_identity_and_sector_inputs_before_execution() {
@@ -1199,6 +1994,19 @@ void test_success_orders_vss_cleanup_before_commit_and_keeps_offline() {
           result.value().execution.has_value() &&
           result.value().execution->applied_archive_count == 2U &&
           result.value().execution->boot.required &&
+          result.value().execution->final_commit.source_reidentified &&
+          result.value().execution->final_commit.source_layout_unchanged &&
+          result.value().execution->final_commit.
+              construction_layout_non_bootable &&
+          result.value().execution->final_commit.
+              checkpoint_retained_through_extensions_and_boot &&
+          result.value().execution->final_commit.
+              boot_completed_before_final_layout_publication &&
+          result.value().execution->final_commit.
+              final_layout_published_before_checkpoint_retirement &&
+          ytec::windowsapp::
+              has_valid_windows_direct_shrink_precomputed_completion_evidence(
+                  *result.value().execution) &&
           result.value().execution->target_left_offline &&
           !run.state->abort_called,
       "success requires every archive, boot evidence, and offline completion");
@@ -1238,10 +2046,159 @@ void test_success_orders_vss_cleanup_before_commit_and_keeps_offline() {
           event_index(*run.state, "seal_commit_ready") <
               event_index(*run.state, "snapshots_deleted") &&
           event_index(*run.state, "snapshots_deleted") <
+              event_index(
+                  *run.state,
+                  "reidentify_source_after_snapshot_cleanup") &&
+          event_index(
+              *run.state,
+              "reidentify_source_after_snapshot_cleanup") <
+              event_index(
+                  *run.state,
+                  "prepare_final_extents_incomplete") &&
+          event_index(
+              *run.state,
+              "prepare_final_extents_incomplete") <
+              event_index(*run.state, "finalize_boot") &&
+          event_index(*run.state, "finalize_boot") <
               event_index(*run.state, "revalidate_after_snapshot_delete") &&
           event_index(*run.state, "revalidate_after_snapshot_delete") <
               event_index(*run.state, "commit_final_layout"),
       "target publication must be last, after VSS cleanup and fresh revalidation");
+}
+
+void test_mixed_disk_exact_raw_uses_read_only_source_and_checkpoints() {
+  auto fixture = data_fixture();
+  constexpr std::uint64_t kRawOffset = 5ULL * kGiB;
+  constexpr std::uint64_t kRawSize = 1ULL * kGiB;
+  auto raw_disk_partition = partition(
+      2U, kRawOffset, kRawSize, L"Linux data");
+  raw_disk_partition.type = L"0x83";
+  fixture.source.partitions.push_back(std::move(raw_disk_partition));
+  auto raw_source = source_partition(
+      2U,
+      ytec::migrationcore::MigrationPartitionRole::data,
+      kRawSize,
+      kRawSize);
+  raw_source.partition.file_system =
+      ytec::migrationcore::MigrationFileSystem::unsupported;
+  raw_source.partition.cluster_size = 0U;
+  raw_source.partition.label = L"Linux data";
+  fixture.direct_request.source_partitions.push_back(std::move(raw_source));
+
+  auto request = planning_request(fixture);
+  request.exact_raw_partitions.push_back(
+      ytec::windowsapp::WindowsDirectShrinkExactRawPartition{
+          .source_table_index = 2U,
+          .source_offset_bytes = kRawOffset,
+          .source_size_bytes = kRawSize,
+          .source_partition_type = mbr_type(0x83U),
+      });
+  auto direct = direct_plan(fixture);
+  auto planned = ytec::windowsapp::build_windows_direct_shrink_clone_plan(
+      request, direct);
+  check(planned.has_value(), "mixed NTFS/RAW plan must build");
+  const auto raw_task = std::find_if(
+      planned.value().tasks().begin(),
+      planned.value().tasks().end(),
+      [](const auto& task) {
+        return task.kind == ytec::windowsapp::
+            WindowsDirectShrinkPartitionTaskKind::copy_exact_raw;
+      });
+  check(
+      raw_task != planned.value().tasks().end() &&
+          raw_task->source_size_bytes == kRawSize &&
+          raw_task->construction_size_bytes == kRawSize &&
+          raw_task->target_size_bytes == kRawSize &&
+          raw_task->source_partition_type == mbr_type(0x83U),
+      "RAW task must retain original extent size and MBR type");
+
+  auto run = harness(request);
+  const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+      planned.value(), run.options, run.dependencies);
+  check(result.has_value(), "mixed NTFS/RAW execution must complete");
+  check(
+      result.value().execution.has_value() &&
+          result.value().execution->copied_exact_raw_count == 1U &&
+          result.value().execution->applied_archive_count == 1U &&
+          result.value().execution->commit_ready_checkpoint.
+                  completed_task_count == planned.value().tasks().size(),
+      "execution report and checkpoint must bind one RAW and one NTFS payload");
+  check(
+      event_index(*run.state, "copy_raw_2") <
+              event_index(*run.state, "seal_commit_ready") &&
+          event_index(*run.state, "copy_raw_2") <
+              event_index(*run.state, "snapshots_deleted") &&
+          event_index(*run.state, "copy_raw_2") <
+              event_index(*run.state, "commit_final_layout"),
+      "RAW copy must run inside the callback before sealing and publication");
+}
+
+void test_source_layout_drift_after_snapshot_cleanup_blocks_final_commit() {
+  const auto fixture = system_fixture();
+  auto request = planning_request(fixture);
+  auto plan = product_plan(fixture);
+  auto run = harness(request);
+  run.state->drift_source_after_snapshot_cleanup = true;
+  const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+      plan, run.options, run.dependencies);
+  check(
+      result.has_value() &&
+          result.value().lifecycle.outcome ==
+              ytec::operationcore::OperationOutcome::failed &&
+          run.state->snapshots_deleted && run.state->abort_called &&
+          !run.state->final_commit_called &&
+          std::find(
+              run.state->events.begin(),
+              run.state->events.end(),
+              "prepare_final_extents_incomplete") ==
+              run.state->events.end() &&
+          std::find(
+              run.state->events.begin(),
+              run.state->events.end(),
+              "revalidate_after_snapshot_delete") == run.state->events.end(),
+      "source layout drift after VSS cleanup must abort before target revalidation or final publication");
+}
+
+void test_mbr_signature_rechecks_fail_closed_before_publication() {
+  {
+    const auto fixture = data_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->target_already_has_planned_mbr_signature = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() && result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::failed &&
+            run.state->mbr_safety_observer_count == 1U &&
+            std::find(
+                run.state->events.begin(),
+                run.state->events.end(),
+                "make_platform") == run.state->events.end(),
+        "a target already carrying the planned signature must fail before platform construction, VSS, or target I/O");
+  }
+  {
+    const auto fixture = data_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->collide_mbr_signature_after_cleanup = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() && result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::failed &&
+            run.state->mbr_safety_observer_count >= 3U &&
+            run.state->snapshots_deleted && run.state->abort_called &&
+            !run.state->final_commit_called &&
+            std::find(
+                run.state->events.begin(),
+                run.state->events.end(),
+                "prepare_final_extents_incomplete") ==
+                run.state->events.end(),
+        "a new connected-disk signature collision after VSS cleanup must retain the incomplete checkpoint and withhold final MBR publication");
+  }
 }
 
 void test_cancellation_aborts_offline_without_capture_or_commit() {
@@ -1326,8 +2283,18 @@ void test_malformed_apply_or_boot_evidence_never_commits() {
         result.has_value() &&
             result.value().lifecycle.outcome ==
                 ytec::operationcore::OperationOutcome::failed &&
-            run.state->abort_called && !run.state->final_commit_called,
-        "missing boot readback evidence must abort before commit-ready");
+            run.state->abort_called && run.state->snapshots_deleted &&
+            run.state->final_extents_prepared &&
+            !run.state->final_commit_called &&
+            event_index(*run.state, "snapshots_deleted") <
+                event_index(
+                    *run.state,
+                    "prepare_final_extents_incomplete") &&
+            event_index(
+                *run.state,
+                "prepare_final_extents_incomplete") <
+                event_index(*run.state, "finalize_boot"),
+        "missing boot readback evidence must abort after VSS cleanup/final-extent preparation and before publication");
   }
 }
 
@@ -1361,6 +2328,150 @@ void test_snapshot_set_mismatch_or_commit_failure_stays_incomplete() {
                 ytec::operationcore::OperationOutcome::failed &&
             run.state->abort_called && run.state->final_commit_called,
         "final commit failure must leave the target offline and incomplete");
+  }
+}
+
+void exercise_post_vss_prepare_checkpoint_failures() {
+  {
+    const auto fixture = system_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->fail_prepare_final_extents = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() &&
+            result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::failed &&
+            run.state->snapshots_deleted && run.state->abort_called &&
+            !run.state->boot_completed && !run.state->final_commit_called &&
+            event_index(*run.state, "snapshots_deleted") <
+                event_index(
+                    *run.state,
+                    "prepare_final_extents_incomplete") &&
+            std::find(
+                run.state->events.begin(),
+                run.state->events.end(),
+                "finalize_boot") == run.state->events.end(),
+        "missing final-extent preparation must fail after VSS cleanup and before boot/publication");
+  }
+  {
+    const auto fixture = system_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->drift_checkpoint_during_prepare = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() &&
+            result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::failed &&
+            run.state->abort_called && !run.state->boot_completed &&
+            !run.state->final_commit_called &&
+            std::find(
+                run.state->events.begin(),
+                run.state->events.end(),
+                "revalidate_after_snapshot_delete") ==
+                run.state->events.end(),
+        "prepare must preserve the exact commit-ready checkpoint byte/hash/revision before boot");
+  }
+}
+
+void exercise_post_vss_publication_order_failure() {
+  {
+    const auto fixture = system_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->malformed_final_ordering_evidence = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() &&
+            result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::failed &&
+            run.state->abort_called && run.state->final_commit_called,
+        "missing non-boot/checkpoint/final-publication ordering evidence must not complete");
+  }
+}
+
+void test_post_vss_prepare_checkpoint_and_publication_order_fail_closed() {
+  exercise_post_vss_prepare_checkpoint_failures();
+  exercise_post_vss_publication_order_failure();
+}
+
+void test_data_only_and_checkpoint_cleanup_pending_complete_safely() {
+  {
+    const auto fixture = data_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() && result.value().execution.has_value() &&
+            result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::completed &&
+            !result.value().execution->boot.required &&
+            result.value().execution->boot.completed &&
+            run.state->final_extents_prepared &&
+            !run.state->boot_completed && run.state->final_revalidated &&
+            event_index(*run.state, "snapshots_deleted") <
+                event_index(
+                    *run.state,
+                    "prepare_final_extents_incomplete") &&
+            event_index(
+                *run.state,
+                "prepare_final_extents_incomplete") <
+                event_index(*run.state, "revalidate_after_snapshot_delete") &&
+            event_index(*run.state, "revalidate_after_snapshot_delete") <
+                event_index(*run.state, "commit_final_layout"),
+        "data-only clone must use the same post-VSS prepare/revalidate/final-publication order with completed no-boot proof");
+    auto zero_hash_report = *result.value().execution;
+    zero_hash_report.selected_completion_hash = {};
+    check(
+        !ytec::windowsapp::
+            has_valid_windows_direct_shrink_precomputed_completion_evidence(
+                zero_hash_report),
+        "a zero selected completion hash must fail the allocation-free post-publication check");
+    auto wrong_outcome_report = *result.value().execution;
+    wrong_outcome_report.selected_completion_hash =
+        wrong_outcome_report.final_commit.checkpoint_retired
+        ? wrong_outcome_report.precomputed_pending_completion_hash
+        : wrong_outcome_report.precomputed_retired_completion_hash;
+    check(
+        !ytec::windowsapp::
+            has_valid_windows_direct_shrink_precomputed_completion_evidence(
+                wrong_outcome_report),
+        "a selected completion hash from the opposite retirement outcome must fail closed");
+  }
+  {
+    const auto fixture = data_fixture();
+    auto request = planning_request(fixture);
+    auto plan = product_plan(fixture);
+    auto run = harness(request);
+    run.state->leave_checkpoint_retirement_pending = true;
+    const auto result = ytec::windowsapp::execute_windows_direct_shrink_clone(
+        plan, run.options, run.dependencies);
+    check(
+        result.has_value() && result.value().execution.has_value() &&
+            result.value().lifecycle.outcome ==
+                ytec::operationcore::OperationOutcome::completed &&
+            !run.state->abort_called &&
+            !result.value().execution->final_commit.checkpoint_retired &&
+            result.value().execution->final_commit.
+                checkpoint_retirement_pending &&
+            result.value().execution->final_commit.
+                final_layout_published_before_checkpoint_retirement &&
+            ytec::windowsapp::
+                has_valid_windows_direct_shrink_precomputed_completion_evidence(
+                    *result.value().execution) &&
+            result.value().execution->selected_completion_hash ==
+                result.value().execution->
+                    precomputed_pending_completion_hash,
+        "verified final publication must remain valid and report cleanup pending when checkpoint retirement cannot finish");
   }
 }
 
@@ -1466,14 +2577,69 @@ void test_confirmation_and_layout_drift_stop_before_target_platform() {
   }
 }
 
+void test_source_analysis_hash_binds_complete_review_payload() {
+  const auto fixture = gpt_product_fixture();
+  const auto baseline = ytec::windowsapp::
+      hash_windows_direct_shrink_source_analysis_v1(fixture->analysis);
+  const auto repeated = ytec::windowsapp::
+      hash_windows_direct_shrink_source_analysis_v1(fixture->analysis);
+  check(
+      baseline.has_value() && repeated.has_value() &&
+          baseline.value() == repeated.value(),
+      "source analysis hash must be deterministic");
+
+  const auto changes_hash = [&](const auto& mutate, const char* message) {
+    auto changed = fixture->analysis;
+    mutate(changed);
+    const auto digest = ytec::windowsapp::
+        hash_windows_direct_shrink_source_analysis_v1(changed);
+    check(
+        digest.has_value() && digest.value() != baseline.value(),
+        message);
+  };
+  changes_hash(
+      [](auto& analysis) { analysis.source.serial_suffix += "-DRIFT"; },
+      "stable source identity must be analysis-hash-bound");
+  changes_hash(
+      [](auto& analysis) { analysis.created_utc += "-DRIFT"; },
+      "analysis timestamp must be hash-bound");
+  changes_hash(
+      [](auto& analysis) { analysis.mbr_bootstrap[0] = std::byte{0x7FU}; },
+      "raw bootstrap evidence must be hash-bound");
+  changes_hash(
+      [](auto& analysis) { ++analysis.partitions[2].used_bytes; },
+      "measured NTFS usage must be hash-bound");
+  changes_hash(
+      [](auto& analysis) { analysis.partitions[2].label += L"-DRIFT"; },
+      "partition label and classification payload must be hash-bound");
+  changes_hash(
+      [](auto& analysis) {
+        analysis.content_volumes[0].volume_guid_path =
+            std::wstring(kVolumeThree);
+      },
+      "Volume GUID binding must be analysis-hash-bound");
+}
+
 }  // namespace
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"safe_plan_binds_reviewed_extents_and_disjoint_staging",
        test_safe_plan_binds_reviewed_extents_and_disjoint_staging},
+      {"selected_data_surplus_is_bound_into_windows_plan_hashes",
+       test_selected_data_surplus_is_bound_into_windows_plan_hashes},
       {"product_analysis_builds_representative_gpt_windows_plan",
        test_product_analysis_builds_representative_gpt_windows_plan},
+      {"product_analysis_builds_target_only_mbr_to_gpt_plan",
+       test_product_analysis_builds_target_only_mbr_to_gpt_plan},
+      {"product_analysis_builds_mbr_preserve_with_raw_binding",
+       test_product_analysis_builds_mbr_preserve_with_raw_binding},
+      {"mbr_active_windows_maps_without_separate_bios_payload",
+       test_mbr_active_windows_maps_without_separate_bios_payload},
+      {"mbr_to_gpt_same_capacity_without_staging_fails_closed",
+       test_mbr_to_gpt_same_capacity_without_staging_fails_closed},
+      {"mbr_to_gpt_rejects_unknown_type_snapshot_and_unsafe_selection",
+       test_mbr_to_gpt_rejects_unknown_type_snapshot_and_unsafe_selection},
       {"product_analysis_fails_closed_before_execution",
        test_product_analysis_fails_closed_before_execution},
       {"planner_rejects_unsupported_or_unbound_inputs_before_execution",
@@ -1484,6 +2650,12 @@ int main() {
        test_duplicate_volume_guid_is_rejected_before_vss},
       {"success_orders_vss_cleanup_before_commit_and_keeps_offline",
        test_success_orders_vss_cleanup_before_commit_and_keeps_offline},
+      {"mixed_disk_exact_raw_uses_read_only_source_and_checkpoints",
+       test_mixed_disk_exact_raw_uses_read_only_source_and_checkpoints},
+      {"source_layout_drift_after_snapshot_cleanup_blocks_final_commit",
+       test_source_layout_drift_after_snapshot_cleanup_blocks_final_commit},
+      {"mbr_signature_rechecks_fail_closed_before_publication",
+       test_mbr_signature_rechecks_fail_closed_before_publication},
       {"cancellation_aborts_offline_without_capture_or_commit",
        test_cancellation_aborts_offline_without_capture_or_commit},
       {"target_owned_archive_capacity_failure_cleans_up_without_commit",
@@ -1492,12 +2664,18 @@ int main() {
        test_malformed_apply_or_boot_evidence_never_commits},
       {"snapshot_set_mismatch_or_commit_failure_stays_incomplete",
        test_snapshot_set_mismatch_or_commit_failure_stays_incomplete},
+      {"post_vss_prepare_checkpoint_and_publication_order_fail_closed",
+       test_post_vss_prepare_checkpoint_and_publication_order_fail_closed},
+      {"data_only_and_checkpoint_cleanup_pending_complete_safely",
+       test_data_only_and_checkpoint_cleanup_pending_complete_safely},
       {"duplicate_snapshot_mapping_stops_before_target_io",
        test_duplicate_snapshot_mapping_stops_before_target_io},
       {"platform_preflight_rejection_stops_before_vss",
        test_platform_preflight_rejection_stops_before_vss},
       {"confirmation_and_layout_drift_stop_before_target_platform",
        test_confirmation_and_layout_drift_stop_before_target_platform},
+      {"source_analysis_hash_binds_complete_review_payload",
+       test_source_analysis_hash_binds_complete_review_payload},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {

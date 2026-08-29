@@ -24,6 +24,7 @@ struct WindowsOnlineShrinkImageProductRequest final {
   bool replace_existing{};
   vssrequester::AsyncWaitOptions async_wait;
   clonecore::DiskOperationCallbacks callbacks;
+  vssrequester::VssDiffAreaReviewCallback diff_area_review_callback;
   const clonecore::Logger* logger{};
   // The active product log is either one proved-disjoint local file or the
   // process-wide bounded RAM router. No AppData fallback is inferred here.

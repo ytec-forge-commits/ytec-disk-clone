@@ -145,7 +145,13 @@ WindowsCompletionPowerProof make_clone_completion_power_proof(
         report.lifecycle.verified_work_bytes == clone.copied_data_bytes &&
         !all_zero(clone.verified_write_digest) &&
         clone.read_back_verified && clone.partition_table_committed &&
-        clone.snapshot_backup_completed && clone.snapshots_deleted &&
+        clone.source_consistency_verified &&
+        ((clone.used_vss_snapshot && clone.snapshot_backup_completed &&
+          clone.snapshots_deleted) ||
+         (!clone.used_vss_snapshot &&
+          !clone.snapshot_backup_completed &&
+          !clone.snapshots_deleted &&
+          clone.locked_volume_count != 0U)) &&
         clone.target_left_offline &&
         clone.boot_finalization_required ==
             report.plan.source->is_system_disk &&
@@ -172,7 +178,29 @@ make_direct_shrink_clone_completion_power_proof(
       report.plan.source.has_value() && has_execution;
   if (has_execution) {
     const auto& execution = report.execution.value();
-    verified = verified && report.plan.expected_work_bytes != 0U &&
+    const bool mbr_final = execution.final_commit.final_partition_style ==
+        migrationcore::MigrationPartitionStyle::mbr;
+    const bool gpt_final = execution.final_commit.final_partition_style ==
+        migrationcore::MigrationPartitionStyle::gpt;
+    const bool partition_style_proof = mbr_final
+        ? execution.final_commit.source_mbr_sector0_unchanged &&
+              execution.final_commit.source_mbr_bootstrap_unchanged &&
+              execution.final_commit.target_mbr_signature_collision_free &&
+              execution.final_commit.final_mbr_sector0_read_back_verified &&
+              execution.final_commit.final_mbr_disk_signature != 0U &&
+              execution.final_commit.final_mbr_active_partition_count ==
+                  (report.plan.source->is_system_disk ? 1U : 0U)
+        : gpt_final &&
+              !execution.final_commit.source_mbr_sector0_unchanged &&
+              !execution.final_commit.source_mbr_bootstrap_unchanged &&
+              !execution.final_commit.target_mbr_signature_collision_free &&
+              !execution.final_commit.final_mbr_sector0_read_back_verified &&
+              execution.final_commit.final_mbr_disk_signature == 0U &&
+              execution.final_commit.final_mbr_active_partition_count == 0U;
+    verified = verified &&
+        has_valid_windows_direct_shrink_precomputed_completion_evidence(
+            execution) &&
+        report.plan.expected_work_bytes != 0U &&
         execution.verified_target_bytes != 0U &&
         execution.verified_target_bytes <= report.plan.expected_work_bytes &&
         report.lifecycle.processed_work_bytes ==
@@ -206,14 +234,29 @@ make_direct_shrink_clone_completion_power_proof(
         execution.boot.boot_files_read_back_verified &&
         execution.boot.recovery_configuration_verified &&
         execution.boot.target_offline &&
+        execution.boot.target_only_reconstruction &&
+        execution.boot.exact_target_volume_extents &&
+        execution.boot.legacy_bios ==
+            (mbr_final && report.plan.source->is_system_disk) &&
+        execution.boot.real_boot_not_claimed && partition_style_proof &&
         !all_zero(execution.final_commit.committed_layout_hash) &&
         execution.final_commit.aggregate_write_digest ==
             execution.aggregate_write_digest &&
+        execution.final_commit.source_reidentified &&
+        execution.final_commit.source_layout_unchanged &&
         execution.final_commit.target_reidentified &&
         execution.final_commit.staging_identity_reverified &&
         execution.final_commit.checkpoint_reverified &&
         execution.final_commit.staging_removed &&
-        execution.final_commit.checkpoint_retired &&
+        (execution.final_commit.checkpoint_retired !=
+         execution.final_commit.checkpoint_retirement_pending) &&
+        execution.final_commit.construction_layout_non_bootable &&
+        execution.final_commit.
+            checkpoint_retained_through_extensions_and_boot &&
+        execution.final_commit.
+            boot_completed_before_final_layout_publication &&
+        execution.final_commit.
+            final_layout_published_before_checkpoint_retirement &&
         execution.final_commit.hidden_final_layout_published_and_read_back &&
         execution.final_commit.every_required_ntfs_extension_verified &&
         execution.final_commit.every_write_flushed &&

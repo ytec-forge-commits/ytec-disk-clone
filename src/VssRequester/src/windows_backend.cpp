@@ -1103,19 +1103,23 @@ WindowsVssBackend::query_snapshot_devices(
             : std::wstring(value.m_pwszSnapshotDeviceObject);
     if (!IsEqualGUID(value.m_SnapshotId, identity->snapshot_id) ||
         !IsEqualGUID(value.m_SnapshotSetId, impl_->snapshot_set_id) ||
+        IsEqualGUID(value.m_ProviderId, GUID_NULL) ||
+        value.m_tsCreationTimestamp == 0 ||
         !equals_case_insensitive(original, requested.volume_guid_path) ||
         !is_snapshot_device_path(device)) {
       return clonecore::Result<std::vector<SnapshotMapping>>::failure(
           vss_error(
-              clonecore::ErrorCode::identity_mismatch,
-              VSS_E_OBJECT_NOT_FOUND,
-              L"VSS Snapshot属性Identity確認",
-              L"VSSが返したSnapshot属性と固定済みIdentityが一致しません"));
+          clonecore::ErrorCode::identity_mismatch,
+          VSS_E_OBJECT_NOT_FOUND,
+          L"VSS Snapshot属性Identity確認",
+          L"VSSが返したSnapshot、provider、creation timestampと固定済みIdentityが一致しません"));
     }
     mappings.push_back(SnapshotMapping{
         .original_volume_guid_path = requested.volume_guid_path,
         .snapshot_id = guid_to_string(value.m_SnapshotId),
         .snapshot_device_path = device,
+        .provider_id = guid_to_string(value.m_ProviderId),
+        .creation_timestamp = value.m_tsCreationTimestamp,
     });
   }
 
@@ -1153,6 +1157,10 @@ clonecore::Status WindowsVssBackend::copy_snapshot_data(
         !equals_case_insensitive(
             supplied.snapshot_device_path,
             verified.snapshot_device_path) ||
+        !equals_case_insensitive(
+            supplied.provider_id,
+            verified.provider_id) ||
+        supplied.creation_timestamp != verified.creation_timestamp ||
         !is_snapshot_device_path(verified.snapshot_device_path)) {
       return fail(
           clonecore::ErrorCode::identity_mismatch,

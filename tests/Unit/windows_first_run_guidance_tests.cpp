@@ -714,9 +714,9 @@ void product_source_connects_current_exe_factory_and_both_ui_paths() {
             count_token(source, "first_run_guidance_action") >= 8U &&
             source.find("show_first_run_guidance_dialog(*state, false)") !=
                 std::string::npos &&
-            source.find("calculate_first_run_guidance_diagnostic_button_layout") !=
+            source.find("calculate_diagnostics_action_layout") !=
                 std::string::npos,
-        "Diagnostics must expose the same guide in its own split button");
+        "Diagnostics must expose the same guide in its own action row");
   check(source.find("SHGetKnownFolderPath") == std::string::npos &&
             source.find("FOLDERID_LocalAppData") == std::string::npos &&
             source.find("RegSetValue") == std::string::npos,

@@ -294,6 +294,9 @@ ytec::vssrequester::SnapshotCopyContext snapshot_context(
                   L"\\\\?\\Volume{33333333-3333-3333-3333-333333333333}\\",
               .snapshot_id = snapshot_id,
               .snapshot_device_path = device_path,
+              .provider_id =
+                  L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+              .creation_timestamp = 1'001,
           },
       },
   };
@@ -515,9 +518,11 @@ class LifecycleBackend final
         ytec::vssrequester::SnapshotMapping>>::success({
         ytec::vssrequester::SnapshotMapping{
             .original_volume_guid_path = volumes.front().volume_guid_path,
-            .snapshot_id = L"{snapshot-55}",
+            .snapshot_id = L"{00000000-0000-0000-0000-000000000055}",
             .snapshot_device_path =
                 L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy55",
+            .provider_id = L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}",
+            .creation_timestamp = 1'055,
         },
     });
   }

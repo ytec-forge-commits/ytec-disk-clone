@@ -39,6 +39,7 @@ function Test-PowerShellScriptEncoding {
 }
 
 Test-PowerShellScriptEncoding
+& (Join-Path $PSScriptRoot 'Test-ProductVersion.ps1')
 Invoke-NativeCommand cmake --preset msvc-x64
 Invoke-NativeCommand cmake --build --preset msvc-x64 --clean-first
 Invoke-NativeCommand ctest --preset msvc-x64

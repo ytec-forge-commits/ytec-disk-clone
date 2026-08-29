@@ -55,6 +55,9 @@ adk_management_ui_contract() noexcept {
 }
 
 struct AdkManagementView final {
+  bool manifest_structure_valid{};
+  bool primary_source_pins_confirmed{};
+  bool unattended_no_restart_confirmed{};
   bool execution_gate_open{};
   bool platform_creation_permitted{};
   bool path_selection_permitted{};
@@ -69,6 +72,69 @@ struct AdkManagementView final {
 // starts a download, requests elevation, or launches an installer.
 [[nodiscard]] AdkManagementView build_adk_management_view(
     const AdkReleaseManifest& manifest);
+
+enum class AdkManagementPathSelection : std::uint8_t {
+  none,
+  existing_offline_layout,
+  new_offline_layout_parent,
+};
+
+struct AdkManagementActionReview final {
+  AdkManagementAction action{
+      AdkManagementAction::official_download_install};
+  AdkManagementPathSelection path_selection{
+      AdkManagementPathSelection::none};
+  bool manifest_structure_valid{};
+  bool execution_gate_open{};
+  bool requires_eula_review{};
+  bool requires_network_retrieval{};
+  bool requires_explicit_uninstall_confirmation{};
+  bool path_picker_permitted{};
+  std::wstring title;
+  std::wstring summary;
+};
+
+// Pure per-command product contract. A closed execution gate always keeps the
+// path picker disabled, including for requests containing a hostile path.
+[[nodiscard]] AdkManagementActionReview build_adk_management_action_review(
+    const AdkReleaseManifest& manifest,
+    AdkManagementAction action);
+
+// Converts a user-selected existing local parent into a fixed new child for
+// official /layout export. No directory is read or created by this helper.
+[[nodiscard]] clonecore::Result<std::filesystem::path>
+make_adk_offline_layout_destination(
+    const AdkReleaseManifest& manifest,
+    const std::filesystem::path& selected_parent);
+
+enum class AdkEvidenceStage : std::uint8_t {
+  review_opened,
+  gate_blocked,
+  path_selected,
+  eula_retrieval_started,
+  eula_verified,
+  consent_accepted,
+  action_started,
+  action_succeeded,
+  action_failed,
+};
+
+struct AdkEvidenceFacts final {
+  AdkManagementAction action{
+      AdkManagementAction::official_download_install};
+  AdkEvidenceStage stage{AdkEvidenceStage::review_opened};
+  bool path_selected{};
+  bool complete_eula_presented{};
+  bool explicit_consent{};
+  std::uint32_t native_code{};
+};
+
+// Produces a bounded log line containing manifest and observed booleans only.
+// It intentionally has no path, URL, command-line, EULA-body, or credential
+// field, so product evidence cannot accidentally disclose those values.
+[[nodiscard]] clonecore::Result<std::wstring> format_adk_evidence_event(
+    const AdkReleaseManifest& manifest,
+    const AdkEvidenceFacts& facts);
 
 struct AdkManagementLayout final {
   int client_width{};

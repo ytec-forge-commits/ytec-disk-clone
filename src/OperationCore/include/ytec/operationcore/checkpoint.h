@@ -14,6 +14,7 @@ namespace ytec::operationcore {
 
 inline constexpr std::uint32_t kCheckpointSchemaVersionV1 = 1U;
 inline constexpr std::uint32_t kCheckpointSchemaVersionV2 = 2U;
+inline constexpr std::uint32_t kCheckpointSchemaVersionV3 = 3U;
 inline constexpr std::uint32_t kCheckpointSchemaVersion =
     kCheckpointSchemaVersionV2;
 inline constexpr std::size_t kMaximumCheckpointBytes = 256U * 1024U;
@@ -45,6 +46,20 @@ struct CheckpointPreparationEvidence final {
       const CheckpointPreparationEvidence&) const noexcept = default;
 };
 
+// Schema v3 binds the durable output prefix to all app-owned objects that
+// participate in a resumable image-create transaction. The digest is supplied
+// by the owning stream backend and covers its canonical journal state; this
+// layer deliberately does not infer it from file lengths alone.
+struct CheckpointOutputProgressEvidence final {
+  Sha256Digest verified_prefix_hash{};
+  std::uint64_t primary_output_length{};
+  std::uint64_t journal_length{};
+  std::uint64_t auxiliary_output_length{};
+
+  [[nodiscard]] bool operator==(
+      const CheckpointOutputProgressEvidence&) const noexcept = default;
+};
+
 struct InterruptionCheckpoint final {
   std::uint32_t schema_version{kCheckpointSchemaVersion};
   OperationId operation_id{};
@@ -69,6 +84,11 @@ struct InterruptionCheckpoint final {
   // before payload progress begins. Raw metadata bytes are never persisted.
   // Legacy executing/verifying checkpoints omit it.
   std::optional<CheckpointPreparationEvidence> preparation_evidence;
+
+  // Schema v3 only. This records no password, key, plaintext, or raw metadata.
+  // A caller must re-open and fully authenticate/hash the declared prefix
+  // before it treats these lengths as resumable progress.
+  std::optional<CheckpointOutputProgressEvidence> output_progress_evidence;
 };
 
 struct ParsedCheckpoint final {

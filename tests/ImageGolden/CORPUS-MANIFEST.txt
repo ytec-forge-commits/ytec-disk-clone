@@ -1,0 +1,19 @@
+# SHA-256 values apply to whitespace-stripped, hex-decoded bytes.
+# sha256  decoded-file-name  decoded-bytes
+62417066d682b0f5c3396199c73a5b60b2743510bf8f74821c7fbdce38ebca4e  partition-snapshot-mbr-v1  640
+887ac7e5c760eb156b248cc7b2e0a9c3e69c78e2c245eb57c0c9fc122ccf3cf7  partition-snapshot-mbr-two-partition-v1  640
+8498a93d04130a26e0b09bc5f927910de72847fc0200912be2c59d5993679957  partition-snapshot-gpt-512e-v1  34496
+13749987cf2f9ecf6855fff3faacbbaae94f4f9606bd66b70a0f78a1f2fbdb49  manifest-exact-mbr-v1  1280
+e22159461fe563f219a0856be75054fb341880fbce4aabc3cfb34d4b3f12e9f1  manifest-exact-gpt-512e-v1  35136
+565129dceb284a6f35722d28a9cad2c11b6bcb9bd32f5c178984e16780855ad8  manifest-partition-selection-mbr-v1  1664
+1b2150c4f2ce6e96ff495a5db917f7b6b39822eb4db0ff73949900a711741848  manifest-shrink-wim-mbr-v1  1280
+3010ff3761c36e0fafcc675c37781291aeb008dd470c29b92a85133a69fa26c5  manifest-rescue-mbr-v1  1280
+3009c5925cc413464b93291b4cf0ab157a112bdadfa172a799dfc02622ace981  container-exact-mbr-v1  2000
+b17b8f65ce6d6af7818183459978017abae5aee6845ae3ddd5a13ba9097be594  container-exact-gpt-512e-v1  39952
+65ebeaa4712b602b7386ece85e435ef76a6854e571a4ae36e3420821abb5fbee  container-exact-mixed-v1  6343
+18a25442d7ae911366a114f4c408fdf514a39698516c68cd58bfaae35a23219e  container-partition-selection-mbr-v1  6480
+e45922a5d911c9a80b33b8ce36fcfd8809c353473fec047e3842653568c2ab35  container-shrink-wim-mbr-v1  3537
+4362ae1bc921d06d08dfbe1a74d957f9f5a0990ab395320e89b254ea77c08fd3  container-encrypted-exact-mbr-v1  6096
+358be2c68cc1cbd1c84ce5b62deffb62bc266e853c664c480c54a5aff57e389f  container-rescue-loss-map-v1  2624
+d07f9acad0f25b258b1fffbef1e4b6ef21baa49f51392f72342bbbeb9cb3f2af  container-rescue-legacy-no-read-evidence-v1  2624
+89d197c536acbbbba3b8fa0573a17cd668501db1d513c94b45546110bd876a30  container-rescue-lossless-v1  2512

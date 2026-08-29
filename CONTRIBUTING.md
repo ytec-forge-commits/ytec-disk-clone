@@ -1,7 +1,10 @@
 # Contributing to Y-TEC Tsumugi Drive
 
-Thank you for helping improve Y-TEC Tsumugi Drive. This is safety-critical disk
-software and currently a `0.2.0-dev` development preview targeting 1.0.0.
+Thank you for helping improve Y-TEC Tsumugi Drive. This is a personally
+developed open-source, safety-critical disk project released under the Y-TEC
+name. It is not company-internal software. The current
+`1.0.0-internal-beta` build is a pre-release validation candidate, not a stable
+1.0.0 release.
 Representative hardware acceptance is incomplete, so every contribution must
 preserve the project's fail-closed behavior and state its validation limits.
 

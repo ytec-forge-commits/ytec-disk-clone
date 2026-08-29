@@ -107,7 +107,7 @@ ytec::diskmodel::InventoryReport valid_report() {
   return report;
 }
 
-void help_exposes_direct_operation_only() {
+void help_exposes_read_only_preflight_only() {
   MockInventoryProvider provider(valid_report());
   std::ostringstream output;
   std::ostringstream errors;
@@ -116,6 +116,13 @@ void help_exposes_direct_operation_only() {
   check(exit_code == 0, "help must succeed");
   check(output.str().find("--clone-preflight") != std::string::npos,
         "direct preflight must be documented");
+  check(output.str().find("--clone-execute") == std::string::npos,
+        "destructive clone CLI must not be documented");
+  check(output.str().find("--acknowledge-target-erasure") ==
+            std::string::npos,
+        "target erasure CLI bypass must not be documented");
+  check(output.str().find("--confirmation") == std::string::npos,
+        "fixed confirmation CLI must not be documented");
   check(output.str().find("--job-") == std::string::npos,
         "removed job CLI must not be documented");
   check(provider.call_count == 0U, "help must not enumerate disks");
@@ -125,20 +132,38 @@ void removed_job_arguments_stop_before_all_io() {
   for (const std::wstring argument :
        {L"--job-preflight", L"--job-execute", L"--job-path"}) {
     MockInventoryProvider provider(valid_report());
-    MockExecutionService service;
     std::ostringstream output;
     std::ostringstream errors;
     const int exit_code = ytec::winpeapp::run_winpe_app(
         {argument, L"X:\\legacy-do-not-open.json"},
         provider,
         output,
-        errors,
-        &service);
+        errors);
     check(exit_code == 64, "removed job argument must be rejected");
     check(provider.call_count == 0U,
           "removed job argument must not enumerate or search media");
-    check(service.call_count == 0U,
-          "removed job argument must not reach execution");
+  }
+}
+
+void destructive_cli_arguments_stop_before_all_io() {
+  const std::vector<std::vector<std::wstring>> rejected{
+      {L"--clone-execute", L"--source", L"0", L"--target", L"1",
+       L"--acknowledge-target-erasure", L"--confirmation", L"OK"},
+      {L"--acknowledge-target-erasure"},
+      {L"--confirmation", L"OK"},
+      {L"--clone-preflight", L"--source", L"0", L"--target", L"1",
+       L"--confirmation", L"OK"},
+  };
+  for (const auto& arguments : rejected) {
+    MockInventoryProvider provider(valid_report());
+    std::ostringstream output;
+    std::ostringstream errors;
+    const int exit_code = ytec::winpeapp::run_winpe_app(
+        arguments, provider, output, errors);
+    check(exit_code == 64,
+          "destructive or fixed-confirmation CLI arguments must be rejected");
+    check(provider.call_count == 0U,
+          "rejected destructive CLI arguments must stop before inventory");
   }
 }
 
@@ -159,27 +184,22 @@ void direct_preflight_is_read_only() {
         "preflight must state its read-only boundary");
 }
 
-void abnormal_target_health_fails_before_execution() {
+void abnormal_target_health_fails_preflight() {
   auto report = valid_report();
   report.disks[1].health.state =
       ytec::diskmodel::DiskHealthState::caution;
   MockInventoryProvider provider(std::move(report));
-  MockExecutionService service;
   std::ostringstream output;
   std::ostringstream errors;
   const int exit_code = ytec::winpeapp::run_winpe_app(
-      {L"--clone-execute", L"--source", L"0", L"--target", L"1",
-       L"--acknowledge-target-erasure", L"--confirmation", L"OK"},
+      {L"--clone-preflight", L"--source", L"0", L"--target", L"1"},
       provider,
       output,
-      errors,
-      &service);
+      errors);
   check(exit_code == 1,
         "SMART/NVMe caution target must fail closed");
   check(provider.call_count == 1U,
         "health gate may use one read-only inventory");
-  check(service.call_count == 0U,
-        "health gate must stop before the destructive service");
 }
 
 void abnormal_source_health_remains_visible_and_recommends_rescue() {
@@ -204,56 +224,28 @@ void abnormal_source_health_remains_visible_and_recommends_rescue() {
         "A PE source temperature warning must remain visible before OK");
 }
 
-void direct_execute_requires_exact_ok_and_leaves_target_offline() {
+void direct_internal_api_requires_exact_ok_and_leaves_target_offline() {
   {
     MockInventoryProvider provider(valid_report());
     MockExecutionService service;
-    std::ostringstream output;
-    std::ostringstream errors;
-    const int exit_code = ytec::winpeapp::run_winpe_app(
-        {L"--clone-execute", L"--source", L"0", L"--target", L"1",
-         L"--acknowledge-target-erasure", L"--confirmation", L"OK",
-         L"--authorization", L"legacy"},
-        provider,
-        output,
-        errors,
-        &service);
-    check(exit_code == 64, "legacy authorization argument must be rejected");
-    check(provider.call_count == 0U,
-          "invalid public arguments must stop before disk enumeration");
-    check(service.call_count == 0U,
-          "invalid public arguments must not reach the service");
-  }
-
-  {
-    MockInventoryProvider provider(valid_report());
-    MockExecutionService service;
-    std::ostringstream output;
-    std::ostringstream errors;
-    const int exit_code = ytec::winpeapp::run_winpe_app(
-        {L"--clone-execute", L"--source", L"0", L"--target", L"1",
-         L"--acknowledge-target-erasure", L"--confirmation", L"ok"},
-        provider,
-        output,
-        errors,
-        &service);
-    check(exit_code == 1, "lowercase confirmation must fail");
+    const auto plan = ytec::winpeapp::prepare_direct_clone_operation(
+        0U, 1U, provider);
+    check(plan.has_value(), "valid direct plan must prepare");
+    const auto result = ytec::winpeapp::execute_direct_clone_operation(
+        plan.value(), true, L"ok", L"", service);
+    check(!result.has_value(), "lowercase confirmation must fail");
     check(service.call_count == 0U,
           "invalid confirmation must not reach the service");
   }
 
   MockInventoryProvider provider(valid_report());
   MockExecutionService service;
-  std::ostringstream output;
-  std::ostringstream errors;
-  const int exit_code = ytec::winpeapp::run_winpe_app(
-      {L"--clone-execute", L"--source", L"0", L"--target", L"1",
-       L"--acknowledge-target-erasure", L"--confirmation", L"OK"},
-      provider,
-      output,
-      errors,
-      &service);
-  check(exit_code == 0, "exact OK confirmation must execute");
+  const auto plan = ytec::winpeapp::prepare_direct_clone_operation(
+      0U, 1U, provider);
+  check(plan.has_value(), "valid direct plan must prepare");
+  const auto result = ytec::winpeapp::execute_direct_clone_operation(
+      plan.value(), true, L"OK", L"", service);
+  check(result.has_value(), "exact OK confirmation must execute");
   check(service.call_count == 1U, "service must execute once");
   check(service.last_request.leave_target_offline,
         "direct clone must request an offline completed target");
@@ -261,20 +253,21 @@ void direct_execute_requires_exact_ok_and_leaves_target_offline() {
         "target erasure acknowledgement must be target-bound");
   check(service.last_request.confirmation.typed_token == L"OK",
         "service confirmation must preserve the approved exact OK token");
-  check(output.str().find("検証完了・換装待ち") != std::string::npos,
-        "completion must not claim boot success");
+  check(result.value().target_left_offline,
+        "validated completion must leave the target offline");
 }
 
 }  // namespace
 
 int main() {
   try {
-    help_exposes_direct_operation_only();
+    help_exposes_read_only_preflight_only();
     removed_job_arguments_stop_before_all_io();
+    destructive_cli_arguments_stop_before_all_io();
     direct_preflight_is_read_only();
-    abnormal_target_health_fails_before_execution();
+    abnormal_target_health_fails_preflight();
     abnormal_source_health_remains_visible_and_recommends_rescue();
-    direct_execute_requires_exact_ok_and_leaves_target_offline();
+    direct_internal_api_requires_exact_ok_and_leaves_target_offline();
     std::cout << "winpe direct app tests: PASS\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

@@ -265,6 +265,16 @@ struct AdkAcquisitionReport final {
 
 // Validates every bounded field, component order, URL host/path, redirect,
 // SHA-256 and source-layout rule without performing I/O.
+// This structural form deliberately does not open either release execution
+// gate.  It exists so the product can render the complete pinned manifest and
+// explain the exact blocked gate without treating a pending release as valid
+// for communication or installer launch.
+[[nodiscard]] clonecore::Status validate_adk_release_manifest_structure(
+    const AdkReleaseManifest& manifest);
+
+// Validates the structural manifest and both release execution gates.  Only
+// this form may authorize acquisition, installer launch, offline publication,
+// or managed removal.
 [[nodiscard]] clonecore::Status validate_adk_release_manifest(
     const AdkReleaseManifest& manifest);
 

@@ -221,7 +221,6 @@ execute_mbr2gpt_direct_operation(
     const std::vector<std::wstring>& arguments,
     diskmodel::IDiskInventoryProvider& provider,
     std::ostream& output,
-    std::ostream& error_output,
-    ICloneExecutionService* execution_service = nullptr);
+    std::ostream& error_output);
 
 }  // namespace ytec::winpeapp

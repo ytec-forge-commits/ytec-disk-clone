@@ -26,6 +26,12 @@ constexpr wchar_t kVolume[] =
     L"\\\\?\\Volume{11111111-2222-3333-4444-555555555555}\\";
 constexpr wchar_t kSnapshot[] =
     L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy91";
+constexpr wchar_t kSnapshotId[] =
+    L"{00000000-0000-0000-0000-000000000091}";
+constexpr wchar_t kSnapshotSetId[] =
+    L"{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}";
+constexpr wchar_t kProviderId[] =
+    L"{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}";
 
 void check(const bool condition, const std::string& message) {
   if (!condition) {
@@ -255,7 +261,9 @@ class CapturedSession final
             .session_source_offset = 0U,
             .length = kWimBytes,
             .original_volume_guid_path = kVolume,
-            .snapshot_id = state_.wrong_snapshot ? L"wrong" : L"snapshot-91",
+            .snapshot_id = state_.wrong_snapshot
+                ? L"{00000000-0000-0000-0000-000000000099}"
+                : kSnapshotId,
             .snapshot_device_path = kSnapshot,
         },
         ytec::windowsapp::WindowsShrinkCapturedPayload{
@@ -354,7 +362,7 @@ class Backend final : public ytec::vssrequester::IWorkflowBackend {
   }
   [[nodiscard]] ytec::clonecore::Result<std::wstring>
   start_snapshot_set() override {
-    return ytec::clonecore::Result<std::wstring>::success(L"snapshot-set-91");
+    return ytec::clonecore::Result<std::wstring>::success(kSnapshotSetId);
   }
   [[nodiscard]] ytec::clonecore::Status add_volume(
       const std::wstring&,
@@ -385,15 +393,17 @@ class Backend final : public ytec::vssrequester::IWorkflowBackend {
     return ytec::clonecore::Result<
         std::vector<ytec::vssrequester::SnapshotMapping>>::success({
         {.original_volume_guid_path = kVolume,
-         .snapshot_id = L"snapshot-91",
-         .snapshot_device_path = kSnapshot},
+         .snapshot_id = kSnapshotId,
+         .snapshot_device_path = kSnapshot,
+         .provider_id = kProviderId,
+         .creation_timestamp = 1'091},
     });
   }
   [[nodiscard]] ytec::clonecore::Status copy_snapshot_data(
       const std::vector<ytec::vssrequester::SnapshotMapping>& mappings)
       override {
     return callback_({
-        .snapshot_set_id = L"snapshot-set-91",
+        .snapshot_set_id = kSnapshotSetId,
         .mappings = mappings,
     });
   }

@@ -14,6 +14,7 @@ namespace ytec::clonecore {
 
 enum class MbrPartitionCopyMode : std::uint8_t {
   fat32_raw,
+  exfat_raw,
   ntfs_used_clusters,
   recovery_ntfs_raw,
 };

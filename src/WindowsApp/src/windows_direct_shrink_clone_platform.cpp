@@ -2,6 +2,7 @@
 
 #include "ytec/bootrepair/bcdboot.h"
 #include "ytec/bootrepair/clone_boot_finalization.h"
+#include "ytec/bootrepair/efi_boot_ownership.h"
 #include "ytec/bootrepair/system_volume_mount.h"
 #include "ytec/bootrepair/winre_diagnostic.h"
 #include "ytec/bootrepair/winre_registration.h"
@@ -11,6 +12,7 @@
 #include "ytec/windowsdism/dism.h"
 
 #include <Windows.h>
+#include <winioctl.h>
 
 #include <algorithm>
 #include <array>
@@ -35,7 +37,9 @@ constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr std::size_t kHashBlockBytes = 4U * 1024U * 1024U;
 constexpr std::uint32_t kDismTimeoutMilliseconds =
     6U * 60U * 60U * 1000U;
-constexpr std::size_t kCheckpointBytes = 4096U;
+constexpr std::size_t kCheckpointBytes = static_cast<std::size_t>(
+    kWindowsDirectShrinkCheckpointRecordBytes);
+static_assert(kCheckpointBytes == 4096U);
 constexpr std::uint64_t kMinimumDismScratchFreeBytes = 512ULL * kMiB;
 constexpr std::uint64_t kTemporaryNoDefaultDriveLetter =
     0x8000000000000000ULL;
@@ -168,7 +172,7 @@ clonecore::Status write_flush_readback(
   return clonecore::success_status();
 }
 
-clonecore::Status invalidate_partition_metadata(
+clonecore::Status invalidate_initial_partition_metadata(
     clonecore::ITargetDiskWriter& writer) {
   if (writer.logical_sector_size() != 512U ||
       writer.size_bytes() < 2U * kMiB ||
@@ -250,6 +254,31 @@ clonecore::Status validate_gpt_write_plan(
   return clonecore::success_status();
 }
 
+// Once the fixed checkpoint has been created at 64 KiB, broad first-MiB
+// invalidation is forbidden. Invalidate only the five exact GPT metadata
+// ranges represented by a validated plan so the durable incomplete marker is
+// preserved across construction-layout transitions and abort cleanup.
+clonecore::Status invalidate_exact_gpt_metadata(
+    clonecore::ITargetDiskWriter& writer,
+    const clonecore::GptWritePlan& reference_plan) {
+  auto status = validate_gpt_write_plan(reference_plan, writer.size_bytes());
+  if (!status) {
+    return status;
+  }
+  for (const auto& write : reference_plan.writes) {
+    std::vector<std::byte> zeroes(write.bytes.size(), std::byte{0});
+    status = write_flush_readback(
+        writer,
+        write.offset,
+        zeroes,
+        L"直接縮小exact GPTメタデータ無効化");
+    if (!status) {
+      return status;
+    }
+  }
+  return clonecore::success_status();
+}
+
 clonecore::Status publish_gpt_plan(
     clonecore::ITargetDiskWriter& writer,
     const clonecore::GptWritePlan& plan,
@@ -266,7 +295,7 @@ clonecore::Status publish_gpt_plan(
     auto status = write_flush_readback(
         writer, write->offset, write->bytes, operation);
     if (!status) {
-      static_cast<void>(invalidate_partition_metadata(writer));
+      static_cast<void>(invalidate_exact_gpt_metadata(writer, plan));
       return status;
     }
   }
@@ -298,6 +327,178 @@ clonecore::Status verify_gpt_plan(
   return clonecore::success_status();
 }
 
+clonecore::Status verify_mbr_sector(
+    clonecore::ITargetDiskWriter& writer,
+    const std::span<const std::byte> expected,
+    const std::wstring_view operation) {
+  if (writer.logical_sector_size() != 512U || expected.size() != 512U) {
+    return status_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        std::wstring(operation),
+        L"MBR sector0は512 bytesでなければなりません");
+  }
+  auto observed = writer.read_back(0U, expected.size());
+  if (!observed) {
+    return clonecore::Status::failure(observed.error());
+  }
+  if (observed.value().size() != expected.size() ||
+      !std::equal(expected.begin(), expected.end(), observed.value().begin())) {
+    return status_failure(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_CRC,
+        std::wstring(operation),
+        L"現在のraw MBR sector0が不変計画と一致しません");
+  }
+  return clonecore::success_status();
+}
+
+class FixedMbrSignatureGenerator final
+    : public clonecore::IMbrSignatureGenerator {
+ public:
+  explicit FixedMbrSignatureGenerator(const std::uint32_t signature) noexcept
+      : signature_(signature) {}
+
+  clonecore::Result<std::uint32_t> next_signature() override {
+    return clonecore::Result<std::uint32_t>::success(signature_);
+  }
+
+ private:
+  std::uint32_t signature_{};
+};
+
+clonecore::Result<clonecore::MbrWritePlan> build_final_mbr(
+    const WindowsDirectShrinkClonePlan& plan) {
+  const auto& binding = plan.mbr_preserve_binding();
+  if (!binding.has_value() || binding->target_disk_signature == 0U ||
+      plan.expected_target().logical_sector_size != 512U ||
+      plan.expected_target().size_bytes % 512U != 0U ||
+      plan.tasks().empty() || plan.tasks().size() > 4U) {
+    return failure<clonecore::MbrWritePlan>(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小最終MBR計画",
+        L"immutable raw MBR binding、512-byte対象、またはprimary partition件数が不正です");
+  }
+
+  clonecore::MbrDisk synthetic{
+      .logical_sector_size = 512U,
+      .sector_count = plan.expected_target().size_bytes / 512U,
+      .disk_signature = binding->source_disk_signature,
+      .bootstrap = binding->source_bootstrap,
+  };
+  synthetic.partitions.reserve(plan.tasks().size());
+  std::array<bool, 4U> used{};
+  for (const auto& task : plan.tasks()) {
+    const std::uint64_t first_lba = task.target_offset_bytes / 512U;
+    const std::uint64_t sector_count = task.target_size_bytes / 512U;
+    std::uint64_t end_lba{};
+    if (task.target_number == 0U || task.target_number > used.size() ||
+        used[task.target_number - 1U] ||
+        task.target_offset_bytes % 512U != 0U ||
+        task.target_size_bytes == 0U || task.target_size_bytes % 512U != 0U ||
+        first_lba > (std::numeric_limits<std::uint32_t>::max)() ||
+        sector_count > (std::numeric_limits<std::uint32_t>::max)() ||
+        !checked_add(first_lba, sector_count, end_lba) ||
+        end_lba > synthetic.sector_count ||
+        (task.role != migrationcore::MigrationPartitionRole::recovery &&
+         task.role != migrationcore::MigrationPartitionRole::windows &&
+         task.role != migrationcore::MigrationPartitionRole::bios_system &&
+         task.role != migrationcore::MigrationPartitionRole::data)) {
+      return failure<clonecore::MbrWritePlan>(
+          clonecore::ErrorCode::unsupported_layout,
+          ERROR_NOT_SUPPORTED,
+          L"直接縮小最終MBR primary extent",
+          L"partition番号、32bit LBA、extent、またはMBR roleが対応範囲外です");
+    }
+    for (const auto& existing : synthetic.partitions) {
+      const std::uint64_t existing_end =
+          static_cast<std::uint64_t>(existing.first_lba) +
+          existing.sector_count;
+      if (first_lba < existing_end && existing.first_lba < end_lba) {
+        return failure<clonecore::MbrWritePlan>(
+            clonecore::ErrorCode::invalid_data,
+            ERROR_INVALID_DATA,
+            L"直接縮小最終MBR primary重複",
+            L"最終MBR primary partitionのextentが重複しています");
+      }
+    }
+    used[task.target_number - 1U] = true;
+    synthetic.partitions.push_back(clonecore::MbrPartition{
+        .table_index = static_cast<std::uint8_t>(task.target_number - 1U),
+        .active = task.active,
+        .first_chs = {std::byte{0xFE}, std::byte{0xFF}, std::byte{0xFF}},
+        .type = task.kind ==
+                WindowsDirectShrinkPartitionTaskKind::copy_exact_raw
+            ? std::to_integer<std::uint8_t>(task.source_partition_type[0])
+            : task.role == migrationcore::MigrationPartitionRole::recovery
+                  ? static_cast<std::uint8_t>(0x27U)
+                  : static_cast<std::uint8_t>(0x07U),
+        .last_chs = {std::byte{0xFE}, std::byte{0xFF}, std::byte{0xFF}},
+        .first_lba = static_cast<std::uint32_t>(first_lba),
+        .sector_count = static_cast<std::uint32_t>(sector_count),
+    });
+  }
+
+  FixedMbrSignatureGenerator generator(binding->target_disk_signature);
+  auto result = clonecore::make_mbr_write_plan(
+      synthetic,
+      plan.expected_target().size_bytes,
+      512U,
+      generator,
+      {},
+      plan.boot_finalization_required());
+  if (!result) {
+    return result;
+  }
+  const std::size_t active_count = static_cast<std::size_t>(std::count_if(
+      result.value().target_disk.partitions.begin(),
+      result.value().target_disk.partitions.end(),
+      [](const clonecore::MbrPartition& partition) {
+        return partition.active;
+      }));
+  if (result.value().sector.size() != 512U ||
+      result.value().target_disk.disk_signature !=
+          binding->target_disk_signature ||
+      result.value().target_disk.bootstrap != binding->source_bootstrap ||
+      active_count != (plan.boot_finalization_required() ? 1U : 0U)) {
+    return failure<clonecore::MbrWritePlan>(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_CRC,
+        L"直接縮小最終MBR生成証跡",
+        L"source bootstrap、fresh signature、sector0、またはActive件数が不変計画と一致しません");
+  }
+  return result;
+}
+
+clonecore::Result<std::vector<std::byte>> build_hidden_final_mbr_sector(
+    const clonecore::MbrWritePlan& final_plan) {
+  if (final_plan.sector.size() != 512U) {
+    return failure<std::vector<std::byte>>(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小hidden MBR sector0",
+        L"最終MBR sector0が512 bytesではありません");
+  }
+  std::vector<std::byte> hidden = final_plan.sector;
+  std::fill_n(hidden.begin(), 440U, std::byte{0});
+  for (std::size_t index = 0U; index < 4U; ++index) {
+    hidden[446U + index * 16U] = std::byte{0};
+  }
+  if (hidden[510] != std::byte{0x55} || hidden[511] != std::byte{0xAA} ||
+      !std::all_of(hidden.begin(), hidden.begin() + 440, [](const auto value) {
+        return value == std::byte{0};
+      })) {
+    return failure<std::vector<std::byte>>(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_CRC,
+        L"直接縮小hidden MBR生成証跡",
+        L"zero bootstrap、inactive entries、または0x55AAを固定できません");
+  }
+  return clonecore::Result<std::vector<std::byte>>::success(
+      std::move(hidden));
+}
+
 std::u16string task_name(const WindowsDirectShrinkPartitionTask& task) {
   switch (task.role) {
     case migrationcore::MigrationPartitionRole::efi_system:
@@ -323,6 +524,10 @@ std::u16string task_name(const WindowsDirectShrinkPartitionTask& task) {
 
 clonecore::GptGuid task_type_guid(
     const WindowsDirectShrinkPartitionTask& task) noexcept {
+  if (task.kind ==
+      WindowsDirectShrinkPartitionTaskKind::copy_exact_raw) {
+    return clonecore::GptGuid{.bytes = task.source_partition_type};
+  }
   switch (task.role) {
     case migrationcore::MigrationPartitionRole::efi_system:
       return clonecore::gpt_type_efi_system();
@@ -343,6 +548,13 @@ std::uint64_t task_final_attributes(
   return task.role == migrationcore::MigrationPartitionRole::recovery
       ? kRecoveryGptAttributes
       : 0U;
+}
+
+void withhold_construction_partition_visibility(
+    clonecore::GptPartition& partition) {
+  partition.type_guid = clonecore::gpt_type_basic_data();
+  partition.attributes = kTemporaryNoDefaultDriveLetter;
+  partition.name = u"YTEC-INCOMPLETE";
 }
 
 class ReplayGuidGenerator final : public clonecore::IGuidGenerator {
@@ -473,7 +685,7 @@ clonecore::Result<clonecore::GptWritePlan> build_temporary_gpt(
           L"最終entryとconstruction taskを一意に対応付けできません");
     }
     partition.last_lba = construction_end / 512U - 1U;
-    partition.attributes |= kTemporaryNoDefaultDriveLetter;
+    withhold_construction_partition_visibility(partition);
   }
   if (plan.staging().archive_offset_bytes % 512U != 0U ||
       plan.staging().archive_capacity_bytes == 0U ||
@@ -552,18 +764,140 @@ clonecore::Result<clonecore::GptWritePlan> build_hidden_final_gpt(
     const clonecore::GptWritePlan& final_plan) {
   auto source = final_plan.target_disk;
   for (auto& partition : source.partitions) {
-    partition.attributes |= kTemporaryNoDefaultDriveLetter;
+    withhold_construction_partition_visibility(partition);
   }
   ReplayGuidGenerator replay(replay_guids(source));
   return clonecore::make_gpt_write_plan(
       source, plan.expected_target().size_bytes, 512U, replay);
 }
 
+const clonecore::GptPartition* find_gpt_partition(
+    const clonecore::GptDisk& disk,
+    const std::uint32_t target_number) noexcept {
+  const auto found = std::find_if(
+      disk.partitions.begin(),
+      disk.partitions.end(),
+      [&](const clonecore::GptPartition& partition) {
+        return partition.entry_index + 1U == target_number;
+      });
+  return found == disk.partitions.end() ? nullptr : std::addressof(*found);
+}
+
+clonecore::Status validate_gpt_phase_relationships(
+    const WindowsDirectShrinkClonePlan& plan,
+    const clonecore::GptWritePlan& final_plan,
+    const clonecore::GptWritePlan& temporary_plan,
+    const clonecore::GptWritePlan& hidden_plan) {
+  std::uint64_t checkpoint_end{};
+  if (plan.checkpoint_offset_bytes() !=
+          kWindowsDirectShrinkCheckpointOffsetBytes ||
+      !checked_add(
+          plan.checkpoint_offset_bytes(),
+          kWindowsDirectShrinkCheckpointRecordBytes,
+          checkpoint_end) ||
+      checkpoint_end > plan.expected_target().size_bytes ||
+      final_plan.target_disk.disk_guid != temporary_plan.target_disk.disk_guid ||
+      final_plan.target_disk.disk_guid != hidden_plan.target_disk.disk_guid ||
+      final_plan.target_disk.partitions.size() != plan.tasks().size() ||
+      hidden_plan.target_disk.partitions.size() != plan.tasks().size() ||
+      temporary_plan.target_disk.partitions.size() != plan.tasks().size() + 1U) {
+    return status_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小GPT phase不変条件",
+        L"固定checkpoint、同一fresh disk GUID、またはphase別partition件数が一致しません");
+  }
+
+  for (const auto* phase : {&final_plan, &temporary_plan, &hidden_plan}) {
+    for (const auto& write : phase->writes) {
+      std::uint64_t write_end{};
+      if (!checked_add(write.offset, write.bytes.size(), write_end) ||
+          (write.offset < checkpoint_end &&
+           plan.checkpoint_offset_bytes() < write_end)) {
+        return status_failure(
+            clonecore::ErrorCode::invalid_data,
+            ERROR_INVALID_DATA,
+            L"直接縮小GPT／checkpoint分離",
+            L"GPT metadata writeが固定checkpoint recordと重複しています");
+      }
+    }
+  }
+
+  for (const auto& task : plan.tasks()) {
+    const auto* final = find_gpt_partition(
+        final_plan.target_disk, task.target_number);
+    const auto* temporary = find_gpt_partition(
+        temporary_plan.target_disk, task.target_number);
+    const auto* hidden = find_gpt_partition(
+        hidden_plan.target_disk, task.target_number);
+    if (final == nullptr || temporary == nullptr || hidden == nullptr ||
+        final->unique_guid.is_zero() ||
+        final->unique_guid != temporary->unique_guid ||
+        final->unique_guid != hidden->unique_guid ||
+        final->type_guid != task_type_guid(task) ||
+        final->attributes != task_final_attributes(task) ||
+        final->name != task_name(task) ||
+        final->first_lba * 512ULL != task.target_offset_bytes ||
+        (final->last_lba - final->first_lba + 1U) * 512ULL !=
+            task.target_size_bytes ||
+        temporary->type_guid != clonecore::gpt_type_basic_data() ||
+        temporary->attributes != kTemporaryNoDefaultDriveLetter ||
+        temporary->name != u"YTEC-INCOMPLETE" ||
+        temporary->first_lba * 512ULL != task.target_offset_bytes ||
+        (temporary->last_lba - temporary->first_lba + 1U) * 512ULL !=
+            task.construction_size_bytes ||
+        hidden->type_guid != clonecore::gpt_type_basic_data() ||
+        hidden->attributes != kTemporaryNoDefaultDriveLetter ||
+        hidden->name != u"YTEC-INCOMPLETE" ||
+        hidden->first_lba * 512ULL != task.target_offset_bytes ||
+        (hidden->last_lba - hidden->first_lba + 1U) * 512ULL !=
+            task.target_size_bytes) {
+      return status_failure(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"直接縮小GPT construction/final対応",
+          L"同一fresh partition GUID、construction非boot属性、final extent、または最終type/name/attrsが一致しません");
+    }
+  }
+
+  std::size_t staging_count{};
+  std::size_t temporary_esp_count{};
+  for (const auto& partition : temporary_plan.target_disk.partitions) {
+    temporary_esp_count +=
+        partition.type_guid == clonecore::gpt_type_efi_system() ? 1U : 0U;
+    if (partition.first_lba * 512ULL ==
+            plan.staging().archive_offset_bytes &&
+        (partition.last_lba - partition.first_lba + 1U) * 512ULL ==
+            plan.staging().archive_capacity_bytes &&
+        partition.type_guid == clonecore::gpt_type_basic_data() &&
+        partition.attributes == kTemporaryNoDefaultDriveLetter &&
+        partition.name == u"YTEC-INCOMPLETE-STAGING" &&
+        !partition.unique_guid.is_zero()) {
+      ++staging_count;
+    }
+  }
+  const auto hidden_esp_count = static_cast<std::size_t>(std::count_if(
+      hidden_plan.target_disk.partitions.begin(),
+      hidden_plan.target_disk.partitions.end(),
+      [](const clonecore::GptPartition& partition) {
+        return partition.type_guid == clonecore::gpt_type_efi_system();
+      }));
+  if (staging_count != 1U || temporary_esp_count != 0U ||
+      hidden_esp_count != 0U) {
+    return status_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小GPT construction非boot証跡",
+        L"exact stagingが一意でないかtemporary／hidden-finalにESP型が露出しています");
+  }
+  return clonecore::success_status();
+}
+
 clonecore::Result<imageformat::Sha256Digest> staging_identity_hash(
     const WindowsDirectShrinkClonePlan& plan,
     const imageformat::Sha256Digest& connection_instance_hash) {
   constexpr std::string_view kDomain =
-      "YTEC-WINDOWS-DIRECT-SHRINK-STAGING-V1";
+      "YTEC-WINDOWS-DIRECT-SHRINK-STAGING-V2";
   auto target_hash = imageformat::
       hash_tsumugi_physical_restore_target_identity_v1(
           plan.expected_target());
@@ -580,6 +914,8 @@ clonecore::Result<imageformat::Sha256Digest> staging_identity_hash(
   append_array(bytes, target_hash.value());
   append_array(bytes, connection_instance_hash);
   append_array(bytes, plan.final_layout_hash());
+  append_u64(bytes, plan.checkpoint_offset_bytes());
+  append_u64(bytes, kWindowsDirectShrinkCheckpointRecordBytes);
   append_u64(bytes, plan.staging().offset_bytes);
   append_u64(bytes, plan.staging().length_bytes);
   append_u64(bytes, plan.staging().control_reserve_bytes);
@@ -588,9 +924,399 @@ clonecore::Result<imageformat::Sha256Digest> staging_identity_hash(
   return imageformat::sha256(bytes);
 }
 
+bool source_partition_style_matches(
+    const diskmodel::PartitionStyle observed,
+    const migrationcore::MigrationPartitionStyle planned) noexcept {
+  return (observed == diskmodel::PartitionStyle::gpt &&
+          planned == migrationcore::MigrationPartitionStyle::gpt) ||
+      (observed == diskmodel::PartitionStyle::mbr &&
+       planned == migrationcore::MigrationPartitionStyle::mbr);
+}
+
+bool supported_initial_target_partition_table(
+    const diskmodel::DiskInfo& target,
+    const diskmodel::PartitionStyle normalized_style) noexcept {
+  if (normalized_style == diskmodel::PartitionStyle::raw) {
+    return target.partitions.empty();
+  }
+  if (normalized_style == diskmodel::PartitionStyle::gpt) {
+    return std::all_of(
+        target.partitions.begin(),
+        target.partitions.end(),
+        [](const diskmodel::PartitionInfo& partition) {
+          return partition.number != 0U &&
+              partition.style == diskmodel::PartitionStyle::gpt;
+        });
+  }
+  if (normalized_style != diskmodel::PartitionStyle::mbr ||
+      target.partitions.size() > 4U) {
+    return false;
+  }
+  std::array<bool, 5U> seen{};
+  for (const auto& partition : target.partitions) {
+    const bool extended = equal_path(partition.type, L"0x05") ||
+        equal_path(partition.type, L"0x0F") ||
+        equal_path(partition.type, L"0x85");
+    if (partition.number == 0U || partition.number > 4U ||
+        seen[partition.number] ||
+        partition.style != diskmodel::PartitionStyle::mbr || extended) {
+      return false;
+    }
+    seen[partition.number] = true;
+  }
+  return true;
+}
+
+const WindowsDirectShrinkPartitionTask* find_source_task(
+    const WindowsDirectShrinkClonePlan& plan,
+    const std::uint32_t source_table_index,
+    const std::uint32_t target_number) noexcept {
+  const auto found = std::find_if(
+      plan.tasks().begin(),
+      plan.tasks().end(),
+      [&](const WindowsDirectShrinkPartitionTask& task) {
+        return task.source_table_index == source_table_index &&
+            task.target_number == target_number;
+      });
+  return found == plan.tasks().end() ? nullptr : &*found;
+}
+
+bool mbr_partition_type_matches(
+    const std::wstring_view observed,
+    const std::uint8_t expected) noexcept {
+  constexpr wchar_t kHex[] = L"0123456789ABCDEF";
+  const std::array<wchar_t, 5U> canonical{
+      L'0',
+      L'x',
+      kHex[(expected >> 4U) & 0x0FU],
+      kHex[expected & 0x0FU],
+      L'\0',
+  };
+  return observed.size() == 4U &&
+      _wcsnicmp(observed.data(), canonical.data(), 4U) == 0;
+}
+
+bool unsupported_extended_mbr_type(const std::wstring_view type) noexcept {
+  const auto hex = [](const wchar_t value) noexcept {
+    return (value >= L'0' && value <= L'9') ||
+        (value >= L'a' && value <= L'f') ||
+        (value >= L'A' && value <= L'F');
+  };
+  return type.size() != 4U || type[0] != L'0' ||
+      (type[1] != L'x' && type[1] != L'X') || !hex(type[2]) ||
+      !hex(type[3]) || equal_path(type, L"0x00") ||
+      equal_path(type, L"0x05") ||
+      equal_path(type, L"0x0F") || equal_path(type, L"0x85");
+}
+
+clonecore::Status validate_mbr_to_gpt_source_bindings(
+    const WindowsDirectShrinkClonePlan& plan,
+    const diskmodel::DiskInfo& source) {
+  using Disposition = WindowsDirectShrinkSourcePartitionDisposition;
+  using Role = migrationcore::MigrationPartitionRole;
+
+  if (all_zero(plan.source_partition_snapshot_hash()) ||
+      source.partitions.empty() || source.partitions.size() > 4U ||
+      plan.source_partition_mappings().size() != source.partitions.size()) {
+    return status_failure(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"直接縮小production MBR source mapping",
+        L"1～4個のprimary partitionと全source partitionの不変mappingが必要です");
+  }
+
+  std::size_t active_count{};
+  std::size_t windows_count{};
+  std::size_t bios_system_count{};
+  std::size_t recovery_count{};
+  std::size_t replaced_boot_count{};
+  std::array<bool, 5U> seen_primary_numbers{};
+  for (const auto& partition : source.partitions) {
+    if (partition.number == 0U || partition.number > 4U ||
+        seen_primary_numbers[partition.number] ||
+        partition.style != diskmodel::PartitionStyle::mbr ||
+        (!equal_path(partition.type, L"0x07") &&
+         !equal_path(partition.type, L"0x27"))) {
+      return status_failure(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"直接縮小production MBR source partition",
+        L"MBR primary partitionは一意な1～4番の0x07または0x27だけに限定します");
+    }
+    seen_primary_numbers[partition.number] = true;
+    if (partition.bootable) {
+      ++active_count;
+    }
+
+    const WindowsDirectShrinkSourcePartitionMapping* mapping = nullptr;
+    for (const auto& candidate : plan.source_partition_mappings()) {
+      if (candidate.source_table_index != partition.number) {
+        continue;
+      }
+      if (mapping != nullptr) {
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DUP_NAME,
+            L"直接縮小production MBR source mapping重複",
+            L"一つのsource partitionへ複数のmappingがあります");
+      }
+      mapping = &candidate;
+    }
+    if (mapping == nullptr ||
+        (equal_path(partition.type, L"0x27") &&
+         mapping->role != Role::recovery) ||
+        (equal_path(partition.type, L"0x07") &&
+         mapping->role != Role::bios_system &&
+         mapping->role != Role::windows && mapping->role != Role::data)) {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_DEVICE_REINITIALIZATION_NEEDED,
+          L"直接縮小production MBR source role",
+          L"source partition typeと不変role mappingが一致しません");
+    }
+
+    if (mapping->role == Role::windows) {
+      ++windows_count;
+    } else if (mapping->role == Role::bios_system) {
+      ++bios_system_count;
+    } else if (mapping->role == Role::recovery) {
+      ++recovery_count;
+    }
+
+    switch (mapping->disposition) {
+      case Disposition::transferred_to_target: {
+        if (!mapping->selected || !mapping->target_number) {
+          return status_failure(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_INVALID_DATA,
+              L"直接縮小production MBR transfer mapping",
+              L"転送対象にはselectedとtarget numberが必要です");
+        }
+        const auto* task = find_source_task(
+            plan, mapping->source_table_index, *mapping->target_number);
+        if (task == nullptr || task->role != mapping->role) {
+          return status_failure(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_DEVICE_REINITIALIZATION_NEEDED,
+              L"直接縮小production MBR transfer task",
+              L"source mappingとtarget taskを一意に対応付けできません");
+        }
+        break;
+      }
+      case Disposition::replaced_by_generated_uefi_boot:
+        if (mapping->role != Role::bios_system || !mapping->selected ||
+            !mapping->required || mapping->target_number) {
+          return status_failure(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_INVALID_DATA,
+              L"直接縮小production BIOS boot置換",
+              L"必須BIOS systemだけを生成ESP/MSRへ置換できます");
+        }
+        ++replaced_boot_count;
+        break;
+      case Disposition::omitted_unselected:
+        if (mapping->selected || mapping->required || mapping->target_number ||
+            partition.bootable) {
+          return status_failure(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_INVALID_DATA,
+              L"直接縮小production MBR未選択領域",
+              L"未選択・非必須・非activeのsourceだけを省略できます");
+        }
+        break;
+      case Disposition::recreated_as_generated_system_partition:
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_INVALID_DATA,
+            L"直接縮小production MBR system再作成",
+            L"MBR sourceにGPT system partition再作成mappingは指定できません");
+    }
+
+    if (partition.bootable &&
+        !((mapping->role == Role::bios_system &&
+           mapping->disposition ==
+               Disposition::replaced_by_generated_uefi_boot) ||
+          (mapping->role == Role::windows &&
+           mapping->disposition == Disposition::transferred_to_target))) {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_INVALID_DATA,
+          L"直接縮小production MBR active partition",
+          L"一意なactive partitionはBIOS systemまたは転送Windowsでなければなりません");
+    }
+  }
+
+  if (active_count != 1U || windows_count != 1U || bios_system_count > 1U ||
+      recovery_count > 1U || replaced_boot_count != bios_system_count) {
+    return status_failure(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"直接縮小production MBR起動layout",
+        L"一意なactive/Windows、最大一つのBIOS system/Recovery、および完全なUEFI置換mappingが必要です");
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status validate_mbr_preserve_source_bindings(
+    const WindowsDirectShrinkClonePlan& plan,
+    const diskmodel::DiskInfo& source) {
+  using Disposition = WindowsDirectShrinkSourcePartitionDisposition;
+  using Role = migrationcore::MigrationPartitionRole;
+
+  if (!plan.mbr_preserve_binding().has_value() ||
+      all_zero(plan.source_partition_snapshot_hash()) ||
+      source.partitions.empty() || source.partitions.size() > 4U ||
+      plan.source_partition_mappings().size() != source.partitions.size()) {
+    return status_failure(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"直接縮小production MBR preserve source mapping",
+        L"raw MBR bindingと1～4個のprimary partition全件mappingが必要です");
+  }
+
+  std::array<bool, 5U> seen_primary_numbers{};
+  std::size_t active_count{};
+  std::size_t active_boot_role_count{};
+  std::size_t windows_count{};
+  std::size_t bios_system_count{};
+  std::size_t recovery_count{};
+  for (const auto& partition : source.partitions) {
+    if (partition.number == 0U || partition.number > 4U ||
+        seen_primary_numbers[partition.number] ||
+        partition.style != diskmodel::PartitionStyle::mbr ||
+        unsupported_extended_mbr_type(partition.type)) {
+      return status_failure(
+          clonecore::ErrorCode::unsupported_layout,
+          ERROR_NOT_SUPPORTED,
+          L"直接縮小production MBR preserve primary",
+          L"MBR preserveは一意な1～4番の非extended primaryだけを扱います");
+    }
+    seen_primary_numbers[partition.number] = true;
+
+    const WindowsDirectShrinkSourcePartitionMapping* mapping = nullptr;
+    for (const auto& candidate : plan.source_partition_mappings()) {
+      if (candidate.source_table_index != partition.number) {
+        continue;
+      }
+      if (mapping != nullptr) {
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DUP_NAME,
+            L"直接縮小production MBR preserve mapping重複",
+            L"一つのsource primaryへ複数mappingがあります");
+      }
+      mapping = &candidate;
+    }
+    const WindowsDirectShrinkPartitionTask* transferred_task = nullptr;
+    if (mapping != nullptr &&
+        mapping->disposition == Disposition::transferred_to_target &&
+        mapping->target_number.has_value()) {
+      transferred_task = find_source_task(
+          plan, partition.number, *mapping->target_number);
+    }
+    const bool exact_raw = transferred_task != nullptr &&
+        transferred_task->kind ==
+            WindowsDirectShrinkPartitionTaskKind::copy_exact_raw;
+    const bool exact_raw_type_matches = exact_raw &&
+        mbr_partition_type_matches(
+            partition.type,
+            std::to_integer<std::uint8_t>(
+                transferred_task->source_partition_type[0]));
+    const bool role_matches_type = mapping != nullptr &&
+        (exact_raw
+             ? mapping->role == Role::data && exact_raw_type_matches &&
+                   !partition.bootable
+             : mapping->disposition == Disposition::omitted_unselected &&
+                       mapping->role == Role::data && !partition.bootable
+                 ? true
+             : equal_path(partition.type, L"0x27")
+                 ? mapping->role == Role::recovery
+                 : equal_path(partition.type, L"0x07") &&
+                     (mapping->role == Role::bios_system ||
+                      mapping->role == Role::windows ||
+                      mapping->role == Role::data));
+    if (!role_matches_type) {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_DEVICE_REINITIALIZATION_NEEDED,
+          L"直接縮小production MBR preserve role",
+          L"source primary typeとimmutable role mappingが一致しません");
+    }
+
+    if (mapping->role == Role::windows) {
+      ++windows_count;
+    } else if (mapping->role == Role::bios_system) {
+      ++bios_system_count;
+    } else if (mapping->role == Role::recovery) {
+      ++recovery_count;
+    }
+    if (partition.bootable) {
+      ++active_count;
+      if (mapping->role == Role::windows ||
+          mapping->role == Role::bios_system) {
+        ++active_boot_role_count;
+      }
+    }
+
+    if (mapping->disposition == Disposition::transferred_to_target) {
+      if (!mapping->selected || !mapping->target_number.has_value()) {
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_INVALID_DATA,
+            L"直接縮小production MBR preserve transfer",
+            L"転送mappingにはselectedとtarget numberが必要です");
+      }
+      const auto* task = transferred_task;
+      if (task == nullptr || task->role != mapping->role ||
+          task->active != partition.bootable) {
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DEVICE_REINITIALIZATION_NEEDED,
+            L"直接縮小production MBR preserve task",
+            L"source mappingとtarget taskのroleまたはActive属性が一致しません");
+      }
+    } else if (
+        mapping->disposition == Disposition::omitted_unselected) {
+      if (mapping->selected || mapping->required ||
+          mapping->target_number.has_value() || partition.bootable ||
+          (!equal_path(partition.type, L"0x07") &&
+           !equal_path(partition.type, L"0x27") &&
+           mapping->role != Role::data)) {
+        return status_failure(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_INVALID_DATA,
+            L"直接縮小production MBR preserve省略",
+            L"非required・非active・未選択primaryだけを省略できます");
+      }
+    } else {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_INVALID_DATA,
+          L"直接縮小production MBR preserve disposition",
+          L"形式維持ではsource primaryの転送または安全な未選択省略だけを扱います");
+    }
+  }
+
+  const bool system_valid = plan.boot_finalization_required() &&
+      active_count == 1U && active_boot_role_count == 1U &&
+      windows_count == 1U && bios_system_count <= 1U &&
+      recovery_count <= 1U;
+  const bool data_valid = !plan.boot_finalization_required() &&
+      active_count == 0U && windows_count == 0U &&
+      bios_system_count == 0U && recovery_count == 0U;
+  if (!system_valid && !data_valid) {
+    return status_failure(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"直接縮小production MBR preserve起動layout",
+        L"systemは一意なActive/Windowsと最大一つのBIOS system/Recovery、data-onlyはActive/boot roleなしが必要です");
+  }
+  return clonecore::success_status();
+}
+
 clonecore::Result<std::vector<std::byte>> checkpoint_record(
     const WindowsDirectShrinkCheckpointEvidence& evidence) {
-  constexpr std::string_view kMagic = "YTEC-DSC-CHK-V1";
+  constexpr std::string_view kMagic = "YTEC-DSC-CHK-V2";
   std::vector<std::byte> bytes;
   bytes.reserve(kCheckpointBytes);
   append_u32(bytes, static_cast<std::uint32_t>(kMagic.size()));
@@ -669,11 +1395,15 @@ bool partition_matches_exactly(
     const diskmodel::PartitionInfo& partition,
     const std::uint32_t number,
     const std::uint64_t offset,
-    const std::uint64_t size) noexcept {
+    const std::uint64_t size,
+    const diskmodel::PartitionStyle style) noexcept {
   return partition.number == number && partition.offset_bytes == offset &&
-      partition.size_bytes == size &&
-      partition.style == diskmodel::PartitionStyle::gpt;
+      partition.size_bytes == size && partition.style == style;
 }
+
+clonecore::Status verify_native_construction_mbr(
+    const diskmodel::DiskInfo& target,
+    const WindowsDirectShrinkBootFinalizationRequest& request);
 
 class WindowsDirectShrinkWinReTargetGuard final
     : public bootrepair::IWinReRegistrationTargetGuard {
@@ -712,6 +1442,11 @@ class WindowsDirectShrinkWinReTargetGuard final
       return clonecore::Status::failure(observed.error());
     }
     const auto& target = observed.value().target;
+    const bool legacy_bios = request_.expected_partition_style ==
+        migrationcore::MigrationPartitionStyle::mbr;
+    const auto expected_style = legacy_bios
+        ? diskmodel::PartitionStyle::mbr
+        : diskmodel::PartitionStyle::gpt;
     const auto windows_count = static_cast<std::size_t>(std::count_if(
         target.partitions.begin(),
         target.partitions.end(),
@@ -720,7 +1455,8 @@ class WindowsDirectShrinkWinReTargetGuard final
               partition,
               request_.expected_windows_partition_number,
               request_.expected_windows_partition_offset,
-              request_.expected_windows_partition_size);
+              request_.expected_windows_partition_size,
+              expected_style);
         }));
     const auto recovery_count = static_cast<std::size_t>(std::count_if(
         target.partitions.begin(),
@@ -730,7 +1466,8 @@ class WindowsDirectShrinkWinReTargetGuard final
               partition,
               request_.expected_recovery_partition_number,
               request_.expected_recovery_partition_offset,
-              request_.expected_recovery_partition_size);
+              request_.expected_recovery_partition_size,
+              expected_style);
         }));
     if (target.disk_number != request_.expected_target_disk_number ||
         !target.offline.has_value() || target.offline.value() ||
@@ -739,15 +1476,40 @@ class WindowsDirectShrinkWinReTargetGuard final
         target.is_system_disk || target.logical_sector_size != 512U ||
         diskmodel::normalize_disk_partition_style(
             target.partition_style, target.partitions.size()) !=
-            diskmodel::PartitionStyle::gpt ||
+            expected_style ||
         windows_count != 1U || recovery_count != 1U ||
+        (legacy_bios && request_.expected_mbr_disk_signature == 0U) ||
+        (!legacy_bios && request_.expected_mbr_disk_signature != 0U) ||
         request_.expected_windows_partition_number ==
             request_.expected_recovery_partition_number) {
       return status_failure(
           clonecore::ErrorCode::identity_mismatch,
           ERROR_DEVICE_REINITIALIZATION_NEEDED,
           L"直接縮小WinRE対象再識別",
-          L"安定識別済み対象のonline／writeable／fixed／非system／512-byte GPT状態またはWindows／Recovery exact extentが変化しました");
+          L"安定識別済み対象のonline／writeable／fixed／非system／512-byte firmware別形式またはWindows／Recovery exact extentが変化しました");
+    }
+    if (legacy_bios) {
+      return verify_native_construction_mbr(
+          target,
+          WindowsDirectShrinkBootFinalizationRequest{
+              .expected_target_disk_number =
+                  request_.expected_target_disk_number,
+              .expected_windows_partition_number =
+                  request_.expected_windows_partition_number,
+              .expected_windows_partition_offset =
+                  request_.expected_windows_partition_offset,
+              .expected_windows_partition_size =
+                  request_.expected_windows_partition_size,
+              .expected_system_partition_number =
+                  request_.expected_recovery_partition_number,
+              .expected_system_partition_offset =
+                  request_.expected_recovery_partition_offset,
+              .expected_system_partition_size =
+                  request_.expected_recovery_partition_size,
+              .expected_mbr_disk_signature =
+                  request_.expected_mbr_disk_signature,
+              .firmware = bootrepair::BcdBootFirmware::bios,
+          });
     }
     return clonecore::success_status();
   }
@@ -1076,35 +1838,706 @@ finalize_winre_with_windows_apis(
   });
 }
 
-clonecore::Result<WindowsDirectShrinkBootFinalizationEvidence>
-finalize_boot_with_windows_apis(
-    const clonecore::StableDiskIdentity& target,
-    const std::uint64_t windows_partition_offset) {
-  auto inventory = diskmodel::make_windows_disk_inventory_provider();
-  auto finalizer =
-      bootrepair::make_windows_clone_boot_finalization_service(*inventory);
-  auto result = finalizer->execute(bootrepair::CloneBootFinalizationRequest{
-      .expected_target = target,
-      .expected_style = diskmodel::PartitionStyle::gpt,
-      .expected_windows_partition_offset = windows_partition_offset,
-  });
-  if (!result) {
-    return clonecore::Result<
-        WindowsDirectShrinkBootFinalizationEvidence>::failure(result.error());
+bool native_guid_equals(
+    const GUID& observed,
+    const clonecore::GptGuid& expected) noexcept {
+  static_assert(sizeof(observed) == 16U);
+  return std::memcmp(
+             std::addressof(observed),
+             expected.bytes.data(),
+             expected.bytes.size()) == 0;
+}
+
+clonecore::Status verify_native_construction_gpt(
+    const diskmodel::DiskInfo& target,
+    const WindowsDirectShrinkBootFinalizationRequest& request) {
+  if (target.device_path.empty()) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_INVALID_NAME,
+        L"直接縮小construction GPT native照合",
+        L"再識別済み対象のphysical device pathがありません");
   }
-  const auto& report = result.value();
+  clonecore::UniqueHandle handle(CreateFileW(
+      target.device_path.c_str(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr));
+  if (!handle) {
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::io_failed,
+        L"直接縮小construction GPT native open",
+        GetLastError()));
+  }
+
+  constexpr DWORD kInitialBytes = 64U * 1024U;
+  constexpr DWORD kMaximumBytes = 4U * 1024U * 1024U;
+  DWORD buffer_size = kInitialBytes;
+  DWORD bytes_returned{};
+  std::vector<std::byte> bytes(buffer_size);
+  while (DeviceIoControl(
+             handle.get(),
+             IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+             nullptr,
+             0U,
+             bytes.data(),
+             buffer_size,
+             &bytes_returned,
+             nullptr) == FALSE) {
+    const DWORD native_code = GetLastError();
+    if ((native_code == ERROR_INSUFFICIENT_BUFFER ||
+         native_code == ERROR_MORE_DATA) &&
+        buffer_size < kMaximumBytes) {
+      buffer_size = (std::min)(buffer_size * 2U, kMaximumBytes);
+      bytes.resize(buffer_size);
+      continue;
+    }
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::query_failed,
+        L"直接縮小construction GPT native query",
+        native_code));
+  }
+
+  constexpr std::size_t kHeaderBytes =
+      offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
+  if (bytes_returned < kHeaderBytes || bytes_returned > bytes.size()) {
+    return status_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小construction GPT native length",
+        L"partition layout応答長が不正です");
+  }
+  const auto* layout =
+      reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(bytes.data());
+  const std::size_t available_entries =
+      (static_cast<std::size_t>(bytes_returned) - kHeaderBytes) /
+      sizeof(PARTITION_INFORMATION_EX);
+  if (layout->PartitionStyle != PARTITION_STYLE_GPT ||
+      layout->PartitionCount > available_entries) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction GPT native table",
+        L"GPT形式またはpartition entry境界が期待と一致しません");
+  }
+
+  std::size_t windows_count{};
+  std::size_t system_count{};
+  std::size_t efi_type_count{};
+  bool every_partition_hidden_basic_data = true;
+  for (DWORD index = 0U; index < layout->PartitionCount; ++index) {
+    const auto& partition = layout->PartitionEntry[index];
+    if (partition.PartitionNumber == 0U ||
+        partition.PartitionLength.QuadPart <= 0) {
+      continue;
+    }
+    if (partition.PartitionStyle != PARTITION_STYLE_GPT) {
+      every_partition_hidden_basic_data = false;
+      continue;
+    }
+    if (native_guid_equals(
+            partition.Gpt.PartitionType,
+            clonecore::gpt_type_efi_system())) {
+      ++efi_type_count;
+    }
+    const bool hidden_basic_data = native_guid_equals(
+        partition.Gpt.PartitionType, clonecore::gpt_type_basic_data()) &&
+        partition.Gpt.Attributes == kTemporaryNoDefaultDriveLetter;
+    every_partition_hidden_basic_data &= hidden_basic_data;
+    const auto offset = partition.StartingOffset.QuadPart < 0
+        ? 0U
+        : static_cast<std::uint64_t>(partition.StartingOffset.QuadPart);
+    const auto length = partition.PartitionLength.QuadPart < 0
+        ? 0U
+        : static_cast<std::uint64_t>(partition.PartitionLength.QuadPart);
+    if (partition.PartitionNumber ==
+            request.expected_windows_partition_number &&
+        offset == request.expected_windows_partition_offset &&
+        length == request.expected_windows_partition_size &&
+        hidden_basic_data) {
+      ++windows_count;
+    }
+    if (partition.PartitionNumber ==
+            request.expected_system_partition_number &&
+        offset == request.expected_system_partition_offset &&
+        length == request.expected_system_partition_size &&
+        hidden_basic_data) {
+      ++system_count;
+    }
+  }
+  if (!every_partition_hidden_basic_data || efi_type_count != 0U ||
+      windows_count != 1U || system_count != 1U) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction GPT native visibility",
+        L"全partitionのBasicData／NO_DRIVE_LETTER、ESP型0件、またはWindows／system exact extentを証明できません");
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status verify_native_construction_mbr(
+    const diskmodel::DiskInfo& target,
+    const WindowsDirectShrinkBootFinalizationRequest& request) {
+  if (target.device_path.empty() || request.expected_mbr_disk_signature == 0U) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_INVALID_NAME,
+        L"直接縮小construction MBR native照合",
+        L"再識別済み対象pathまたはimmutable fresh MBR signatureがありません");
+  }
+  clonecore::UniqueHandle handle(CreateFileW(
+      target.device_path.c_str(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr));
+  if (!handle) {
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::io_failed,
+        L"直接縮小construction MBR native open",
+        GetLastError()));
+  }
+
+  constexpr DWORD kInitialBytes = 64U * 1024U;
+  constexpr DWORD kMaximumBytes = 4U * 1024U * 1024U;
+  DWORD buffer_size = kInitialBytes;
+  DWORD bytes_returned{};
+  std::vector<std::byte> bytes(buffer_size);
+  while (DeviceIoControl(
+             handle.get(),
+             IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+             nullptr,
+             0U,
+             bytes.data(),
+             buffer_size,
+             &bytes_returned,
+             nullptr) == FALSE) {
+    const DWORD native_code = GetLastError();
+    if ((native_code == ERROR_INSUFFICIENT_BUFFER ||
+         native_code == ERROR_MORE_DATA) &&
+        buffer_size < kMaximumBytes) {
+      buffer_size = (std::min)(buffer_size * 2U, kMaximumBytes);
+      bytes.resize(buffer_size);
+      continue;
+    }
+    return clonecore::Status::failure(clonecore::make_win32_error(
+        clonecore::ErrorCode::query_failed,
+        L"直接縮小construction MBR native query",
+        native_code));
+  }
+
+  constexpr std::size_t kHeaderBytes =
+      offsetof(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry);
+  if (bytes_returned < kHeaderBytes || bytes_returned > bytes.size()) {
+    return status_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"直接縮小construction MBR native length",
+        L"partition layout応答長が不正です");
+  }
+  const auto* layout =
+      reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(bytes.data());
+  const std::size_t available_entries =
+      (static_cast<std::size_t>(bytes_returned) - kHeaderBytes) /
+      sizeof(PARTITION_INFORMATION_EX);
+  if (layout->PartitionStyle != PARTITION_STYLE_MBR ||
+      layout->PartitionCount > available_entries ||
+      layout->Mbr.Signature != request.expected_mbr_disk_signature) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction MBR native table",
+        L"MBR形式、fresh disk signature、またはpartition entry境界が期待と一致しません");
+  }
+
+  std::size_t windows_count{};
+  std::size_t system_count{};
+  bool every_partition_inactive_supported_primary = true;
+  std::array<bool, 5U> seen_primary_numbers{};
+  for (DWORD index = 0U; index < layout->PartitionCount; ++index) {
+    const auto& partition = layout->PartitionEntry[index];
+    if (partition.PartitionNumber == 0U ||
+        partition.PartitionLength.QuadPart <= 0) {
+      continue;
+    }
+    const bool supported = partition.PartitionStyle == PARTITION_STYLE_MBR &&
+        partition.PartitionNumber <= 4U &&
+        !seen_primary_numbers[partition.PartitionNumber];
+    if (partition.PartitionNumber <= 4U) {
+      seen_primary_numbers[partition.PartitionNumber] = true;
+    }
+    const bool supported_type = partition.PartitionStyle == PARTITION_STYLE_MBR &&
+        (partition.Mbr.PartitionType == 0x07U ||
+         partition.Mbr.PartitionType == 0x27U);
+    every_partition_inactive_supported_primary &=
+        supported && supported_type && !partition.Mbr.BootIndicator;
+    const auto offset = partition.StartingOffset.QuadPart < 0
+        ? 0U
+        : static_cast<std::uint64_t>(partition.StartingOffset.QuadPart);
+    const auto length = partition.PartitionLength.QuadPart < 0
+        ? 0U
+        : static_cast<std::uint64_t>(partition.PartitionLength.QuadPart);
+    if (partition.PartitionNumber ==
+            request.expected_windows_partition_number &&
+        offset == request.expected_windows_partition_offset &&
+        length == request.expected_windows_partition_size &&
+        supported_type && !partition.Mbr.BootIndicator) {
+      ++windows_count;
+    }
+    if (partition.PartitionNumber ==
+            request.expected_system_partition_number &&
+        offset == request.expected_system_partition_offset &&
+        length == request.expected_system_partition_size &&
+        supported_type && !partition.Mbr.BootIndicator) {
+      ++system_count;
+    }
+  }
+  if (!every_partition_inactive_supported_primary || windows_count != 1U ||
+      system_count != 1U) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction MBR native visibility",
+        L"全primaryの0x07/0x27・Active=false、またはWindows/system exact extentを証明できません");
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status revalidate_direct_construction_boot_target(
+    const WindowsDirectShrinkBootFinalizationRequest& request) {
+  auto inventory = diskmodel::make_windows_disk_inventory_provider();
+  auto observed = diskmodel::reidentify_physical_clone(
+      request.expected_source,
+      request.expected_target,
+      request.confirmation,
+      *inventory,
+      false);
+  if (!observed) {
+    return clonecore::Status::failure(observed.error());
+  }
+  const auto& target = observed.value().target;
+  const bool legacy_bios =
+      request.firmware == bootrepair::BcdBootFirmware::bios;
+  const auto expected_style = legacy_bios
+      ? diskmodel::PartitionStyle::mbr
+      : diskmodel::PartitionStyle::gpt;
+  const auto windows_count = static_cast<std::size_t>(std::count_if(
+      target.partitions.begin(),
+      target.partitions.end(),
+      [&](const diskmodel::PartitionInfo& partition) {
+        return partition_matches_exactly(
+            partition,
+            request.expected_windows_partition_number,
+            request.expected_windows_partition_offset,
+            request.expected_windows_partition_size,
+            expected_style);
+      }));
+  const auto system_count = static_cast<std::size_t>(std::count_if(
+      target.partitions.begin(),
+      target.partitions.end(),
+      [&](const diskmodel::PartitionInfo& partition) {
+        return partition_matches_exactly(
+            partition,
+            request.expected_system_partition_number,
+            request.expected_system_partition_offset,
+            request.expected_system_partition_size,
+            expected_style);
+      }));
+  if (target.disk_number != request.expected_target_disk_number ||
+      !target.offline.has_value() || target.offline.value() ||
+      !target.read_only.has_value() || target.read_only.value() ||
+      !target.removable.has_value() || target.removable.value() ||
+      target.is_system_disk || target.logical_sector_size != 512U ||
+      diskmodel::normalize_disk_partition_style(
+          target.partition_style, target.partitions.size()) !=
+          expected_style ||
+      windows_count != 1U || system_count != 1U ||
+      (!legacy_bios &&
+       request.expected_windows_partition_number ==
+           request.expected_system_partition_number) ||
+      (legacy_bios && request.expected_mbr_disk_signature == 0U) ||
+      (!legacy_bios && request.expected_mbr_disk_signature != 0U)) {
+    return status_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction起動対象再識別",
+        L"安定識別済み対象のonline／writeable／fixed／非system／512-byte形式またはWindows／system exact extentが変化しました");
+  }
+  return legacy_bios
+      ? verify_native_construction_mbr(target, request)
+      : verify_native_construction_gpt(target, request);
+}
+
+clonecore::Result<WindowsDirectShrinkBootFinalizationEvidence>
+finalize_bios_boot_with_windows_apis(
+    const WindowsDirectShrinkBootFinalizationRequest& request) {
+  auto status = revalidate_direct_construction_boot_target(request);
+  auto drive_roots = choose_unused_winre_drive_roots();
+  auto mount_api = bootrepair::make_windows_system_volume_mount_api();
+  if (!status || !drive_roots || !mount_api) {
+    return !status
+        ? clonecore::Result<
+              WindowsDirectShrinkBootFinalizationEvidence>::failure(
+              status.error())
+        : !drive_roots
+              ? clonecore::Result<
+                    WindowsDirectShrinkBootFinalizationEvidence>::failure(
+                    drive_roots.error())
+              : failure<WindowsDirectShrinkBootFinalizationEvidence>(
+                    clonecore::ErrorCode::internal_error,
+                    ERROR_INVALID_HANDLE,
+                    L"直接縮小construction BIOS BCDBoot mount依存",
+                    L"exact target Volume GUID mount APIがありません");
+  }
+
+  const bootrepair::BootRepairVolumeLocation windows_location{
+      .disk_number = request.expected_target_disk_number,
+      .starting_offset = request.expected_windows_partition_offset,
+      .extent_length = request.expected_windows_partition_size,
+      .file_system = L"NTFS",
+  };
+  const bootrepair::BootRepairVolumeLocation system_location{
+      .disk_number = request.expected_target_disk_number,
+      .starting_offset = request.expected_system_partition_offset,
+      .extent_length = request.expected_system_partition_size,
+      .file_system = L"NTFS",
+  };
+  auto windows_mount_result = bootrepair::TemporarySystemVolumeMount::acquire(
+      bootrepair::TemporarySystemVolumeMountPlan{
+          .firmware = bootrepair::BcdBootFirmware::bios,
+          .disk_number = request.expected_target_disk_number,
+          .partition_number = request.expected_windows_partition_number,
+          .volume_name = request.windows_volume_root,
+          .temporary_root = drive_roots.value()[0],
+          .expected_location = windows_location,
+      },
+      *mount_api);
+  if (!windows_mount_result) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(
+        windows_mount_result.error());
+  }
+  auto windows_mount = windows_mount_result.take_value();
+
+  const bool same_system_partition =
+      request.expected_windows_partition_number ==
+          request.expected_system_partition_number;
+  std::optional<bootrepair::TemporarySystemVolumeMount> system_mount;
+  if (!same_system_partition) {
+    auto mounted = bootrepair::TemporarySystemVolumeMount::acquire(
+        bootrepair::TemporarySystemVolumeMountPlan{
+            .firmware = bootrepair::BcdBootFirmware::bios,
+            .disk_number = request.expected_target_disk_number,
+            .partition_number = request.expected_system_partition_number,
+            .volume_name = request.system_volume_root,
+            .temporary_root = drive_roots.value()[1],
+            .expected_location = system_location,
+        },
+        *mount_api);
+    if (!mounted) {
+      const auto release = windows_mount.release();
+      return clonecore::Result<
+          WindowsDirectShrinkBootFinalizationEvidence>::failure(
+          release ? mounted.error() : release.error());
+    }
+    system_mount.emplace(mounted.take_value());
+  }
+
+  const auto release_mounts = [&]() -> std::optional<clonecore::Error> {
+    if (system_mount.has_value()) {
+      const auto system_release = system_mount->release();
+      if (!system_release) {
+        static_cast<void>(windows_mount.release());
+        return system_release.error();
+      }
+    }
+    const auto windows_release = windows_mount.release();
+    return windows_release
+        ? std::nullopt
+        : std::optional<clonecore::Error>(windows_release.error());
+  };
+
+  status = revalidate_direct_construction_boot_target(request);
+  auto bcdboot = status
+      ? bootrepair::execute_bcdboot_with_windows_apis(
+            bootrepair::BcdBootRequest{
+                .target_windows_directory = windows_mount.root() + L"Windows",
+                .target_system_partition_root = same_system_partition
+                    ? windows_mount.root()
+                    : system_mount->root(),
+                .firmware = bootrepair::BcdBootFirmware::bios,
+                .store_policy =
+                    bootrepair::BcdBootStorePolicy::rebuild_fresh,
+            })
+      : clonecore::Result<bootrepair::BcdBootReport>::failure(status.error());
+  const auto release = release_mounts();
+  if (release.has_value()) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(*release);
+  }
+  if (!bcdboot) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(bcdboot.error());
+  }
+  status = revalidate_direct_construction_boot_target(request);
+  if (!status) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(status.error());
+  }
+  if (bcdboot.value().exit_code != 0U ||
+      !bcdboot.value().microsoft_signature_verified ||
+      !bcdboot.value().fresh_store_verified) {
+    return failure<WindowsDirectShrinkBootFinalizationEvidence>(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_CRC,
+        L"直接縮小construction BIOS BCDBoot証跡",
+        L"Microsoft署名、/f BIOS終了コード、またはfresh BCD store読戻し証跡が不足しています");
+  }
   return clonecore::Result<
       WindowsDirectShrinkBootFinalizationEvidence>::success({
-      .microsoft_signed_bcdboot =
-          report.boot_repair.bcdboot.microsoft_signature_verified,
-      .fresh_bcd_store_read_back_verified =
-          report.boot_repair.boot_store_verified &&
-          report.boot_repair.bcdboot.fresh_store_verified,
-      .temporary_mounts_released = report.temporary_mounts_released &&
-          report.boot_repair.temporary_mount_released,
-      .final_target_reidentified = report.final_target_reidentified,
-      .partition_layout_unchanged = report.partition_layout_unchanged,
-      .nvram_unchanged = report.boot_repair.nvram_unchanged,
+      .microsoft_signed_bcdboot = true,
+      .fresh_bcd_store_read_back_verified = true,
+      .construction_gpt_non_bootable_verified = false,
+      .efi_ownership_safe_before_mount = false,
+      .efi_ownership_revalidated_before_mutation = false,
+      .microsoft_boot_namespace_read_back_verified = false,
+      .temporary_mounts_released = true,
+      .final_target_reidentified = true,
+      .partition_layout_unchanged = true,
+      .nvram_unchanged = true,
+      .legacy_bios = true,
+      .exact_target_volume_extents = true,
+      .target_only_reconstruction = true,
+  });
+}
+
+clonecore::Result<WindowsDirectShrinkBootFinalizationEvidence>
+finalize_boot_with_windows_apis(
+    const WindowsDirectShrinkBootFinalizationRequest& request) {
+  const bool legacy_bios =
+      request.firmware == bootrepair::BcdBootFirmware::bios;
+  const bool same_system_partition =
+      request.expected_windows_partition_number ==
+          request.expected_system_partition_number;
+  if ((request.firmware != bootrepair::BcdBootFirmware::uefi &&
+       request.firmware != bootrepair::BcdBootFirmware::bios) ||
+      request.expected_windows_partition_number == 0U ||
+      request.expected_system_partition_number == 0U ||
+      request.expected_windows_partition_offset == 0U ||
+      request.expected_windows_partition_size == 0U ||
+      request.expected_system_partition_offset == 0U ||
+      request.expected_system_partition_size == 0U ||
+      request.windows_volume_root.empty() ||
+      request.system_volume_root.empty() ||
+      (legacy_bios && request.expected_mbr_disk_signature == 0U) ||
+      (!legacy_bios && request.expected_mbr_disk_signature != 0U) ||
+      (!legacy_bios && same_system_partition) ||
+      (same_system_partition !=
+       equal_path(request.windows_volume_root, request.system_volume_root))) {
+    return failure<WindowsDirectShrinkBootFinalizationEvidence>(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_PARAMETER,
+        L"直接縮小construction BCDBoot要求",
+        L"firmware別の一意なWindows/system partition、fresh MBR signature、およびexact Volume GUID rootが必要です");
+  }
+  if (legacy_bios) {
+    return finalize_bios_boot_with_windows_apis(request);
+  }
+  auto status = revalidate_direct_construction_boot_target(request);
+  auto drive_roots = choose_unused_winre_drive_roots();
+  auto mount_api = bootrepair::make_windows_system_volume_mount_api();
+  auto ownership_inspector =
+      bootrepair::make_windows_efi_boot_ownership_inspector();
+  if (!status || !drive_roots || !mount_api || !ownership_inspector) {
+    return !status
+        ? clonecore::Result<
+              WindowsDirectShrinkBootFinalizationEvidence>::failure(
+              status.error())
+        : !drive_roots
+              ? clonecore::Result<
+                    WindowsDirectShrinkBootFinalizationEvidence>::failure(
+                    drive_roots.error())
+              : failure<WindowsDirectShrinkBootFinalizationEvidence>(
+                    clonecore::ErrorCode::internal_error,
+                    ERROR_INVALID_HANDLE,
+                    L"直接縮小construction BCDBoot mount依存",
+                    L"exact Volume GUID mountまたはEFI ownership検査APIがありません");
+  }
+
+  auto ownership_before =
+      ownership_inspector->inspect_existing_esp_read_only(
+          request.system_volume_root);
+  if (!ownership_before ||
+      ownership_before.value().state !=
+          bootrepair::EfiBootOwnershipState::microsoft_only_or_empty ||
+      !bootrepair::efi_boot_ownership_allows_microsoft_rebuild(
+          ownership_before.value())) {
+    return ownership_before
+        ? failure<WindowsDirectShrinkBootFinalizationEvidence>(
+              clonecore::ErrorCode::unsupported_layout,
+              ERROR_NOT_SUPPORTED,
+              L"直接縮小construction EFI ownership事前診断",
+              L"system volumeが空またはMicrosoft所有と一意に確認できません")
+        : clonecore::Result<
+              WindowsDirectShrinkBootFinalizationEvidence>::failure(
+              ownership_before.error());
+  }
+
+  const bootrepair::BootRepairVolumeLocation windows_location{
+      .disk_number = request.expected_target_disk_number,
+      .starting_offset = request.expected_windows_partition_offset,
+      .extent_length = request.expected_windows_partition_size,
+      .file_system = L"NTFS",
+  };
+  const bootrepair::BootRepairVolumeLocation system_location{
+      .disk_number = request.expected_target_disk_number,
+      .starting_offset = request.expected_system_partition_offset,
+      .extent_length = request.expected_system_partition_size,
+      .file_system = L"FAT32",
+  };
+  auto windows_mount_result = bootrepair::TemporarySystemVolumeMount::acquire(
+      bootrepair::TemporarySystemVolumeMountPlan{
+          .firmware = bootrepair::BcdBootFirmware::uefi,
+          .disk_number = request.expected_target_disk_number,
+          .partition_number = request.expected_windows_partition_number,
+          .volume_name = request.windows_volume_root,
+          .temporary_root = drive_roots.value()[0],
+          .expected_location = windows_location,
+      },
+      *mount_api);
+  if (!windows_mount_result) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(
+        windows_mount_result.error());
+  }
+  auto windows_mount = windows_mount_result.take_value();
+  auto system_mount_result = bootrepair::TemporarySystemVolumeMount::acquire(
+      bootrepair::TemporarySystemVolumeMountPlan{
+          .firmware = bootrepair::BcdBootFirmware::uefi,
+          .disk_number = request.expected_target_disk_number,
+          .partition_number = request.expected_system_partition_number,
+          .volume_name = request.system_volume_root,
+          .temporary_root = drive_roots.value()[1],
+          .expected_location = system_location,
+      },
+      *mount_api);
+  if (!system_mount_result) {
+    const auto release = windows_mount.release();
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(
+        release ? system_mount_result.error() : release.error());
+  }
+  auto system_mount = system_mount_result.take_value();
+  const auto release_mounts = [&]() -> std::optional<clonecore::Error> {
+    const auto system_release = system_mount.release();
+    const auto windows_release = windows_mount.release();
+    if (!system_release) {
+      return system_release.error();
+    }
+    if (!windows_release) {
+      return windows_release.error();
+    }
+    return std::nullopt;
+  };
+
+  status = revalidate_direct_construction_boot_target(request);
+  auto ownership_before_mutation = status
+      ? ownership_inspector->inspect_existing_esp_read_only(
+            request.system_volume_root)
+      : clonecore::Result<bootrepair::EfiBootOwnershipEvidence>::failure(
+            status.error());
+  if (ownership_before_mutation &&
+      (!bootrepair::equivalent_efi_boot_ownership(
+           ownership_before.value(), ownership_before_mutation.value()) ||
+       ownership_before_mutation.value().state !=
+           bootrepair::EfiBootOwnershipState::microsoft_only_or_empty ||
+       !bootrepair::efi_boot_ownership_allows_microsoft_rebuild(
+           ownership_before_mutation.value()))) {
+    ownership_before_mutation = clonecore::Result<
+        bootrepair::EfiBootOwnershipEvidence>::failure(platform_error(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"直接縮小construction EFI ownership直前再照合",
+        L"mount後・BCDBoot直前にEFI ownershipが変化しました"));
+  }
+  auto bcdboot = ownership_before_mutation
+      ? bootrepair::execute_bcdboot_with_windows_apis(
+            bootrepair::BcdBootRequest{
+                .target_windows_directory = windows_mount.root() + L"Windows",
+                .target_system_partition_root = system_mount.root(),
+                .firmware = bootrepair::BcdBootFirmware::uefi,
+                .store_policy =
+                    bootrepair::BcdBootStorePolicy::rebuild_fresh,
+            })
+      : clonecore::Result<bootrepair::BcdBootReport>::failure(
+            ownership_before_mutation.error());
+  const auto release = release_mounts();
+  if (release.has_value()) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(*release);
+  }
+  if (!bcdboot) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(
+        bcdboot.error());
+  }
+  status = revalidate_direct_construction_boot_target(request);
+  if (!status) {
+    return clonecore::Result<
+        WindowsDirectShrinkBootFinalizationEvidence>::failure(status.error());
+  }
+  auto ownership_after =
+      ownership_inspector->inspect_existing_esp_read_only(
+          request.system_volume_root);
+  if (!ownership_after ||
+      ownership_after.value().state !=
+          bootrepair::EfiBootOwnershipState::microsoft_only_or_empty ||
+      !bootrepair::efi_boot_ownership_allows_microsoft_rebuild(
+          ownership_after.value()) ||
+      !ownership_after.value().microsoft_namespace_present ||
+      ownership_after.value().microsoft_signed_efi_loader_count == 0U) {
+    return ownership_after
+        ? failure<WindowsDirectShrinkBootFinalizationEvidence>(
+              clonecore::ErrorCode::verification_failed,
+              ERROR_CRC,
+              L"直接縮小construction EFI ownership事後読戻し",
+              L"BCDBoot後のMicrosoft namespaceと署名済みEFI loaderを確認できません")
+        : clonecore::Result<
+              WindowsDirectShrinkBootFinalizationEvidence>::failure(
+              ownership_after.error());
+  }
+  if (bcdboot.value().exit_code != 0U ||
+      !bcdboot.value().microsoft_signature_verified ||
+      !bcdboot.value().fresh_store_verified) {
+    return failure<WindowsDirectShrinkBootFinalizationEvidence>(
+        clonecore::ErrorCode::verification_failed,
+        ERROR_CRC,
+        L"直接縮小construction BCDBoot証跡",
+        L"Microsoft署名、終了コード、または新規BCD store読戻し証跡が不足しています");
+  }
+  return clonecore::Result<
+      WindowsDirectShrinkBootFinalizationEvidence>::success({
+      .microsoft_signed_bcdboot = true,
+      .fresh_bcd_store_read_back_verified = true,
+      .construction_gpt_non_bootable_verified = true,
+      .efi_ownership_safe_before_mount = true,
+      .efi_ownership_revalidated_before_mutation = true,
+      .microsoft_boot_namespace_read_back_verified = true,
+      .temporary_mounts_released = true,
+      .final_target_reidentified = true,
+      .partition_layout_unchanged = true,
+      // An explicit /s root is mandatory in BcdBootRequest and therefore the
+      // direct construction flow never creates or reorders host NVRAM entries.
+      .nvram_unchanged = true,
+      .legacy_bios = false,
+      .exact_target_volume_extents = true,
+      .target_only_reconstruction = true,
   });
 }
 
@@ -2034,6 +3467,35 @@ clonecore::Result<imageformat::Sha256Digest> applied_digest(
   return imageformat::sha256(bytes);
 }
 
+bool stable_identity_exactly_matches(
+    const clonecore::StableDiskIdentity& left,
+    const clonecore::StableDiskIdentity& right) noexcept {
+  return left.disk_number == right.disk_number && left.model == right.model &&
+      left.size_bytes == right.size_bytes &&
+      left.logical_sector_size == right.logical_sector_size &&
+      left.serial_suffix == right.serial_suffix &&
+      left.device_instance_id == right.device_instance_id &&
+      left.is_system_disk == right.is_system_disk;
+}
+
+bool checkpoint_exactly_matches(
+    const WindowsDirectShrinkCheckpointEvidence& left,
+    const WindowsDirectShrinkCheckpointEvidence& right) noexcept {
+  return left.phase == right.phase && left.revision == right.revision &&
+      left.plan_hash == right.plan_hash &&
+      left.staging_identity_hash == right.staging_identity_hash &&
+      left.record_hash == right.record_hash &&
+      left.aggregate_write_digest == right.aggregate_write_digest &&
+      stable_identity_exactly_matches(
+          left.observed_target, right.observed_target) &&
+      left.completed_task_count == right.completed_task_count &&
+      left.verified_target_bytes == right.verified_target_bytes &&
+      left.durable == right.durable && left.flushed == right.flushed &&
+      left.read_back_verified == right.read_back_verified &&
+      left.target_offline == right.target_offline &&
+      left.final_layout_committed == right.final_layout_committed;
+}
+
 class WindowsDirectShrinkClonePlatform final
     : public IWindowsDirectShrinkClonePlatform {
  public:
@@ -2043,13 +3505,17 @@ class WindowsDirectShrinkClonePlatform final
       WindowsDirectShrinkClonePlatformDependencies dependencies,
       clonecore::GptWritePlan final_gpt,
       clonecore::GptWritePlan temporary_gpt,
-      clonecore::GptWritePlan hidden_final_gpt)
+      clonecore::GptWritePlan hidden_final_gpt,
+      std::optional<clonecore::MbrWritePlan> final_mbr,
+      std::vector<std::byte> hidden_final_mbr_sector)
       : plan_(std::move(plan)),
         request_(std::move(request)),
         dependencies_(std::move(dependencies)),
         final_gpt_(std::move(final_gpt)),
         temporary_gpt_(std::move(temporary_gpt)),
-        hidden_final_gpt_(std::move(hidden_final_gpt)) {}
+        hidden_final_gpt_(std::move(hidden_final_gpt)),
+        final_mbr_(std::move(final_mbr)),
+        hidden_final_mbr_sector_(std::move(hidden_final_mbr_sector)) {}
 
   ~WindowsDirectShrinkClonePlatform() override {
     if (state_ != State::committed &&
@@ -2152,7 +3618,7 @@ class WindowsDirectShrinkClonePlatform final
           L"固定したWriterの容量または論理セクターが計画と一致しません");
     }
     target_touched_ = true;
-    status = invalidate_partition_metadata(*writer_);
+    status = invalidate_initial_partition_metadata(*writer_);
     if (status) {
       status = publish_gpt_plan(
           *writer_, temporary_gpt_, L"直接縮小一時GPT公開");
@@ -2308,7 +3774,8 @@ class WindowsDirectShrinkClonePlatform final
       return imageformat::sha256(combined);
     };
     for (const auto& task : tasks) {
-      if (task.kind == WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim) {
+      if (task.kind == WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim ||
+          task.kind == WindowsDirectShrinkPartitionTaskKind::copy_exact_raw) {
         continue;
       }
       if (task.kind ==
@@ -2608,6 +4075,198 @@ class WindowsDirectShrinkClonePlatform final
     });
   }
 
+  clonecore::Result<WindowsDirectShrinkExactRawPartitionEvidence>
+  copy_exact_raw_and_verify(
+      const WindowsDirectShrinkPartitionTask& task,
+      const clonecore::ISourceDiskReader& read_only_source) override {
+    constexpr std::size_t kChunkBytes = 4U * 1024U * 1024U;
+    if (state_ != State::begun || disk_online_ || !writer_ ||
+        archive_.has_value() || !task.source_table_index.has_value() ||
+        task.kind !=
+            WindowsDirectShrinkPartitionTaskKind::copy_exact_raw ||
+        task.role != migrationcore::MigrationPartitionRole::data ||
+        task.source_size_bytes == 0U ||
+        task.construction_size_bytes != task.source_size_bytes ||
+        task.target_size_bytes != task.source_size_bytes ||
+        read_only_source.logical_sector_size() != 512U ||
+        read_only_source.size_bytes() != plan_.expected_source().size_bytes ||
+        writer_->logical_sector_size() != 512U ||
+        writer_->size_bytes() != plan_.expected_target().size_bytes) {
+      return failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_STATE,
+          L"直接縮小exact RAW初期条件",
+          L"read-only source、offline target、元区画と同一容量のRAW task、または512-byte sectorを証明できません");
+    }
+    std::uint64_t source_end{};
+    std::uint64_t target_end{};
+    if (!checked_add(
+            task.source_offset_bytes,
+            task.source_size_bytes,
+            source_end) ||
+        !checked_add(
+            task.target_offset_bytes,
+            task.target_size_bytes,
+            target_end) ||
+        source_end > read_only_source.size_bytes() ||
+        target_end > writer_->size_bytes() ||
+        task.source_offset_bytes % 512U != 0U ||
+        task.target_offset_bytes % 512U != 0U ||
+        task.source_size_bytes % 512U != 0U) {
+      return failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_ARITHMETIC_OVERFLOW,
+          L"直接縮小exact RAW extent",
+          L"source/target extentの終端、整列、または不変容量が不正です");
+    }
+    const auto source_reader = [&](
+        const std::uint64_t relative,
+        const std::size_t length) {
+      if (clonecore::disk_operation_cancellation_requested(
+              request_.callbacks)) {
+        return clonecore::Result<std::vector<std::byte>>::failure({
+            .code = clonecore::ErrorCode::cancelled,
+            .native_code = ERROR_CANCELLED,
+            .operation = L"直接縮小exact RAW source Hash",
+            .message = L"読取り専用区画のHash境界で取消しました",
+        });
+      }
+      return read_only_source.read(task.source_offset_bytes + relative, length);
+    };
+    auto source_hash_before = imageformat::sha256_from_reader(
+        task.source_size_bytes, kChunkBytes, source_reader);
+    if (!source_hash_before || all_zero(source_hash_before.value())) {
+      return source_hash_before
+          ? failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+                clonecore::ErrorCode::verification_failed,
+                ERROR_CRC,
+                L"直接縮小exact RAW source Hash",
+                L"コピー前source SHA-256が無効です")
+          : clonecore::Result<
+                WindowsDirectShrinkExactRawPartitionEvidence>::failure(
+                source_hash_before.error());
+    }
+
+    std::uint64_t copied{};
+    std::uint64_t chunks{};
+    while (copied < task.source_size_bytes) {
+      if (clonecore::disk_operation_cancellation_requested(
+              request_.callbacks)) {
+        abort_keep_offline_incomplete();
+        return failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+            clonecore::ErrorCode::cancelled,
+            ERROR_CANCELLED,
+            L"直接縮小exact RAW取消",
+            L"次のRAW chunk書込み前に取消し、targetをoffline未完了で保持しました");
+      }
+      const auto remaining = task.source_size_bytes - copied;
+      const auto length = static_cast<std::size_t>((std::min<std::uint64_t>)(
+          remaining, kChunkBytes));
+      auto source = read_only_source.read(
+          task.source_offset_bytes + copied, length);
+      if (!source || source.value().size() != length) {
+        abort_keep_offline_incomplete();
+        return source
+            ? failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+                  clonecore::ErrorCode::io_failed,
+                  ERROR_HANDLE_EOF,
+                  L"直接縮小exact RAW source読取り",
+                  L"読取り専用sourceからchunk全体を読み取れません")
+            : clonecore::Result<
+                  WindowsDirectShrinkExactRawPartitionEvidence>::failure(
+                  source.error());
+      }
+      auto status = write_flush_readback(
+          *writer_,
+          task.target_offset_bytes + copied,
+          source.value(),
+          L"直接縮小exact RAW chunk書込み・flush・読戻し");
+      if (!status) {
+        abort_keep_offline_incomplete();
+        return clonecore::Result<
+            WindowsDirectShrinkExactRawPartitionEvidence>::failure(
+            status.error());
+      }
+      copied += length;
+      ++chunks;
+      clonecore::report_disk_operation_progress(
+          request_.callbacks,
+          clonecore::DiskOperationProgress{
+              .stage = clonecore::DiskOperationStage::copying_data,
+              .partition_index = task.source_table_index,
+              .total_read_bytes = task.source_size_bytes,
+              .total_write_bytes = task.target_size_bytes,
+              .total_verify_bytes = task.target_size_bytes,
+              .read_bytes = copied,
+              .written_bytes = copied,
+              .verified_bytes = copied,
+              .cancellation_allowed = true,
+              .pause_allowed = true,
+          });
+      if (clonecore::disk_operation_control_at_safe_boundary(
+              request_.callbacks,
+              clonecore::DiskOperationSafeBoundary{
+                  .kind = clonecore::DiskOperationSafeBoundaryKind::
+                      verified_chunk,
+                  .stage = clonecore::DiskOperationStage::copying_data,
+                  .partition_index = task.source_table_index,
+                  .completed_bytes = copied,
+                  .completed_units = chunks,
+              }) == clonecore::DiskOperationControlDecision::
+                  cancel_operation) {
+        abort_keep_offline_incomplete();
+        return failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+            clonecore::ErrorCode::cancelled,
+            ERROR_CANCELLED,
+            L"直接縮小exact RAW安全境界",
+            L"検証済みchunk境界で取消し、targetをoffline未完了で保持しました");
+      }
+    }
+
+    auto target_hash = imageformat::sha256_from_reader(
+        task.target_size_bytes,
+        kChunkBytes,
+        [&](const std::uint64_t relative, const std::size_t length) {
+          return writer_->read_back(task.target_offset_bytes + relative, length);
+        });
+    auto source_hash_after = imageformat::sha256_from_reader(
+        task.source_size_bytes, kChunkBytes, source_reader);
+    if (!target_hash || !source_hash_after ||
+        target_hash.value() != source_hash_before.value() ||
+        source_hash_after.value() != source_hash_before.value()) {
+      abort_keep_offline_incomplete();
+      return !target_hash
+          ? clonecore::Result<
+                WindowsDirectShrinkExactRawPartitionEvidence>::failure(
+                target_hash.error())
+          : !source_hash_after
+                ? clonecore::Result<
+                      WindowsDirectShrinkExactRawPartitionEvidence>::failure(
+                      source_hash_after.error())
+                : failure<WindowsDirectShrinkExactRawPartitionEvidence>(
+                      clonecore::ErrorCode::verification_failed,
+                      ERROR_CRC,
+                      L"直接縮小exact RAW全体Hash",
+                      L"コピー前後sourceまたはtarget全体SHA-256が一致しません");
+    }
+    return clonecore::Result<
+        WindowsDirectShrinkExactRawPartitionEvidence>::success({
+        .source_table_index = *task.source_table_index,
+        .target_number = task.target_number,
+        .verified_target_bytes = task.target_size_bytes,
+        .verified_chunk_count = chunks,
+        .source_sha256 = source_hash_before.take_value(),
+        .target_sha256 = target_hash.value(),
+        .target_write_digest = target_hash.take_value(),
+        .source_reader_read_only = true,
+        .source_extent_exact = true,
+        .every_write_flushed = true,
+        .every_chunk_read_back = true,
+        .complete_target_hash_verified = true,
+        .target_offline = true,
+    });
+  }
+
   clonecore::Status discard_exact_staged_archive(
       const WindowsDirectShrinkStagedArchiveEvidence& archive) override {
     if (state_ != State::begun || disk_online_ || !archive_ ||
@@ -2669,24 +4328,48 @@ class WindowsDirectShrinkClonePlatform final
   clonecore::Result<WindowsDirectShrinkBootEvidence>
   finalize_boot_from_staged_layout_and_verify(
       const WindowsDirectShrinkClonePlan& plan) override {
-    if (state_ != State::begun || disk_online_ ||
+    if (state_ != State::commit_ready || disk_online_ ||
+        !final_extents_prepared_ || boot_finalized_ ||
+        !current_checkpoint_ ||
+        current_checkpoint_->phase !=
+            WindowsDirectShrinkCheckpointPhase::commit_ready ||
         plan.final_layout_hash() != plan_.final_layout_hash()) {
       return failure<WindowsDirectShrinkBootEvidence>(
           clonecore::ErrorCode::invalid_argument,
           ERROR_INVALID_STATE,
           L"直接縮小production起動最終化",
-          L"開始済みoffline状態と同じ不変計画が必要です");
+          L"commit-ready checkpoint、hidden-final extent、単回offline状態、および同じ不変計画が必要です");
+    }
+    auto status = verify_hidden_partition_layout();
+    if (status) {
+      status = verify_checkpoint(*current_checkpoint_);
+    }
+    if (status) {
+      status = revalidate_mbr_source_and_signature(
+          L"直接縮小BIOS BCDBoot直前raw MBR再照合");
+    }
+    if (!status) {
+      abort_keep_offline_incomplete();
+      return clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
+          status.error());
     }
     if (!plan.boot_finalization_required()) {
+      boot_finalized_ = true;
       return clonecore::Result<WindowsDirectShrinkBootEvidence>::success({
           .required = false,
           .completed = true,
           .boot_files_read_back_verified = true,
           .recovery_configuration_verified = true,
           .target_offline = true,
+          .target_only_reconstruction = true,
+          .exact_target_volume_extents = true,
+          .legacy_bios = false,
+          .real_boot_not_claimed = true,
       });
     }
+    const bool legacy_bios = is_mbr_mode();
     const WindowsDirectShrinkPartitionTask* windows = nullptr;
+    const WindowsDirectShrinkPartitionTask* system = nullptr;
     const WindowsDirectShrinkPartitionTask* recovery = nullptr;
     for (const auto& task : plan.tasks()) {
       if (task.role == migrationcore::MigrationPartitionRole::windows) {
@@ -2699,6 +4382,19 @@ class WindowsDirectShrinkClonePlatform final
         }
         windows = &task;
       } else if (
+          (!legacy_bios &&
+           task.role == migrationcore::MigrationPartitionRole::efi_system) ||
+          (legacy_bios &&
+           task.role == migrationcore::MigrationPartitionRole::bios_system)) {
+        if (system != nullptr) {
+          return failure<WindowsDirectShrinkBootEvidence>(
+              clonecore::ErrorCode::unsupported_layout,
+              ERROR_NOT_SUPPORTED,
+              L"直接縮小production construction system領域",
+              L"firmware別system領域が一意ではありません");
+        }
+        system = &task;
+      } else if (
           task.role == migrationcore::MigrationPartitionRole::recovery) {
         if (recovery != nullptr) {
           return failure<WindowsDirectShrinkBootEvidence>(
@@ -2710,27 +4406,65 @@ class WindowsDirectShrinkClonePlatform final
         recovery = &task;
       }
     }
-    if (windows == nullptr || !dependencies_.finalize_boot ||
+    if (legacy_bios && system == nullptr) {
+      system = windows;
+    }
+    const std::size_t active_count = static_cast<std::size_t>(std::count_if(
+        plan.tasks().begin(),
+        plan.tasks().end(),
+        [](const WindowsDirectShrinkPartitionTask& task) {
+          return task.active;
+        }));
+    if (windows == nullptr || system == nullptr ||
+        (!legacy_bios && windows->target_number == system->target_number) ||
+        (legacy_bios && (!system->active || active_count != 1U)) ||
+        !dependencies_.finalize_boot ||
         (recovery != nullptr && !dependencies_.finalize_winre)) {
       return failure<WindowsDirectShrinkBootEvidence>(
           clonecore::ErrorCode::unsupported_layout,
           ERROR_NOT_SUPPORTED,
           L"直接縮小production起動依存",
-          L"一意なWindows領域、BCDBoot finalizer、またはWinRE finalizerがありません");
+          L"一意なWindows／firmware別system領域、exactly one Active、BCDBoot finalizer、またはWinRE finalizerがありません");
     }
 
-    auto windows_volume = online_bind_target(*windows);
+    auto windows_volume = online_bind_target(*windows, true);
     if (!windows_volume) {
       abort_keep_offline_incomplete();
       return clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
           windows_volume.error());
+    }
+    WindowsTsumugiShrinkVolumeBinding system_volume = windows_volume.value();
+    if (system->target_number != windows->target_number) {
+      auto bound_system = dependencies_.target_io->bind_online_volume(
+          system->target_number,
+          system->target_offset_bytes,
+          system->target_size_bytes);
+      if (!bound_system ||
+          bound_system.value().disk_number !=
+              windows_volume.value().disk_number ||
+          equal_path(
+              bound_system.value().volume_device_path,
+              windows_volume.value().volume_device_path)) {
+        static_cast<void>(dependencies_.target_io->set_target_offline(true));
+        disk_online_ = false;
+        abort_keep_offline_incomplete();
+        return bound_system
+            ? failure<WindowsDirectShrinkBootEvidence>(
+                  clonecore::ErrorCode::identity_mismatch,
+                  ERROR_DEVICE_REINITIALIZATION_NEEDED,
+                  L"直接縮小production construction system volume拘束",
+                  L"Windowsとsystem領域が同じ再識別済み対象の異なるexact Volume GUIDではありません")
+            : clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
+                  bound_system.error());
+      }
+      system_volume = bound_system.take_value();
     }
     std::optional<WindowsTsumugiShrinkVolumeBinding> recovery_volume;
     if (recovery != nullptr) {
       auto bound = dependencies_.target_io->bind_online_volume(
           recovery->target_number,
           recovery->target_offset_bytes,
-          recovery->construction_size_bytes);
+          recovery->target_size_bytes);
       if (!bound ||
           bound.value().disk_number != windows_volume.value().disk_number) {
         static_cast<void>(dependencies_.target_io->set_target_offline(true));
@@ -2749,13 +4483,53 @@ class WindowsDirectShrinkClonePlatform final
     }
 
     auto finalized = dependencies_.finalize_boot(
-        plan_.expected_target(), windows->target_offset_bytes);
+        WindowsDirectShrinkBootFinalizationRequest{
+            .expected_source = plan_.expected_source(),
+            .expected_target = plan_.expected_target(),
+            .confirmation = request_.confirmation,
+            .expected_target_disk_number =
+                windows_volume.value().disk_number,
+            .expected_windows_partition_number = windows->target_number,
+            .expected_windows_partition_offset = windows->target_offset_bytes,
+            .expected_windows_partition_size = windows->target_size_bytes,
+            .expected_system_partition_number = system->target_number,
+            .expected_system_partition_offset = system->target_offset_bytes,
+            .expected_system_partition_size = system->target_size_bytes,
+            .expected_mbr_disk_signature = legacy_bios
+                ? plan_.mbr_preserve_binding()->target_disk_signature
+                : 0U,
+            .windows_volume_root =
+                windows_volume.value().volume_device_path,
+            .system_volume_root = system_volume.volume_device_path,
+            .firmware = legacy_bios
+                ? bootrepair::BcdBootFirmware::bios
+                : bootrepair::BcdBootFirmware::uefi,
+        });
+    const bool firmware_evidence_valid = finalized &&
+        (legacy_bios
+             ? finalized.value().legacy_bios &&
+                   !finalized.value().construction_gpt_non_bootable_verified &&
+                   !finalized.value().efi_ownership_safe_before_mount &&
+                   !finalized.value().
+                       efi_ownership_revalidated_before_mutation &&
+                   !finalized.value().
+                       microsoft_boot_namespace_read_back_verified
+             : !finalized.value().legacy_bios &&
+                   finalized.value().construction_gpt_non_bootable_verified &&
+                   finalized.value().efi_ownership_safe_before_mount &&
+                   finalized.value().
+                       efi_ownership_revalidated_before_mutation &&
+                   finalized.value().
+                       microsoft_boot_namespace_read_back_verified);
     if (!finalized || !finalized.value().microsoft_signed_bcdboot ||
         !finalized.value().fresh_bcd_store_read_back_verified ||
+        !firmware_evidence_valid ||
         !finalized.value().temporary_mounts_released ||
         !finalized.value().final_target_reidentified ||
         !finalized.value().partition_layout_unchanged ||
-        !finalized.value().nvram_unchanged) {
+        !finalized.value().nvram_unchanged ||
+        !finalized.value().exact_target_volume_extents ||
+        !finalized.value().target_only_reconstruction) {
       static_cast<void>(dependencies_.target_io->set_target_offline(true));
       disk_online_ = false;
       abort_keep_offline_incomplete();
@@ -2764,7 +4538,7 @@ class WindowsDirectShrinkClonePlatform final
                 clonecore::ErrorCode::verification_failed,
                 ERROR_CRC,
                 L"直接縮小production BCDBoot証跡",
-                L"Microsoft署名、新規BCD読戻し、mount解放、対象再識別、layout不変、またはNVRAM不変の証跡が不足しています")
+                L"Microsoft署名、新規BCD、firmware別nonboot construction、exact target volume、target-only、mount解放、対象再識別、layout不変、またはNVRAM不変の証跡が不足しています")
           : clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
                 finalized.error());
     }
@@ -2782,12 +4556,16 @@ class WindowsDirectShrinkClonePlatform final
               .expected_windows_partition_offset =
                   windows->target_offset_bytes,
               .expected_windows_partition_size =
-                  windows->construction_size_bytes,
+                  windows->target_size_bytes,
               .expected_recovery_partition_number = recovery->target_number,
               .expected_recovery_partition_offset =
                   recovery->target_offset_bytes,
               .expected_recovery_partition_size =
-                  recovery->construction_size_bytes,
+                  recovery->target_size_bytes,
+              .expected_partition_style = plan_.partition_style(),
+              .expected_mbr_disk_signature = legacy_bios
+                  ? plan_.mbr_preserve_binding()->target_disk_signature
+                  : 0U,
               .windows_volume_root =
                   windows_volume.value().volume_device_path,
               .recovery_volume_root =
@@ -2830,18 +4608,26 @@ class WindowsDirectShrinkClonePlatform final
       return clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
           offline.error());
     }
-    auto gpt = verify_gpt_plan(*writer_, temporary_gpt_);
-    if (!gpt) {
+    status = verify_hidden_partition_layout();
+    if (status) {
+      status = verify_checkpoint(*current_checkpoint_);
+    }
+    if (!status) {
       abort_keep_offline_incomplete();
       return clonecore::Result<WindowsDirectShrinkBootEvidence>::failure(
-          gpt.error());
+          status.error());
     }
+    boot_finalized_ = true;
     return clonecore::Result<WindowsDirectShrinkBootEvidence>::success({
         .required = true,
         .completed = true,
         .boot_files_read_back_verified = true,
         .recovery_configuration_verified = recovery_verified,
         .target_offline = true,
+        .target_only_reconstruction = true,
+        .exact_target_volume_extents = true,
+        .legacy_bios = legacy_bios,
+        .real_boot_not_claimed = true,
     });
   }
 
@@ -2864,17 +4650,19 @@ class WindowsDirectShrinkClonePlatform final
   }
 
   clonecore::Result<WindowsDirectShrinkCheckpointEvidence>
-  revalidate_before_final_commit(
+  prepare_final_extents_keep_incomplete_and_verify(
       const WindowsDirectShrinkClonePlan& plan,
       const WindowsDirectShrinkCheckpointEvidence& expected) override {
     if (state_ != State::commit_ready || disk_online_ ||
-        archive_.has_value() ||
-        plan.final_layout_hash() != plan_.final_layout_hash()) {
+        final_extents_prepared_ || boot_finalized_ ||
+        final_layout_published_ || archive_.has_value() ||
+        plan.final_layout_hash() != plan_.final_layout_hash() ||
+        expected.phase != WindowsDirectShrinkCheckpointPhase::commit_ready) {
       return failure<WindowsDirectShrinkCheckpointEvidence>(
           clonecore::ErrorCode::invalid_argument,
           ERROR_INVALID_STATE,
-          L"直接縮小production最終commit前再照合",
-          L"commit-ready、archive破棄、または不変計画が成立していません");
+          L"直接縮小production hidden-final extent準備",
+          L"単回commit-ready、archive破棄、offline、および同じ不変計画が必要です");
     }
     auto status = reidentify_current_target();
     if (status) {
@@ -2883,58 +4671,38 @@ class WindowsDirectShrinkClonePlatform final
     if (status) {
       status = verify_checkpoint(expected);
     }
-    if (!status) {
-      abort_keep_offline_incomplete();
-      return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::failure(
-          status.error());
-    }
-    return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::success(
-        expected);
-  }
-
-  clonecore::Result<WindowsDirectShrinkFinalCommitEvidence>
-  commit_final_layout_last(
-      const WindowsDirectShrinkClonePlan& plan,
-      const WindowsDirectShrinkCheckpointEvidence& commit_ready) override {
-    if (state_ != State::commit_ready || disk_online_ ||
-        archive_.has_value() ||
-        plan.final_layout_hash() != plan_.final_layout_hash()) {
-      return failure<WindowsDirectShrinkFinalCommitEvidence>(
-          clonecore::ErrorCode::invalid_argument,
-          ERROR_INVALID_STATE,
-          L"直接縮小production最終commit",
-          L"commit-ready、archive破棄、または不変計画が成立していません");
-    }
-    auto status = reidentify_current_target();
     if (status) {
-      status = verify_checkpoint(commit_ready);
+      status = revalidate_mbr_source_and_signature(
+          L"直接縮小hidden MBR公開前raw MBR再照合");
     }
     if (status) {
-      status = verify_gpt_plan(*writer_, temporary_gpt_);
+      // No archive can remain at this boundary. Release every object tied to
+      // the soon-to-be-removed staging extent before changing the GPT.
+      wim_store_.reset();
+      staging_volume_.reset();
+      status = invalidate_exact_gpt_metadata(*writer_, temporary_gpt_);
     }
     if (status) {
-      std::vector<std::byte> zeroes(kCheckpointBytes, std::byte{0});
-      status = write_flush_readback(
-          *writer_,
-          plan_.staging().offset_bytes,
-          zeroes,
-          L"直接縮小checkpoint退役");
+      status = is_mbr_mode()
+          ? write_flush_readback(
+                *writer_,
+                0U,
+                hidden_final_mbr_sector_,
+                L"直接縮小nonboot hidden-final MBR公開")
+          : publish_gpt_plan(
+                *writer_,
+                hidden_final_gpt_,
+                L"直接縮小nonboot hidden-final GPT公開");
     }
     if (status) {
-      current_checkpoint_.reset();
-      current_checkpoint_record_.clear();
-      status = invalidate_partition_metadata(*writer_);
+      status = verify_hidden_partition_layout();
     }
     if (status) {
-      status = publish_gpt_plan(
-          *writer_, hidden_final_gpt_, L"直接縮小hidden final GPT公開");
-    }
-    if (status) {
-      status = verify_gpt_plan(*writer_, hidden_final_gpt_);
-    }
-    if (status && plan_.ntfs_extension_task_count() != 0U) {
+      // Even with no extension, staging removal and the final extents must be
+      // visible to the volume binding layer before boot reconstruction.
       status = dependencies_.target_io->notify_layout_changed();
     }
+
     std::uint64_t extended_count{};
     for (const auto& task : plan_.tasks()) {
       if (!status || task.construction_size_bytes == task.target_size_bytes) {
@@ -2981,57 +4749,257 @@ class WindowsDirectShrinkClonePlatform final
                         : status_failure(
                               clonecore::ErrorCode::verification_failed,
                               ERROR_CRC,
-                              L"直接縮小NTFS最終伸長証跡",
+                              L"直接縮小NTFS hidden-final伸長証跡",
                               L"旧・新寸法、exact extent、NTFS sector、flush、または全namespace読戻しが不足しています");
         break;
       }
+      if (plan_.surplus_allocation() ==
+          migrationcore::ShrinkSurplusAllocation::
+              selected_data_partition) {
+        if (!task.source_table_index.has_value() ||
+            task.source_table_index !=
+                plan_.surplus_target_source_table_index() ||
+            task.role != migrationcore::MigrationPartitionRole::data ||
+            plan_.staging().final_growth_owner_target_number !=
+                task.target_number ||
+            targeted_surplus_source_table_index_.has_value()) {
+          status = status_failure(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_DEVICE_REINITIALIZATION_NEEDED,
+              L"直接縮小指定NTFS余剰所有者",
+              L"レビュー済みsource table index、target number、data役割、または単一所有者が一致しません");
+          break;
+        }
+        targeted_surplus_source_table_index_ = task.source_table_index;
+        targeted_surplus_target_number_ = task.target_number;
+        targeted_surplus_previous_file_system_bytes_ =
+            extended.value().previous_file_system_bytes;
+        targeted_surplus_final_file_system_bytes_ =
+            extended.value().final_file_system_bytes;
+        targeted_surplus_owner_verified_ = true;
+        targeted_surplus_exact_size_verified_ =
+            extended.value().final_file_system_bytes ==
+                task.target_size_bytes &&
+            extended.value().final_partition_extent_bytes ==
+                task.target_size_bytes &&
+            extended.value().exact_single_extent_reverified &&
+            extended.value().ntfs_sector_count_reverified;
+        targeted_surplus_readback_verified_ =
+            readback.value().file_system_metadata_verified &&
+            readback.value().namespace_fully_enumerated &&
+            readback.value().every_regular_file_read_to_eof;
+      }
       ++extended_count;
     }
-    if (status &&
-        extended_count != plan_.ntfs_extension_task_count()) {
+    if (status && extended_count != plan_.ntfs_extension_task_count()) {
       status = status_failure(
           clonecore::ErrorCode::verification_failed,
           ERROR_CRC,
-          L"直接縮小NTFS最終伸長件数",
+          L"直接縮小NTFS hidden-final伸長件数",
           L"計画した全NTFS伸長を完了していません");
+    }
+    const bool targeted_surplus = plan_.surplus_allocation() ==
+        migrationcore::ShrinkSurplusAllocation::selected_data_partition;
+    if (status && targeted_surplus &&
+        (!targeted_surplus_source_table_index_.has_value() ||
+         targeted_surplus_source_table_index_ !=
+             plan_.surplus_target_source_table_index() ||
+         !targeted_surplus_target_number_.has_value() ||
+         targeted_surplus_target_number_ !=
+             plan_.staging().final_growth_owner_target_number ||
+         !targeted_surplus_owner_verified_ ||
+         !targeted_surplus_exact_size_verified_ ||
+         !targeted_surplus_readback_verified_)) {
+      status = status_failure(
+          clonecore::ErrorCode::verification_failed,
+          ERROR_CRC,
+          L"直接縮小指定NTFS余剰の最終証跡",
+          L"指定所有者、exact filesystem寸法、または全namespace読戻し証跡が不足しています");
     }
     if (status) {
       status = reidentify_current_target();
     }
     if (status) {
-      status = verify_gpt_plan(*writer_, hidden_final_gpt_);
+      status = verify_hidden_partition_layout();
     }
     if (status) {
-      status = invalidate_partition_metadata(*writer_);
+      status = verify_checkpoint(expected);
     }
     if (status) {
-      status = publish_gpt_plan(
-          *writer_, final_gpt_, L"直接縮小visible final GPT最終公開");
+      status = revalidate_mbr_source_and_signature(
+          L"直接縮小最終MBR公開前raw MBR再照合");
+    }
+    if (!status) {
+      abort_keep_offline_incomplete();
+      return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::failure(
+          status.error());
+    }
+    prepared_extension_count_ = extended_count;
+    final_extents_prepared_ = true;
+    // Core synthesizes the successful non-required boot evidence for data-only
+    // plans and therefore does not call the boot finalizer in that branch.
+    boot_finalized_ = !plan_.boot_finalization_required();
+    return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::success(
+        expected);
+  }
+
+  clonecore::Result<WindowsDirectShrinkCheckpointEvidence>
+  revalidate_before_final_commit(
+      const WindowsDirectShrinkClonePlan& plan,
+      const WindowsDirectShrinkCheckpointEvidence& expected) override {
+    if (state_ != State::commit_ready || disk_online_ ||
+        !final_extents_prepared_ || !boot_finalized_ ||
+        final_layout_published_ || archive_.has_value() ||
+        plan.final_layout_hash() != plan_.final_layout_hash()) {
+      return failure<WindowsDirectShrinkCheckpointEvidence>(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_STATE,
+          L"直接縮小production最終commit前再照合",
+          L"commit-ready、hidden-final extent、boot最終化、archive破棄、または不変計画が成立していません");
+    }
+    auto status = reidentify_current_target();
+    if (status) {
+      status = verify_hidden_partition_layout();
     }
     if (status) {
-      status = verify_gpt_plan(*writer_, final_gpt_);
+      status = verify_checkpoint(expected);
+    }
+    if (status) {
+      status = revalidate_mbr_source_and_signature(
+          L"直接縮小最終commit前raw MBR再照合");
+    }
+    if (!status) {
+      abort_keep_offline_incomplete();
+      return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::failure(
+          status.error());
+    }
+    return clonecore::Result<WindowsDirectShrinkCheckpointEvidence>::success(
+        expected);
+  }
+
+  clonecore::Result<WindowsDirectShrinkFinalCommitEvidence>
+  commit_final_layout_last(
+      const WindowsDirectShrinkClonePlan& plan,
+      const WindowsDirectShrinkCheckpointEvidence& commit_ready) override {
+    if (state_ != State::commit_ready || disk_online_ ||
+        !final_extents_prepared_ || !boot_finalized_ ||
+        final_layout_published_ || archive_.has_value() ||
+        plan.final_layout_hash() != plan_.final_layout_hash()) {
+      return failure<WindowsDirectShrinkFinalCommitEvidence>(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_STATE,
+          L"直接縮小production最終commit",
+          L"commit-ready、hidden-final extent、boot最終化、archive破棄、または不変計画が成立していません");
+    }
+    // Allocate the cleanup buffer before the irreversible final-publication
+    // boundary. No allocation or fallible evidence construction is needed
+    // after the final GPT or final MBR sector0 has been read back.
+    std::vector<std::byte> checkpoint_zeroes(
+        kCheckpointBytes, std::byte{0});
+    auto status = reidentify_current_target();
+    if (status) {
+      status = verify_checkpoint(commit_ready);
+    }
+    if (status) {
+      status = verify_hidden_partition_layout();
+    }
+    if (status) {
+      status = revalidate_mbr_source_and_signature(
+          L"直接縮小sector0-last直前raw MBR再照合");
+    }
+    if (status && is_mbr_mode()) {
+      status = write_flush_readback(
+          *writer_,
+          0U,
+          final_mbr_->sector,
+          L"直接縮小visible final MBR sector0最終公開");
+    } else if (status) {
+      status = invalidate_exact_gpt_metadata(*writer_, hidden_final_gpt_);
+      if (status) {
+        status = publish_gpt_plan(
+            *writer_, final_gpt_, L"直接縮小visible final GPT最終公開");
+      }
     }
     if (!status) {
       abort_keep_offline_incomplete();
       return clonecore::Result<WindowsDirectShrinkFinalCommitEvidence>::failure(
           status.error());
     }
+
+    // This latch is the irreversible safe boundary: final GPT metadata or the
+    // single final MBR sector0 and its complete readback are proven while target
+    // remains offline. Do not add a second fallible readback before this latch:
+    // a transient failure there could otherwise invalidate an already proven
+    // final layout. Nothing after this point may invalidate it or report failure.
+    final_layout_published_ = true;
+    bool checkpoint_retired = false;
+    try {
+      const auto retired = write_flush_readback(
+          *writer_,
+          plan_.checkpoint_offset_bytes(),
+          checkpoint_zeroes,
+          L"直接縮小checkpoint退役");
+      checkpoint_retired = retired.has_value();
+    } catch (...) {
+      checkpoint_retired = false;
+    }
+    if (checkpoint_retired) {
+      current_checkpoint_.reset();
+      current_checkpoint_record_.clear();
+    }
     state_ = State::committed;
+    abort_cleanup_complete_ = true;
     return clonecore::Result<WindowsDirectShrinkFinalCommitEvidence>::success({
         .committed_layout_hash = plan_.final_layout_hash(),
         .aggregate_write_digest = commit_ready.aggregate_write_digest,
+        .source_reidentified = true,
+        .source_layout_unchanged = true,
         .target_reidentified = true,
         .staging_identity_reverified = true,
         .checkpoint_reverified = true,
         .staging_removed = true,
-        .checkpoint_retired = true,
+        .checkpoint_retired = checkpoint_retired,
+        .checkpoint_retirement_pending = !checkpoint_retired,
+        .construction_layout_non_bootable = true,
+        .checkpoint_retained_through_extensions_and_boot = true,
+        .boot_completed_before_final_layout_publication = true,
+        .final_layout_published_before_checkpoint_retirement = true,
         .hidden_final_layout_published_and_read_back = true,
-        .extended_ntfs_partition_count = extended_count,
+        .extended_ntfs_partition_count = prepared_extension_count_,
         .every_required_ntfs_extension_verified = true,
+        .targeted_surplus_source_table_index =
+            targeted_surplus_source_table_index_,
+        .targeted_surplus_target_number = targeted_surplus_target_number_,
+        .targeted_surplus_previous_file_system_bytes =
+            targeted_surplus_previous_file_system_bytes_,
+        .targeted_surplus_final_file_system_bytes =
+            targeted_surplus_final_file_system_bytes_,
+        .targeted_surplus_owner_verified =
+            targeted_surplus_owner_verified_,
+        .targeted_surplus_exact_size_verified =
+            targeted_surplus_exact_size_verified_,
+        .targeted_surplus_readback_verified =
+            targeted_surplus_readback_verified_,
         .every_write_flushed = true,
         .every_write_read_back = true,
         .primary_layout_committed_last = true,
         .target_offline = true,
+        .final_partition_style = plan_.partition_style(),
+        .source_mbr_sector0_unchanged = is_mbr_mode(),
+        .source_mbr_bootstrap_unchanged = is_mbr_mode(),
+        .target_mbr_signature_collision_free = is_mbr_mode(),
+        .final_mbr_sector0_read_back_verified = is_mbr_mode(),
+        .final_mbr_disk_signature = is_mbr_mode()
+            ? final_mbr_->target_disk.disk_signature
+            : 0U,
+        .final_mbr_active_partition_count = is_mbr_mode()
+            ? static_cast<std::uint32_t>(std::count_if(
+                  final_mbr_->target_disk.partitions.begin(),
+                  final_mbr_->target_disk.partitions.end(),
+                  [](const clonecore::MbrPartition& partition) {
+                    return partition.active;
+                  }))
+            : 0U,
     });
   }
 
@@ -3048,6 +5016,27 @@ class WindowsDirectShrinkClonePlatform final
       abort_cleanup_complete_ = true;
       return;
     }
+    // A successfully published and read-back final GPT is complete. A later
+    // checkpoint-cleanup problem must never turn it back into an invalid disk.
+    if (final_layout_published_) {
+      bool offline = !disk_online_;
+      try {
+        if (!offline && dependencies_.target_io) {
+          offline = dependencies_.target_io->set_target_offline(true).has_value();
+        }
+      } catch (...) {
+        offline = false;
+      }
+      if (offline) {
+        disk_online_ = false;
+        state_ = State::committed;
+        abort_cleanup_complete_ = true;
+      } else {
+        state_ = State::aborted;
+        abort_cleanup_complete_ = false;
+      }
+      return;
+    }
     bool safely_offline = false;
     try {
       if (dependencies_.target_io) {
@@ -3060,7 +5049,7 @@ class WindowsDirectShrinkClonePlatform final
       }
       if (safely_offline && writer_) {
         abort_cleanup_complete_ =
-            invalidate_partition_metadata(*writer_).has_value();
+            invalidate_exact_gpt_metadata(*writer_, temporary_gpt_).has_value();
       }
     } catch (...) {
       safely_offline = false;
@@ -3085,6 +5074,63 @@ class WindowsDirectShrinkClonePlatform final
     imageformat::Sha256Digest hash{};
     bool applied{};
   };
+
+  [[nodiscard]] bool is_mbr_mode() const noexcept {
+    return final_mbr_.has_value();
+  }
+
+  clonecore::Status verify_hidden_partition_layout() {
+    if (!writer_) {
+      return status_failure(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_HANDLE,
+          L"直接縮小hidden layout読戻し",
+          L"offline target writerがありません");
+    }
+    return is_mbr_mode()
+        ? verify_mbr_sector(
+              *writer_,
+              hidden_final_mbr_sector_,
+              L"直接縮小nonboot hidden MBR読戻し")
+        : verify_gpt_plan(*writer_, hidden_final_gpt_);
+  }
+
+  clonecore::Status revalidate_mbr_source_and_signature(
+      const std::wstring_view operation) {
+    if (!is_mbr_mode()) {
+      return clonecore::success_status();
+    }
+    const auto& binding = plan_.mbr_preserve_binding();
+    if (!binding.has_value() || !dependencies_.observe_mbr_safety) {
+      return status_failure(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_HANDLE,
+          std::wstring(operation),
+          L"immutable MBR bindingまたはsource/signature observerがありません");
+    }
+    auto observed = dependencies_.observe_mbr_safety(
+        plan_.expected_source(), plan_.expected_target(), false);
+    if (!observed) {
+      return clonecore::Status::failure(observed.error());
+    }
+    if (observed.value().source_sector0_hash != binding->source_sector0_hash ||
+        observed.value().source_bootstrap != binding->source_bootstrap ||
+        observed.value().source_disk_signature !=
+            binding->source_disk_signature ||
+        binding->target_disk_signature == 0U ||
+        std::find(
+            observed.value().connected_mbr_signatures_excluding_target.begin(),
+            observed.value().connected_mbr_signatures_excluding_target.end(),
+            binding->target_disk_signature) !=
+            observed.value().connected_mbr_signatures_excluding_target.end()) {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_DEVICE_REINITIALIZATION_NEEDED,
+          std::wstring(operation),
+          L"source raw MBR sector0/bootstrapまたはfresh target signatureの非衝突性が計画後に変化しました");
+    }
+    return clonecore::success_status();
+  }
 
   clonecore::Result<WindowsDirectShrinkCheckpointEvidence>
   persist_checkpoint(WindowsDirectShrinkCheckpointEvidence evidence) {
@@ -3112,7 +5158,7 @@ class WindowsDirectShrinkClonePlatform final
     evidence.record_hash = hash.take_value();
     auto status = write_flush_readback(
         *writer_,
-        plan_.staging().offset_bytes,
+        plan_.checkpoint_offset_bytes(),
         record.value(),
         L"直接縮小checkpoint書込み");
     if (!status) {
@@ -3159,12 +5205,7 @@ class WindowsDirectShrinkClonePlatform final
   clonecore::Status verify_checkpoint(
       const WindowsDirectShrinkCheckpointEvidence& expected) {
     if (!writer_ || !current_checkpoint_ ||
-        expected.record_hash != current_checkpoint_->record_hash ||
-        expected.revision != current_checkpoint_->revision ||
-        expected.plan_hash != current_checkpoint_->plan_hash ||
-        expected.staging_identity_hash !=
-            current_checkpoint_->staging_identity_hash ||
-        expected.phase != current_checkpoint_->phase ||
+        !checkpoint_exactly_matches(expected, *current_checkpoint_) ||
         current_checkpoint_record_.size() != kCheckpointBytes) {
       return status_failure(
           clonecore::ErrorCode::identity_mismatch,
@@ -3173,7 +5214,7 @@ class WindowsDirectShrinkClonePlatform final
           L"期待recordと現在の単回所有checkpointが一致しません");
     }
     auto observed = writer_->read_back(
-        plan_.staging().offset_bytes, current_checkpoint_record_.size());
+        plan_.checkpoint_offset_bytes(), current_checkpoint_record_.size());
     if (!observed) {
       return clonecore::Status::failure(observed.error());
     }
@@ -3279,6 +5320,47 @@ class WindowsDirectShrinkClonePlatform final
     if (!status) {
       return status;
     }
+    auto source_layout =
+        imageformat::hash_tsumugi_physical_restore_target_layout_v1(
+            observed.value().source);
+    if (!source_layout) {
+      return clonecore::Status::failure(source_layout.error());
+    }
+    const auto source_style = diskmodel::normalize_disk_partition_style(
+        observed.value().source.partition_style,
+        observed.value().source.partitions.size());
+    if (!source_partition_style_matches(
+            source_style, plan_.source_partition_style()) ||
+        source_layout.value() != plan_.expected_source_layout_hash() ||
+        observed.value().source.is_system_disk !=
+            plan_.expected_source().is_system_disk ||
+        !observed.value().source.offline.has_value() ||
+        observed.value().source.offline.value() ||
+        !observed.value().source.read_only.has_value() ||
+        observed.value().source.read_only.value() ||
+        !observed.value().source.removable.has_value() ||
+        observed.value().source.removable.value() ||
+        observed.value().source.logical_sector_size != 512U) {
+      return status_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_DEVICE_REINITIALIZATION_NEEDED,
+          L"直接縮小production source layout再照合",
+          L"最終commit前のsource形式、layout Hash、system属性、または固定online状態が不変計画と一致しません");
+    }
+    if (is_mbr_mode()) {
+      status = validate_mbr_preserve_source_bindings(
+          plan_, observed.value().source);
+      if (!status) {
+        return status;
+      }
+    } else if (plan_.partition_style_choice() ==
+               migrationcore::DirectClonePartitionStyleChoice::mbr_to_gpt) {
+      status = validate_mbr_to_gpt_source_bindings(
+          plan_, observed.value().source);
+      if (!status) {
+        return status;
+      }
+    }
     if (!observed.value().target.offline.value_or(false) ||
         observed.value().target.read_only.value_or(true) ||
         observed.value().target.removable.value_or(true) ||
@@ -3299,6 +5381,8 @@ class WindowsDirectShrinkClonePlatform final
   clonecore::GptWritePlan final_gpt_;
   clonecore::GptWritePlan temporary_gpt_;
   clonecore::GptWritePlan hidden_final_gpt_;
+  std::optional<clonecore::MbrWritePlan> final_mbr_;
+  std::vector<std::byte> hidden_final_mbr_sector_;
   std::unique_ptr<clonecore::ITargetDiskWriter> writer_;
   std::unique_ptr<IWindowsDirectShrinkOwnedWimStore> wim_store_;
   std::optional<WindowsTsumugiShrinkVolumeBinding> staging_volume_;
@@ -3308,6 +5392,18 @@ class WindowsDirectShrinkClonePlatform final
   State state_{State::created};
   bool disk_online_{};
   bool target_touched_{};
+  bool final_extents_prepared_{};
+  bool boot_finalized_{};
+  bool final_layout_published_{};
+  std::uint64_t prepared_extension_count_{};
+  std::optional<std::uint32_t>
+      targeted_surplus_source_table_index_;
+  std::optional<std::uint32_t> targeted_surplus_target_number_;
+  std::uint64_t targeted_surplus_previous_file_system_bytes_{};
+  std::uint64_t targeted_surplus_final_file_system_bytes_{};
+  bool targeted_surplus_owner_verified_{};
+  bool targeted_surplus_exact_size_verified_{};
+  bool targeted_surplus_readback_verified_{};
   bool abort_cleanup_complete_{};
 };
 
@@ -3344,10 +5440,39 @@ clonecore::Status validate_factory_inputs(
       observed.source.partition_style, observed.source.partitions.size());
   const auto target_style = diskmodel::normalize_disk_partition_style(
       observed.target.partition_style, observed.target.partitions.size());
+  const bool preserve_gpt =
+      plan.partition_style_choice() ==
+          migrationcore::DirectClonePartitionStyleChoice::preserve &&
+      plan.source_partition_style() ==
+          migrationcore::MigrationPartitionStyle::gpt &&
+      plan.partition_style() == migrationcore::MigrationPartitionStyle::gpt &&
+      source_style == diskmodel::PartitionStyle::gpt;
+  const bool preserve_mbr =
+      plan.partition_style_choice() ==
+          migrationcore::DirectClonePartitionStyleChoice::preserve &&
+      plan.source_partition_style() ==
+          migrationcore::MigrationPartitionStyle::mbr &&
+      plan.partition_style() == migrationcore::MigrationPartitionStyle::mbr &&
+      source_style == diskmodel::PartitionStyle::mbr &&
+      plan.mbr_preserve_binding().has_value() &&
+      plan.mbr_preserve_binding()->target_disk_signature != 0U &&
+      plan.mbr_preserve_binding()->target_disk_signature !=
+          plan.mbr_preserve_binding()->source_disk_signature;
+  const bool target_only_mbr_to_gpt =
+      plan.partition_style_choice() ==
+          migrationcore::DirectClonePartitionStyleChoice::mbr_to_gpt &&
+      plan.source_partition_style() ==
+          migrationcore::MigrationPartitionStyle::mbr &&
+      plan.partition_style() == migrationcore::MigrationPartitionStyle::gpt &&
+      source_style == diskmodel::PartitionStyle::mbr &&
+      plan.boot_finalization_required() &&
+      plan.expected_source().is_system_disk && observed.source.is_system_disk;
   if (!request.confirmation.first_step_acknowledged ||
       request.confirmation.typed_token != L"OK" ||
       source_layout.value() != plan.expected_source_layout_hash() ||
       target_layout.value() != plan.expected_target_layout_hash() ||
+      observed.source.is_system_disk !=
+          plan.expected_source().is_system_disk ||
       !observed.source.offline.has_value() ||
       observed.source.offline.value() ||
       !observed.source.read_only.has_value() ||
@@ -3362,10 +5487,12 @@ clonecore::Status validate_factory_inputs(
       observed.target.is_system_disk ||
       observed.source.logical_sector_size != 512U ||
       observed.target.logical_sector_size != 512U ||
-      source_style != diskmodel::PartitionStyle::gpt ||
+      (!preserve_gpt && !preserve_mbr && !target_only_mbr_to_gpt) ||
       (target_style != diskmodel::PartitionStyle::raw &&
        target_style != diskmodel::PartitionStyle::gpt &&
        target_style != diskmodel::PartitionStyle::mbr) ||
+      !supported_initial_target_partition_table(
+          observed.target, target_style) ||
       source_class.dynamic_disk || source_class.storage_spaces ||
       source_class.software_raid ||
       source_class.unresolved_hardware_raid ||
@@ -3377,11 +5504,14 @@ clonecore::Status validate_factory_inputs(
           diskmodel::DiskHealthOperationAdvice::proceed ||
       diskmodel::disk_health_operation_advice(observed.target.health, false) ==
           diskmodel::DiskHealthOperationAdvice::block_target ||
-      plan.partition_style() != migrationcore::MigrationPartitionStyle::gpt ||
+      (plan.partition_style() != migrationcore::MigrationPartitionStyle::gpt &&
+       plan.partition_style() != migrationcore::MigrationPartitionStyle::mbr) ||
       (plan.surplus_allocation() !=
            migrationcore::ShrinkSurplusAllocation::leave_unallocated &&
        plan.surplus_allocation() !=
-           migrationcore::ShrinkSurplusAllocation::automatic_proportional) ||
+           migrationcore::ShrinkSurplusAllocation::automatic_proportional &&
+       plan.surplus_allocation() !=
+           migrationcore::ShrinkSurplusAllocation::selected_data_partition) ||
       plan.target_is_active_rescue_media() || plan.tasks().empty() ||
       plan.archive_task_count() == 0U ||
       plan.maximum_archive_upper_bound_bytes() == 0U ||
@@ -3391,39 +5521,77 @@ clonecore::Status validate_factory_inputs(
           kWindowsDirectShrinkStagingFileSystemReserveBytes ||
       all_zero(dependencies.connection_instance_hash) ||
       !dependencies.target_io || !dependencies.guid_generator ||
-      !dependencies.make_wim_store || !dependencies.reidentify_confirmed) {
+      !dependencies.make_wim_store || !dependencies.reidentify_confirmed ||
+      (preserve_mbr && !dependencies.observe_mbr_safety)) {
     return status_failure(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"直接縮小production factory安全範囲",
-        L"レビュー済みlayout、固定512-byte基本disk、GPT、NTFS、1GiB staging余白、confirmed identity、および全production依存が必要です");
+        L"レビュー済み形式維持/変換intent、layout、固定512-byte基本disk、GPT/MBR target、NTFS、1GiB staging余白、confirmed identity、および全production依存が必要です");
+  }
+  if (preserve_mbr) {
+    status = validate_mbr_preserve_source_bindings(plan, observed.source);
+    if (!status) {
+      return status;
+    }
+  } else if (target_only_mbr_to_gpt) {
+    status = validate_mbr_to_gpt_source_bindings(plan, observed.source);
+    if (!status) {
+      return status;
+    }
   }
   std::size_t efi_count{};
   std::size_t msr_count{};
   std::size_t windows_count{};
   std::size_t recovery_count{};
+  std::size_t bios_system_count{};
+  std::size_t active_count{};
+  std::size_t active_boot_role_count{};
   std::uint64_t extension_count{};
   bool growth_owner_matched = false;
+  bool selected_data_growth_owner_matched = false;
   for (const auto& task : plan.tasks()) {
     std::uint64_t construction_end{};
     std::uint64_t final_end{};
-    if (task.target_number == 0U || task.target_offset_bytes % kMiB != 0U ||
+    if (task.target_number == 0U ||
+        (preserve_mbr && task.target_number > 4U) ||
+        task.target_offset_bytes % kMiB != 0U ||
         task.construction_size_bytes == 0U ||
         task.construction_size_bytes > task.target_size_bytes ||
         task.construction_size_bytes % 512U != 0U ||
-        task.target_size_bytes % 512U != 0U || task.active ||
+        task.target_size_bytes % 512U != 0U ||
+        (task.active && !preserve_mbr) ||
         !checked_add(
             task.target_offset_bytes,
             task.construction_size_bytes,
             construction_end) ||
         !checked_add(
             task.target_offset_bytes, task.target_size_bytes, final_end) ||
-        final_end > plan.expected_target().size_bytes) {
+        final_end > plan.expected_target().size_bytes ||
+        (task.kind ==
+                 WindowsDirectShrinkPartitionTaskKind::copy_exact_raw &&
+         (!task.source_table_index.has_value() ||
+          task.source_size_bytes == 0U ||
+          task.construction_size_bytes != task.source_size_bytes ||
+          task.target_size_bytes != task.source_size_bytes ||
+          all_zero(task.source_partition_type) ||
+          !task.original_volume_guid_path.empty() ||
+          task.archive_upper_bound_bytes != 0U)) ||
+        (task.kind !=
+                 WindowsDirectShrinkPartitionTaskKind::copy_exact_raw &&
+         !all_zero(task.source_partition_type))) {
       return status_failure(
           clonecore::ErrorCode::unsupported_layout,
           ERROR_NOT_SUPPORTED,
           L"直接縮小production partition寸法",
           L"construction/final寸法、整列、範囲、またはActive属性が未対応です");
+    }
+    if (task.active) {
+      ++active_count;
+      if (task.role == migrationcore::MigrationPartitionRole::windows ||
+          task.role == migrationcore::MigrationPartitionRole::bios_system) {
+        ++active_boot_role_count;
+      }
     }
     switch (task.role) {
       case migrationcore::MigrationPartitionRole::efi_system:
@@ -3476,20 +5644,30 @@ clonecore::Status validate_factory_inputs(
         if (task.kind !=
                 WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim &&
             task.kind !=
-                WindowsDirectShrinkPartitionTaskKind::create_empty_ntfs) {
+                WindowsDirectShrinkPartitionTaskKind::create_empty_ntfs &&
+            task.kind !=
+                WindowsDirectShrinkPartitionTaskKind::copy_exact_raw) {
           return status_failure(
               clonecore::ErrorCode::unsupported_layout,
               ERROR_NOT_SUPPORTED,
               L"直接縮小production data task",
-              L"data領域はNTFS WIM適用または空NTFS生成に限定します");
+              L"data領域はNTFS WIM適用、空NTFS生成、または元サイズexact RAWに限定します");
         }
         break;
       case migrationcore::MigrationPartitionRole::bios_system:
-        return status_failure(
-            clonecore::ErrorCode::unsupported_layout,
-            ERROR_NOT_SUPPORTED,
-            L"直接縮小production BIOS system task",
-            L"現production経路はGPT/UEFIだけを扱います");
+        ++bios_system_count;
+        if (!preserve_mbr ||
+            (task.kind !=
+                 WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim &&
+             task.kind !=
+                 WindowsDirectShrinkPartitionTaskKind::create_empty_ntfs)) {
+          return status_failure(
+              clonecore::ErrorCode::unsupported_layout,
+              ERROR_NOT_SUPPORTED,
+              L"直接縮小production BIOS system task",
+              L"MBR形式維持のNTFS WIM適用または空NTFS生成だけを扱います");
+        }
+        break;
     }
     if (task.construction_size_bytes < task.target_size_bytes) {
       ++extension_count;
@@ -3500,15 +5678,40 @@ clonecore::Status validate_factory_inputs(
             plan.staging().length_bytes ==
                 task.target_size_bytes - task.construction_size_bytes;
       }
+      if (plan.surplus_allocation() ==
+              migrationcore::ShrinkSurplusAllocation::
+                  selected_data_partition &&
+          plan.surplus_target_source_table_index().has_value() &&
+          task.source_table_index ==
+              plan.surplus_target_source_table_index() &&
+          task.role == migrationcore::MigrationPartitionRole::data &&
+          (task.kind ==
+               WindowsDirectShrinkPartitionTaskKind::apply_ntfs_wim ||
+           task.kind ==
+               WindowsDirectShrinkPartitionTaskKind::create_empty_ntfs) &&
+          plan.staging().final_growth_owner_target_number ==
+              task.target_number) {
+        selected_data_growth_owner_matched = growth_owner_matched;
+      }
     }
   }
-  const bool system_roles_valid = plan.boot_finalization_required() &&
-      efi_count == 1U && msr_count == 1U && windows_count == 1U &&
-      recovery_count <= 1U && dependencies.finalize_boot &&
+  const bool common_system_roles_valid = plan.boot_finalization_required() &&
+      windows_count == 1U && recovery_count <= 1U &&
+      dependencies.finalize_boot &&
       (recovery_count == 0U || dependencies.finalize_winre);
+  const bool gpt_system_roles_valid = common_system_roles_valid &&
+      !preserve_mbr && efi_count == 1U && msr_count == 1U &&
+      bios_system_count == 0U && active_count == 0U;
+  const bool mbr_system_roles_valid = common_system_roles_valid &&
+      preserve_mbr && efi_count == 0U && msr_count == 0U &&
+      bios_system_count <= 1U && active_count == 1U &&
+      active_boot_role_count == 1U;
+  const bool system_roles_valid =
+      gpt_system_roles_valid || mbr_system_roles_valid;
   const bool data_roles_valid = !plan.boot_finalization_required() &&
-      efi_count == 0U && msr_count == 0U && windows_count == 0U &&
-      recovery_count == 0U;
+      efi_count == 0U && windows_count == 0U && recovery_count == 0U &&
+      bios_system_count == 0U && active_count == 0U &&
+      (preserve_mbr ? msr_count == 0U : msr_count <= 1U);
   const bool leave_valid = plan.surplus_allocation() ==
           migrationcore::ShrinkSurplusAllocation::leave_unallocated &&
       extension_count == 0U &&
@@ -3516,14 +5719,37 @@ clonecore::Status validate_factory_inputs(
   const bool automatic_valid = plan.surplus_allocation() ==
           migrationcore::ShrinkSurplusAllocation::automatic_proportional &&
       extension_count != 0U && growth_owner_matched;
+  bool selected_mapping_valid = false;
+  if (plan.surplus_target_source_table_index().has_value()) {
+    const auto mapping = std::find_if(
+        plan.source_partition_mappings().begin(),
+        plan.source_partition_mappings().end(),
+        [&plan](const WindowsDirectShrinkSourcePartitionMapping& value) {
+          return value.source_table_index ==
+              *plan.surplus_target_source_table_index();
+        });
+    selected_mapping_valid =
+        mapping != plan.source_partition_mappings().end() &&
+        mapping->role == migrationcore::MigrationPartitionRole::data &&
+        mapping->requested && mapping->selected &&
+        mapping->disposition == WindowsDirectShrinkSourcePartitionDisposition::
+            transferred_to_target &&
+        mapping->target_number ==
+            plan.staging().final_growth_owner_target_number;
+  }
+  const bool selected_data_valid = plan.surplus_allocation() ==
+          migrationcore::ShrinkSurplusAllocation::selected_data_partition &&
+      plan.surplus_target_source_table_index().has_value() &&
+      extension_count == 1U && growth_owner_matched &&
+      selected_data_growth_owner_matched && selected_mapping_valid;
   if ((!system_roles_valid && !data_roles_valid) ||
-      (!leave_valid && !automatic_valid) ||
+      (!leave_valid && !automatic_valid && !selected_data_valid) ||
       extension_count != plan.ntfs_extension_task_count()) {
     return status_failure(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"直接縮小production role／余剰契約",
-        L"GPT system/data役割、Boot/WinRE依存、staging所有、またはNTFS伸長件数が不変計画と一致しません");
+        L"GPT/MBR system/data役割、Boot/WinRE依存、staging所有、またはNTFS伸長件数が不変計画と一致しません");
   }
   return clonecore::success_status();
 }
@@ -3576,12 +5802,38 @@ make_windows_direct_shrink_clone_platform_with_dependencies(
       temporary_gpt.value(), plan.expected_target().size_bytes);
   auto hidden_valid = validate_gpt_write_plan(
       hidden_final_gpt.value(), plan.expected_target().size_bytes);
-  if (!final_valid || !temporary_valid || !hidden_valid) {
+  auto phase_relationships =
+      final_valid && temporary_valid && hidden_valid
+      ? validate_gpt_phase_relationships(
+            plan,
+            final_gpt.value(),
+            temporary_gpt.value(),
+            hidden_final_gpt.value())
+      : clonecore::Status::failure(
+            !final_valid
+                ? final_valid.error()
+                : !temporary_valid ? temporary_valid.error()
+                                   : hidden_valid.error());
+  if (!phase_relationships) {
     return clonecore::Result<std::unique_ptr<
         IWindowsDirectShrinkClonePlatform>>::failure(
-        !final_valid ? final_valid.error()
-                     : !temporary_valid ? temporary_valid.error()
-                                        : hidden_valid.error());
+        phase_relationships.error());
+  }
+  std::optional<clonecore::MbrWritePlan> final_mbr;
+  std::vector<std::byte> hidden_final_mbr_sector;
+  if (plan.partition_style() == migrationcore::MigrationPartitionStyle::mbr) {
+    auto built_mbr = build_final_mbr(plan);
+    if (!built_mbr) {
+      return clonecore::Result<std::unique_ptr<
+          IWindowsDirectShrinkClonePlatform>>::failure(built_mbr.error());
+    }
+    auto hidden_mbr = build_hidden_final_mbr_sector(built_mbr.value());
+    if (!hidden_mbr) {
+      return clonecore::Result<std::unique_ptr<
+          IWindowsDirectShrinkClonePlatform>>::failure(hidden_mbr.error());
+    }
+    final_mbr.emplace(built_mbr.take_value());
+    hidden_final_mbr_sector = hidden_mbr.take_value();
   }
   std::unique_ptr<IWindowsDirectShrinkClonePlatform> result =
       std::make_unique<WindowsDirectShrinkClonePlatform>(
@@ -3590,7 +5842,9 @@ make_windows_direct_shrink_clone_platform_with_dependencies(
           std::move(dependencies),
           final_gpt.take_value(),
           temporary_gpt.take_value(),
-          hidden_final_gpt.take_value());
+          hidden_final_gpt.take_value(),
+          std::move(final_mbr),
+          std::move(hidden_final_mbr_sector));
   return clonecore::Result<std::unique_ptr<
       IWindowsDirectShrinkClonePlatform>>::success(std::move(result));
 }
@@ -3651,6 +5905,8 @@ make_windows_direct_shrink_clone_platform(
           },
       .finalize_boot = finalize_boot_with_windows_apis,
       .finalize_winre = finalize_winre_with_windows_apis,
+      .observe_mbr_safety =
+          observe_windows_direct_shrink_mbr_safety_with_windows_apis,
   };
   return make_windows_direct_shrink_clone_platform_with_dependencies(
       plan, observed, request, std::move(dependencies));

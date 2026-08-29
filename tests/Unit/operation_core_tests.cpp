@@ -132,6 +132,48 @@ ytec::operationcore::InterruptionCheckpoint make_preparation_checkpoint(
   return checkpoint;
 }
 
+ytec::operationcore::InterruptionCheckpoint make_v3_image_checkpoint() {
+  const ytec::operationcore::OperationPlan plan{
+      .schema_version = ytec::operationcore::kOperationPlanSchemaVersion,
+      .operation_id = make_operation_id(0x51U),
+      .kind = ytec::operationcore::OperationKind::image_create,
+      .environment = ytec::operationcore::OperationEnvironment::winpe,
+      .source = make_identity(
+          3U, L"Synthetic image source", "IMAGE-SRC", L"TEST\\IMAGE-SRC"),
+      .target = std::nullopt,
+      .expected_work_bytes = 4096U,
+      .immutable_payload_hash = make_digest(0x52U),
+  };
+  const auto plan_hash = ytec::operationcore::hash_operation_plan(plan);
+  if (!plan_hash) {
+    throw TestFailure{"The sample image-create plan must hash"};
+  }
+  return ytec::operationcore::InterruptionCheckpoint{
+      .schema_version = ytec::operationcore::kCheckpointSchemaVersionV3,
+      .operation_id = plan.operation_id,
+      .kind = plan.kind,
+      .environment = plan.environment,
+      .phase = ytec::operationcore::CheckpointPhase::preparing,
+      .revision = 1U,
+      .expected_work_bytes = plan.expected_work_bytes,
+      .verified_work_bytes = 0U,
+      .verified_chunk_count = 0U,
+      .plan_hash = plan_hash.value(),
+      .output_identity_hash = make_digest(0x53U),
+      .source = plan.source,
+      .target = std::nullopt,
+      .continuity_token = L"PE-SOURCE-STATE-SYNTHETIC-0001",
+      .preparation_evidence = std::nullopt,
+      .output_progress_evidence =
+          ytec::operationcore::CheckpointOutputProgressEvidence{
+              .verified_prefix_hash = make_digest(0x54U),
+              .primary_output_length = 0U,
+              .journal_length = 0U,
+              .auxiliary_output_length = 0U,
+          },
+  };
+}
+
 ytec::clonecore::Error test_error(
     const ytec::clonecore::ErrorCode code,
     std::wstring operation) {
@@ -1071,6 +1113,97 @@ void test_unknown_existing_files_are_never_overwritten_or_deleted() {
         "A pre-existing unknown stage must never be claimed or deleted");
 }
 
+void test_checkpoint_v3_output_progress_is_bounded_and_monotonic() {
+  auto preparing = make_v3_image_checkpoint();
+  const auto serialized =
+      ytec::operationcore::serialize_checkpoint(preparing);
+  check(serialized.has_value(), "A valid v3 image checkpoint should serialize");
+  const auto parsed = ytec::operationcore::parse_checkpoint(serialized.value());
+  check(parsed.has_value() &&
+            parsed.value().checkpoint.schema_version ==
+                ytec::operationcore::kCheckpointSchemaVersionV3 &&
+            parsed.value().checkpoint.output_progress_evidence ==
+                preparing.output_progress_evidence,
+        "V3 output progress evidence should round-trip exactly");
+
+  auto missing = preparing;
+  missing.output_progress_evidence.reset();
+  check(!ytec::operationcore::validate_checkpoint(missing),
+        "V3 must fail closed without output progress evidence");
+
+  auto wrong_kind = preparing;
+  wrong_kind.kind = ytec::operationcore::OperationKind::rescue_image;
+  check(!ytec::operationcore::validate_checkpoint(wrong_kind),
+        "V3 must not silently enable rescue image resume");
+
+  auto prepared = preparing;
+  prepared.revision = 2U;
+  prepared.phase = ytec::operationcore::CheckpointPhase::prepared;
+  prepared.output_progress_evidence->verified_prefix_hash =
+      make_digest(0x55U);
+  prepared.output_progress_evidence->journal_length = 256U;
+  check(ytec::operationcore::validate_checkpoint_transition(
+            preparing, prepared)
+            .has_value(),
+        "A durable journal header may move v3 preparing to prepared");
+
+  auto advanced = prepared;
+  advanced.revision = 3U;
+  advanced.verified_work_bytes = 2048U;
+  advanced.verified_chunk_count = 1U;
+  advanced.output_progress_evidence->verified_prefix_hash =
+      make_digest(0x56U);
+  advanced.output_progress_evidence->primary_output_length = 1024U;
+  advanced.output_progress_evidence->journal_length = 512U;
+  check(ytec::operationcore::validate_checkpoint_transition(
+            prepared, advanced)
+            .has_value(),
+        "A verified chunk may advance bytes, object lengths, and prefix hash");
+
+  auto stale_evidence = advanced;
+  stale_evidence.revision = 4U;
+  stale_evidence.verified_work_bytes = 3072U;
+  stale_evidence.verified_chunk_count = 2U;
+  check(!ytec::operationcore::validate_checkpoint_transition(
+            advanced, stale_evidence),
+        "Progress must not advance without new durable output evidence");
+
+  auto shorter = advanced;
+  shorter.revision = 4U;
+  shorter.verified_work_bytes = 3072U;
+  shorter.verified_chunk_count = 2U;
+  shorter.output_progress_evidence->verified_prefix_hash =
+      make_digest(0x57U);
+  shorter.output_progress_evidence->primary_output_length = 512U;
+  check(!ytec::operationcore::validate_checkpoint_transition(
+            advanced, shorter),
+        "A v3 transition must never shrink a bound object length");
+
+  auto complete = advanced;
+  complete.revision = 4U;
+  complete.verified_work_bytes = complete.expected_work_bytes;
+  complete.verified_chunk_count = 2U;
+  complete.output_progress_evidence->verified_prefix_hash =
+      make_digest(0x58U);
+  complete.output_progress_evidence->primary_output_length = 2048U;
+  complete.output_progress_evidence->journal_length = 768U;
+  check(ytec::operationcore::validate_checkpoint_transition(
+            advanced, complete)
+            .has_value(),
+        "The final verified chunk may complete prepared progress");
+
+  auto commit_ready = complete;
+  commit_ready.revision = 5U;
+  commit_ready.phase = ytec::operationcore::CheckpointPhase::commit_ready;
+  commit_ready.output_progress_evidence->verified_prefix_hash =
+      make_digest(0x59U);
+  commit_ready.output_progress_evidence->primary_output_length += 64U;
+  check(ytec::operationcore::validate_checkpoint_transition(
+            complete, commit_ready)
+            .has_value(),
+        "Commit-ready must preserve the fully verified output evidence");
+}
+
 }  // namespace
 
 int main() {
@@ -1101,6 +1234,8 @@ int main() {
        test_checkpoint_store_create_replace_and_hash_bound_discard},
       {"unknown_existing_files_are_never_overwritten_or_deleted",
        test_unknown_existing_files_are_never_overwritten_or_deleted},
+      {"checkpoint_v3_output_progress_is_bounded_and_monotonic",
+       test_checkpoint_v3_output_progress_is_bounded_and_monotonic},
   };
 
   int failures = 0;

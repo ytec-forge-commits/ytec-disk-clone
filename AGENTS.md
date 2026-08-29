@@ -10,6 +10,10 @@
 - Original Y-TEC project source is licensed under Apache-2.0. Preserve the
   repository `LICENSE`, `NOTICE`, source notices, and the Apache-2.0 rights to
   use, modify, and redistribute source and object forms.
+- This is a personally developed open-source project released by the user
+  under the Y-TEC name. It is not an internal company, employer, or corporate
+  software project. Use "公開前リリース候補" or "個人開発OSS" for the
+  pre-release stage; do not describe it as company-internal software.
 - Official Y-TEC branding and official-build status are separate from the
   source license. Do not describe third-party builds as official, and preserve
   `TRADEMARKS.md`; do not use branding rules to restrict Apache-2.0 rights.
@@ -33,6 +37,11 @@
   remain fail-closed unless independent device-number and partition-range
   queries agree and the volume GUID is unchanged.
 - All image inputs are untrusted and require bounds checking.
+- For CNG hashes created with a caller-owned `pbHashObject` buffer, destroy
+  the `BCRYPT_HASH_HANDLE` before releasing that backing buffer.  Keep RAII
+  member declaration order consistent with reverse destruction order and
+  retain a repeated regression test; a single successful hash is not enough
+  to detect this lifetime bug.
 - Rescue image creation must never reread the failing source for the container
   pass. Rescue once into an owned, write/read-back-verified staging session,
   seal and re-identify it read-only, completely verify the final image partial,

@@ -83,20 +83,41 @@ void verify_width(const int client_width) {
       actions.primary_action.width() >= 300,
       "primary action must be wide enough for long Japanese labels");
 
+  const auto diagnostics = ytec::windowsapp::
+      calculate_diagnostics_action_layout(client_width);
+  check(
+      diagnostics.update_action.left >= 286 &&
+          diagnostics.support_action.right <= client_width - 36,
+      "diagnostics actions must remain inside the content boundary");
+  check(
+      diagnostics.update_action.right <
+              diagnostics.post_migration_action.left &&
+          diagnostics.post_migration_action.right <
+              diagnostics.guidance_action.left &&
+          diagnostics.guidance_action.right <
+              diagnostics.support_action.left,
+      "diagnostics actions must preserve gaps and never overlap");
+  check(
+      diagnostics.update_action.width() >= 145 &&
+          diagnostics.post_migration_action.width() >= 145 &&
+          diagnostics.guidance_action.width() >= 145 &&
+          diagnostics.support_action.width() >= 145,
+      "diagnostics action labels need a non-truncating compact width");
+
   const auto image_options = ytec::windowsapp::
       calculate_image_create_option_layout(client_width);
   check(
       image_options.verification_control.left >= 312 &&
           image_options.transfer_control.right <= client_width - 36,
-      "image-create options must remain inside the content boundary");
+      "clone/image option selectors must remain inside the content boundary");
   check(
       image_options.verification_control.right <
           image_options.transfer_control.left,
-      "verification and transfer mode selectors must not overlap");
+      "clone style or image verification must not overlap transfer mode");
   check(
       image_options.verification_control.width() >= 250 &&
           image_options.transfer_control.width() >= 250,
-      "image-create option labels need a non-truncating width");
+      "clone/image option labels need a non-truncating width");
 }
 
 void verify_rescue_media_compact_height(
@@ -201,6 +222,62 @@ void verify_confirmation_dialog_resource() {
   DestroyWindow(dialog);
 }
 
+bool overlaps(
+    const ytec::windowsapp::DialogBounds& left,
+    const ytec::windowsapp::DialogBounds& right) {
+  return left.left < right.right && left.right > right.left &&
+      left.top < right.bottom && left.bottom > right.top;
+}
+
+void verify_partition_capacity_dialog_layout(
+    const int work_width,
+    const int work_height,
+    const unsigned int dpi) {
+  const auto layout = ytec::windowsapp::
+      calculate_clone_partition_capacity_dialog_layout(
+          work_width, work_height, dpi);
+  const std::array<ytec::windowsapp::DialogBounds, 10U> controls{
+      layout.guidance,
+      layout.partition_list,
+      layout.surplus_label,
+      layout.surplus_policy,
+      layout.surplus_target_label,
+      layout.surplus_target,
+      layout.status,
+      layout.accept_button,
+      layout.cancel_button,
+      layout.client,
+  };
+  for (std::size_t index = 0U; index + 1U < controls.size(); ++index) {
+    check(
+        layout.client.contains(controls[index]),
+        "partition/capacity dialog controls must remain inside client");
+    check(
+        controls[index].width() > 0 && controls[index].height() > 0,
+        "partition/capacity dialog controls must retain usable dimensions");
+  }
+  check(
+      layout.client_width <= work_width &&
+          layout.client_height <= work_height,
+      "partition/capacity dialog must fit the monitor work area");
+  check(
+      layout.partition_list.height() >= 120,
+      "scrollable partition ListView must retain a useful viewport");
+  check(
+      !overlaps(layout.guidance, layout.partition_list) &&
+          !overlaps(layout.partition_list, layout.surplus_policy) &&
+          !overlaps(layout.surplus_policy, layout.surplus_target) &&
+          !overlaps(layout.surplus_target, layout.status) &&
+          !overlaps(layout.status, layout.accept_button) &&
+          !overlaps(layout.accept_button, layout.cancel_button),
+      "partition/capacity dialog rows and actions must not overlap");
+  check(
+      !overlaps(layout.surplus_label, layout.surplus_policy) &&
+          !overlaps(
+              layout.surplus_target_label, layout.surplus_target),
+      "partition/capacity dialog labels must not overlap their combos");
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +295,10 @@ int main() {
            .compact,
       "720-high rescue-media layout should keep the spacious rows");
   verify_confirmation_dialog_resource();
+  for (const unsigned int dpi : {96U, 120U, 144U, 168U, 192U}) {
+    verify_partition_capacity_dialog_layout(1024, 600, dpi);
+    verify_partition_capacity_dialog_layout(1280, 720, dpi);
+  }
   std::cout << "windows app layout tests: PASS\n";
   return 0;
 }

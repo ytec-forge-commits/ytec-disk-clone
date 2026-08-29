@@ -2,7 +2,154 @@
 
 #include "ytec/diskmodel/clone_target_layout.h"
 
+#include <array>
+
 namespace ytec::windowsapp {
+
+namespace {
+
+constexpr std::array<WindowsTransferModeOption, 3U> kCloneTransferModes{{
+    {WindowsTransferModeChoice::exact,
+     L"通常モード（完全複製）"},
+    {WindowsTransferModeChoice::shrink, L"縮小移行モード（小容量へ）"},
+    {WindowsTransferModeChoice::rescue, L"救出モード（データディスク）"},
+}};
+
+constexpr std::array<WindowsTransferModeOption, 3U> kImageTransferModes{{
+    {WindowsTransferModeChoice::exact,
+     L"通常モード（完全複製）"},
+    {WindowsTransferModeChoice::shrink, L"縮小移行モード（小容量へ）"},
+    {WindowsTransferModeChoice::rescue, L"救出モード（データディスク）"},
+}};
+
+constexpr std::array<WindowsPartitionStyleOption, 2U>
+    kPartitionStyleChoices{{
+        {WindowsPartitionStyleChoice::preserve,
+         L"パーティション形式: 維持"},
+        {WindowsPartitionStyleChoice::mbr_to_gpt,
+         L"パーティション形式: MBR→GPT"},
+    }};
+
+}  // namespace
+
+std::span<const WindowsTransferModeOption> windows_transfer_mode_options(
+    const WindowsTransferModeContext context) noexcept {
+  switch (context) {
+    case WindowsTransferModeContext::clone:
+      return kCloneTransferModes;
+    case WindowsTransferModeContext::create_image:
+      return kImageTransferModes;
+    default:
+      return {};
+  }
+}
+
+std::uintptr_t windows_transfer_mode_item_data(
+    const WindowsTransferModeChoice choice) noexcept {
+  return static_cast<std::uintptr_t>(choice);
+}
+
+std::optional<WindowsTransferModeChoice>
+decode_windows_transfer_mode_item_data(const std::uintptr_t item_data) noexcept {
+  switch (item_data) {
+    case static_cast<std::uintptr_t>(
+        WindowsTransferModeChoice::exact):
+      return WindowsTransferModeChoice::exact;
+    case static_cast<std::uintptr_t>(WindowsTransferModeChoice::shrink):
+      return WindowsTransferModeChoice::shrink;
+    case static_cast<std::uintptr_t>(WindowsTransferModeChoice::rescue):
+      return WindowsTransferModeChoice::rescue;
+    default:
+      return std::nullopt;
+  }
+}
+
+bool windows_transfer_mode_allowed(
+    const WindowsTransferModeContext context,
+    const WindowsTransferModeChoice choice) noexcept {
+  const auto options = windows_transfer_mode_options(context);
+  for (const auto& option : options) {
+    if (option.choice == choice) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool windows_transfer_mode_requires_same_or_larger_target(
+    const WindowsTransferModeChoice choice) noexcept {
+  switch (choice) {
+    case WindowsTransferModeChoice::shrink:
+      return false;
+    case WindowsTransferModeChoice::exact:
+    case WindowsTransferModeChoice::rescue:
+    default:
+      return true;
+  }
+}
+
+std::span<const WindowsPartitionStyleOption>
+windows_partition_style_options() noexcept {
+  return kPartitionStyleChoices;
+}
+
+std::uintptr_t windows_partition_style_item_data(
+    const WindowsPartitionStyleChoice choice) noexcept {
+  return static_cast<std::uintptr_t>(choice);
+}
+
+std::optional<WindowsPartitionStyleChoice>
+decode_windows_partition_style_item_data(
+    const std::uintptr_t item_data) noexcept {
+  switch (item_data) {
+    case static_cast<std::uintptr_t>(WindowsPartitionStyleChoice::preserve):
+      return WindowsPartitionStyleChoice::preserve;
+    case static_cast<std::uintptr_t>(WindowsPartitionStyleChoice::mbr_to_gpt):
+      return WindowsPartitionStyleChoice::mbr_to_gpt;
+    default:
+      return std::nullopt;
+  }
+}
+
+bool windows_partition_style_choice_allowed(
+    const WindowsTransferModeChoice transfer_mode,
+    const diskmodel::PartitionStyle source_style,
+    const bool source_is_system_disk,
+    const WindowsPartitionStyleChoice style_choice) noexcept {
+  switch (transfer_mode) {
+    case WindowsTransferModeChoice::exact:
+      return style_choice == WindowsPartitionStyleChoice::preserve;
+    case WindowsTransferModeChoice::shrink:
+      return style_choice == WindowsPartitionStyleChoice::preserve ||
+          (style_choice == WindowsPartitionStyleChoice::mbr_to_gpt &&
+           source_is_system_disk &&
+           source_style == diskmodel::PartitionStyle::mbr);
+    case WindowsTransferModeChoice::rescue:
+      return style_choice == WindowsPartitionStyleChoice::preserve;
+    default:
+      return false;
+  }
+}
+
+bool windows_partition_style_route_available(
+    const WindowsTransferModeChoice transfer_mode,
+    const diskmodel::PartitionStyle source_style,
+    const bool source_is_system_disk,
+    const WindowsPartitionStyleChoice style_choice) noexcept {
+  if (!windows_partition_style_choice_allowed(
+          transfer_mode,
+          source_style,
+          source_is_system_disk,
+          style_choice)) {
+    return false;
+  }
+  if (transfer_mode == WindowsTransferModeChoice::shrink &&
+      style_choice == WindowsPartitionStyleChoice::preserve) {
+    return source_style == diskmodel::PartitionStyle::gpt ||
+        source_style == diskmodel::PartitionStyle::mbr;
+  }
+  return true;
+}
 
 CloneSelectionView evaluate_clone_selection(
     const diskmodel::InventoryReport* const inventory,

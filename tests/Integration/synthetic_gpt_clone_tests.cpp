@@ -166,10 +166,13 @@ class SyntheticUsedRanges final
   Result<std::vector<ByteRange>> query_used_ranges(
       const std::uint32_t,
       const ytec::clonecore::NtfsGeometry&) override {
+    ++query_count;
     return Result<std::vector<ByteRange>>::success(
         {{.offset = 0, .length = 8192},
          {.offset = 32768, .length = 8192}});
   }
+
+  std::uint32_t query_count{};
 };
 
 GptGuid guid_with_byte(const std::uint8_t value) {
@@ -279,6 +282,40 @@ void write_fat32_boot(
       storage,
       offset + 32,
       static_cast<std::uint32_t>(range.length / kSectorSize));
+  storage[offset + 510] = std::byte{0x55};
+  storage[offset + 511] = std::byte{0xAA};
+}
+
+void write_exfat_boot(
+    std::vector<std::byte>& storage,
+    const ByteRange& range) {
+  const std::size_t offset = static_cast<std::size_t>(range.offset);
+  std::fill_n(
+      storage.begin() + static_cast<std::ptrdiff_t>(offset),
+      kSectorSize,
+      std::byte{0});
+  const char signature[] = "EXFAT   ";
+  std::memcpy(storage.data() + offset + 3, signature, 8);
+  const std::uint64_t total_sectors = range.length / kSectorSize;
+  constexpr std::uint32_t fat_offset = 24U;
+  constexpr std::uint32_t fat_length = 8U;
+  constexpr std::uint32_t heap_offset = fat_offset + fat_length;
+  constexpr std::uint32_t sectors_per_cluster = 8U;
+  const auto cluster_count = static_cast<std::uint32_t>(
+      (total_sectors - heap_offset) / sectors_per_cluster);
+  write_little<std::uint64_t>(
+      storage, offset + 64, range.offset / kSectorSize);
+  write_little<std::uint64_t>(storage, offset + 72, total_sectors);
+  write_little<std::uint32_t>(storage, offset + 80, fat_offset);
+  write_little<std::uint32_t>(storage, offset + 84, fat_length);
+  write_little<std::uint32_t>(storage, offset + 88, heap_offset);
+  write_little<std::uint32_t>(storage, offset + 92, cluster_count);
+  write_little<std::uint32_t>(storage, offset + 96, 2U);
+  write_little<std::uint16_t>(storage, offset + 104, 0x0100U);
+  storage[offset + 108] = std::byte{9};
+  storage[offset + 109] = std::byte{3};
+  storage[offset + 110] = std::byte{1};
+  storage[offset + 112] = std::byte{0};
   storage[offset + 510] = std::byte{0x55};
   storage[offset + 511] = std::byte{0xAA};
 }
@@ -644,6 +681,89 @@ void test_synthetic_gpt_clone_success() {
       "MSR payload must not be copied");
 }
 
+void test_gpt_basic_fat32_and_exfat_copy_whole_partition() {
+  const auto run = [](const bool exfat) {
+    SyntheticFixture fixture;
+    const ByteRange basic = byte_range(fixture.layout.partitions[2]);
+    std::fill_n(
+        fixture.source.begin() +
+            static_cast<std::ptrdiff_t>(basic.offset),
+        kSectorSize,
+        std::byte{0});
+    if (exfat) {
+      write_exfat_boot(fixture.source, basic);
+    } else {
+      write_fat32_boot(fixture.source, basic);
+    }
+
+    SyntheticUsedRanges plan_ranges;
+    SequentialGuidGenerator plan_guids(100);
+    const auto plan = ytec::clonecore::build_offline_gpt_clone_plan(
+        fixture.source_reader,
+        fixture.target_writer,
+        plan_ranges,
+        plan_guids);
+    check(plan.has_value(),
+          exfat ? "GPT basic exFAT should plan"
+                : "GPT basic FAT32 should plan");
+    check(plan_ranges.query_count == 0U,
+          "FAT32/exFAT exact planning must not infer NTFS bitmap ranges");
+    const auto copy = std::find_if(
+        plan.value().partition_copies.begin(),
+        plan.value().partition_copies.end(),
+        [](const auto& candidate) { return candidate.entry_index == 2U; });
+    check(copy != plan.value().partition_copies.end() &&
+              copy->source_ranges.size() == 1U &&
+              copy->source_ranges.front().offset == basic.offset &&
+              copy->source_ranges.front().length == basic.length &&
+              copy->mode ==
+                  (exfat
+                       ? ytec::clonecore::PartitionCopyMode::basic_exfat_raw
+                       : ytec::clonecore::PartitionCopyMode::basic_fat32_raw),
+          "FAT32/exFAT exact planning must cover the complete partition");
+
+    SyntheticUsedRanges execute_ranges;
+    SequentialGuidGenerator execute_guids(120);
+    const auto result = ytec::clonecore::execute_offline_gpt_clone(
+        valid_request(),
+        fixture.source_reader,
+        fixture.target_writer,
+        execute_ranges,
+        execute_guids);
+    check(result.has_value(),
+          exfat ? "GPT basic exFAT exact clone should succeed"
+                : "GPT basic FAT32 exact clone should succeed");
+    check(execute_ranges.query_count == 0U,
+          "FAT32/exFAT execution must not request an NTFS bitmap");
+    check(equal_range(fixture.source, fixture.target, basic),
+          "FAT32/exFAT exact clone must preserve every partition byte");
+  };
+
+  run(false);
+  run(true);
+}
+
+void test_malformed_exfat_is_rejected_before_target_write() {
+  SyntheticFixture fixture;
+  const ByteRange basic = byte_range(fixture.layout.partitions[2]);
+  write_exfat_boot(fixture.source, basic);
+  fixture.source[static_cast<std::size_t>(basic.offset + 11U)] =
+      std::byte{0x01};
+  SyntheticUsedRanges used_ranges;
+  SequentialGuidGenerator target_guids(100);
+  const auto result = ytec::clonecore::execute_offline_gpt_clone(
+      valid_request(),
+      fixture.source_reader,
+      fixture.target_writer,
+      used_ranges,
+      target_guids);
+  check(!result.has_value(), "Malformed exFAT must fail closed");
+  check(fixture.target_writer.write_count == 0U,
+        "Malformed exFAT must fail before target metadata invalidation");
+  check(used_ranges.query_count == 0U,
+        "Malformed exFAT must not fall back to an NTFS bitmap route");
+}
+
 void test_verified_write_digest_changes_with_copied_data() {
   SyntheticFixture original;
   SyntheticFixture changed;
@@ -833,6 +953,10 @@ int main() {
       {"bitlocker_boot_sector_is_rejected_explicitly",
        test_bitlocker_boot_sector_is_rejected_explicitly},
       {"synthetic_gpt_clone_success", test_synthetic_gpt_clone_success},
+      {"gpt_basic_fat32_and_exfat_copy_whole_partition",
+       test_gpt_basic_fat32_and_exfat_copy_whole_partition},
+      {"malformed_exfat_is_rejected_before_target_write",
+       test_malformed_exfat_is_rejected_before_target_write},
       {"verified_write_digest_changes_with_copied_data",
        test_verified_write_digest_changes_with_copied_data},
       {"cancellation_leaves_primary_gpt_invalid",

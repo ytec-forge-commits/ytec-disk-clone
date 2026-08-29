@@ -5,12 +5,16 @@
 #include "ytec/clonecore/gpt.h"
 #include "ytec/clonecore/mbr.h"
 #include "ytec/clonecore/offline_mbr_clone.h"
+#include "ytec/clonecore/unique_handle.h"
 #include "ytec/clonecore/windows_volume_bitmap.h"
 #include "ytec/imageformat/tsumugi_physical_restore.h"
 
 #include <Windows.h>
+#include <winioctl.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cwctype>
 #include <limits>
 #include <optional>
@@ -75,6 +79,93 @@ bool equals_case_insensitive(
           });
 }
 
+bool is_hex(const wchar_t value) noexcept {
+  return (value >= L'0' && value <= L'9') ||
+      (value >= L'a' && value <= L'f') ||
+      (value >= L'A' && value <= L'F');
+}
+
+bool is_canonical_volume_guid_path(std::wstring_view path) noexcept {
+  constexpr std::wstring_view prefix = L"\\\\?\\Volume{";
+  if (!path.starts_with(prefix) || !path.ends_with(L'\\')) {
+    return false;
+  }
+  path.remove_suffix(1U);
+  if (!path.ends_with(L'}') || path.size() != prefix.size() + 37U) {
+    return false;
+  }
+  const auto body = path.substr(prefix.size(), 36U);
+  for (std::size_t index = 0U; index < body.size(); ++index) {
+    const bool hyphen = index == 8U || index == 13U || index == 18U ||
+        index == 23U;
+    if ((hyphen && body[index] != L'-') ||
+        (!hyphen && !is_hex(body[index]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::wstring trim_volume_root_slash(std::wstring path) {
+  if (!path.empty() && path.back() == L'\\') {
+    path.pop_back();
+  }
+  return path;
+}
+
+struct ExactVolumeExtent final {
+  std::uint32_t disk_number{};
+  std::uint64_t offset{};
+  std::uint64_t length{};
+};
+
+clonecore::Result<ExactVolumeExtent> query_exact_volume_extent(
+    const HANDLE volume) {
+  std::vector<std::byte> buffer(64U * 1024U);
+  DWORD returned = 0U;
+  if (DeviceIoControl(
+          volume,
+          IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+          nullptr,
+          0U,
+          buffer.data(),
+          static_cast<DWORD>(buffer.size()),
+          &returned,
+          nullptr) == FALSE) {
+    return clonecore::Result<ExactVolumeExtent>::failure(
+        clonecore::make_win32_error(
+            clonecore::ErrorCode::query_failed,
+            L"オンラインFAT/exFAT Volume extent照会",
+            GetLastError()));
+  }
+  constexpr std::size_t header = offsetof(VOLUME_DISK_EXTENTS, Extents);
+  if (returned < header + sizeof(DISK_EXTENT)) {
+    return clonecore::Result<ExactVolumeExtent>::failure(direct_error(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"オンラインFAT/exFAT Volume extent応答",
+        L"Volume extent応答が固定headerより短いです"));
+  }
+  const auto* extents =
+      reinterpret_cast<const VOLUME_DISK_EXTENTS*>(buffer.data());
+  if (extents->NumberOfDiskExtents != 1U ||
+      extents->Extents[0].StartingOffset.QuadPart < 0 ||
+      extents->Extents[0].ExtentLength.QuadPart <= 0) {
+    return clonecore::Result<ExactVolumeExtent>::failure(direct_error(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"オンラインFAT/exFAT Volume extent一意性",
+        L"Volumeを単一の正の物理範囲へ拘束できません"));
+  }
+  return clonecore::Result<ExactVolumeExtent>::success({
+      .disk_number = extents->Extents[0].DiskNumber,
+      .offset = static_cast<std::uint64_t>(
+          extents->Extents[0].StartingOffset.QuadPart),
+      .length = static_cast<std::uint64_t>(
+          extents->Extents[0].ExtentLength.QuadPart),
+  });
+}
+
 clonecore::Result<clonecore::ByteRange> make_partition_range(
     const std::uint64_t first_lba,
     const std::uint64_t sector_count,
@@ -122,6 +213,79 @@ clonecore::Status validate_boot_read(
   }
   return clonecore::validate_fat32_boot_sector(
       boot.value(), source.logical_sector_size(), range.length);
+}
+
+clonecore::Result<clonecore::BasicDataFileSystem>
+classify_basic_file_system_read(
+    const clonecore::ISourceDiskReader& source,
+    const clonecore::ByteRange& range) {
+  const auto boot = source.read(range.offset, source.logical_sector_size());
+  if (!boot) {
+    return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+        boot.error());
+  }
+  if (boot.value().size() != source.logical_sector_size()) {
+    return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+        direct_error(
+            clonecore::ErrorCode::io_failed,
+            ERROR_HANDLE_EOF,
+            L"オンライン基本データ ブートセクター読取り",
+            L"コピー元から論理セクターを完全に読み取れませんでした"));
+  }
+  const auto identified = clonecore::classify_basic_data_file_system(
+      boot.value(), source.logical_sector_size(), range.length);
+  if (!identified ||
+      identified.value() == clonecore::BasicDataFileSystem::ntfs) {
+    return identified;
+  }
+
+  std::uint64_t declared_volume_bytes{};
+  if (identified.value() == clonecore::BasicDataFileSystem::fat32) {
+    const auto geometry = clonecore::parse_fat32_geometry(
+        boot.value(), source.logical_sector_size(), range.length);
+    if (!geometry) {
+      return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+          geometry.error());
+    }
+    if (!checked_multiply(
+            geometry.value().total_sectors,
+            geometry.value().bytes_per_sector,
+            declared_volume_bytes)) {
+      return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+          direct_error(
+              clonecore::ErrorCode::invalid_data,
+              ERROR_ARITHMETIC_OVERFLOW,
+              L"オンラインFAT32 Volume境界",
+              L"FAT32宣言容量を安全に計算できません"));
+    }
+  } else {
+    const auto geometry = clonecore::parse_exfat_geometry(
+        boot.value(), source.logical_sector_size(), range.length);
+    if (!geometry) {
+      return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+          geometry.error());
+    }
+    if (!checked_multiply(
+            geometry.value().total_sectors,
+            geometry.value().bytes_per_sector,
+            declared_volume_bytes)) {
+      return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+          direct_error(
+              clonecore::ErrorCode::invalid_data,
+              ERROR_ARITHMETIC_OVERFLOW,
+              L"オンラインexFAT Volume境界",
+              L"exFAT宣言容量を安全に計算できません"));
+    }
+  }
+  if (declared_volume_bytes != range.length) {
+    return clonecore::Result<clonecore::BasicDataFileSystem>::failure(
+        direct_error(
+            clonecore::ErrorCode::unsupported_layout,
+            ERROR_NOT_SUPPORTED,
+            L"オンラインFAT/exFAT Volume境界",
+            L"排他lockで固定できるVolume宣言範囲がパーティション全体と一致しません"));
+  }
+  return identified;
 }
 
 clonecore::Result<std::size_t> find_binding(
@@ -186,16 +350,22 @@ bool range_less(
 }
 
 clonecore::Status validate_layout_ranges(OnlineDirectSourceLayout& layout) {
-  if (layout.snapshot_partitions.empty()) {
+  if (layout.snapshot_partitions.empty() && layout.locked_partitions.empty()) {
     return clonecore::Status::failure(direct_error(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
-        L"オンライン直接クローン Snapshot対象",
-        L"VSSで固定できるNTFSパーティションがありません"));
+        L"オンライン直接クローン 整合性対象",
+        L"VSS Snapshotまたは排他Volume lockで固定できるパーティションがありません"));
   }
   std::sort(
       layout.snapshot_partitions.begin(),
       layout.snapshot_partitions.end(),
+      [](const auto& left, const auto& right) {
+        return left.disk_offset < right.disk_offset;
+      });
+  std::sort(
+      layout.locked_partitions.begin(),
+      layout.locked_partitions.end(),
       [](const auto& left, const auto& right) {
         return left.disk_offset < right.disk_offset;
       });
@@ -216,6 +386,22 @@ clonecore::Status validate_layout_ranges(OnlineDirectSourceLayout& layout) {
           ERROR_INVALID_DATA,
           L"オンライン直接クローン Snapshot範囲",
           L"Snapshot対象範囲が空、重複、またはオーバーフローしています"));
+    }
+    previous_end = end;
+  }
+  previous_end = 0;
+  for (std::size_t index = 0;
+       index < layout.locked_partitions.size(); ++index) {
+    const auto& route = layout.locked_partitions[index];
+    std::uint64_t end{};
+    if (route.length == 0 || route.volume_guid_path.empty() ||
+        !checked_add(route.disk_offset, route.length, end) ||
+        (index != 0 && route.disk_offset < previous_end)) {
+      return clonecore::Status::failure(direct_error(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"オンライン直接クローン Volume lock範囲",
+          L"Volume lock対象範囲が空、重複、またはオーバーフローしています"));
     }
     previous_end = end;
   }
@@ -247,6 +433,30 @@ clonecore::Status validate_layout_ranges(OnlineDirectSourceLayout& layout) {
             L"Snapshot領域と物理固定領域が重複しています"));
       }
     }
+    for (const auto& locked : layout.locked_partitions) {
+      const std::uint64_t locked_end = locked.disk_offset + locked.length;
+      if (snapshot.disk_offset < locked_end &&
+          locked.disk_offset < snapshot_end) {
+        return clonecore::Status::failure(direct_error(
+            clonecore::ErrorCode::invalid_data,
+            ERROR_INVALID_DATA,
+            L"オンライン直接クローン 読取り経路分離",
+            L"Snapshot領域とVolume lock領域が重複しています"));
+      }
+    }
+  }
+  for (const auto& locked : layout.locked_partitions) {
+    const std::uint64_t locked_end = locked.disk_offset + locked.length;
+    for (const auto& fixed : layout.static_physical_ranges) {
+      const std::uint64_t fixed_end = fixed.offset + fixed.length;
+      if (locked.disk_offset < fixed_end && fixed.offset < locked_end) {
+        return clonecore::Status::failure(direct_error(
+            clonecore::ErrorCode::invalid_data,
+            ERROR_INVALID_DATA,
+            L"オンライン直接クローン 読取り経路分離",
+            L"Volume lock領域と物理固定領域が重複しています"));
+      }
+    }
   }
   return clonecore::success_status();
 }
@@ -262,9 +472,22 @@ bool same_source_layout(
     const OnlineDirectSourceLayout& right) {
   if (left.partition_style != right.partition_style ||
       left.snapshot_partitions.size() != right.snapshot_partitions.size() ||
+      left.locked_partitions.size() != right.locked_partitions.size() ||
       left.static_physical_ranges.size() !=
           right.static_physical_ranges.size()) {
     return false;
+  }
+  for (std::size_t index = 0;
+       index < left.locked_partitions.size(); ++index) {
+    const auto& lhs = left.locked_partitions[index];
+    const auto& rhs = right.locked_partitions[index];
+    if (lhs.partition_index != rhs.partition_index ||
+        lhs.disk_offset != rhs.disk_offset || lhs.length != rhs.length ||
+        lhs.file_system != rhs.file_system ||
+        !equals_case_insensitive(
+            lhs.volume_guid_path, rhs.volume_guid_path)) {
+      return false;
+    }
   }
   for (std::size_t index = 0;
        index < left.snapshot_partitions.size(); ++index) {
@@ -400,6 +623,7 @@ clonecore::Status validate_dependencies(
       !dependencies.query_mbr_bindings ||
       !dependencies.run_snapshot_workflow ||
       !dependencies.open_snapshot_reader ||
+      !dependencies.open_locked_volume ||
       !dependencies.make_snapshot_bitmap_provider ||
       !dependencies.set_clone_target_offline ||
       !dependencies.set_physical_target_offline ||
@@ -411,10 +635,89 @@ clonecore::Status validate_dependencies(
         clonecore::ErrorCode::invalid_argument,
         ERROR_INVALID_PARAMETER,
         L"オンライン直接クローン 依存境界",
-        L"再識別、VSS、Snapshot Reader、コピー先、またはClone Engineがありません"));
+        L"再識別、VSS/Volume lock Reader、コピー先、またはClone Engineがありません"));
   }
   return clonecore::success_status();
 }
+
+class LockedVolumeReader final : public clonecore::ISourceDiskReader {
+ public:
+  LockedVolumeReader(
+      clonecore::UniqueHandle handle,
+      const std::uint64_t size,
+      const std::uint32_t sector_size)
+      : handle_(std::move(handle)), size_(size), sector_size_(sector_size) {}
+
+  [[nodiscard]] std::uint64_t size_bytes() const noexcept override {
+    return size_;
+  }
+
+  [[nodiscard]] std::uint32_t logical_sector_size() const noexcept override {
+    return sector_size_;
+  }
+
+  [[nodiscard]] clonecore::Result<std::vector<std::byte>> read(
+      const std::uint64_t offset,
+      const std::size_t length) const override {
+    std::uint64_t end{};
+    if (!handle_ || length == 0U || length > MAXDWORD ||
+        offset > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()) ||
+        !checked_add(offset, length, end) || end > size_) {
+      return clonecore::Result<std::vector<std::byte>>::failure(direct_error(
+          clonecore::ErrorCode::invalid_argument,
+          ERROR_INVALID_PARAMETER,
+          L"オンラインFAT/exFAT lock Reader範囲",
+          L"読取り要求が空、過大、オーバーフロー、またはVolume境界外です"));
+    }
+    LARGE_INTEGER position{};
+    position.QuadPart = static_cast<LONGLONG>(offset);
+    if (SetFilePointerEx(handle_.get(), position, nullptr, FILE_BEGIN) == FALSE) {
+      return clonecore::Result<std::vector<std::byte>>::failure(
+          clonecore::make_win32_error(
+              clonecore::ErrorCode::io_failed,
+              L"オンラインFAT/exFAT lock Reader seek",
+              GetLastError()));
+    }
+    std::vector<std::byte> bytes(length);
+    DWORD received = 0U;
+    if (ReadFile(
+            handle_.get(),
+            bytes.data(),
+            static_cast<DWORD>(length),
+            &received,
+            nullptr) == FALSE || received != length) {
+      const DWORD native_code = GetLastError();
+      return clonecore::Result<std::vector<std::byte>>::failure(direct_error(
+          clonecore::ErrorCode::io_failed,
+          native_code == ERROR_SUCCESS ? ERROR_HANDLE_EOF : native_code,
+          L"オンラインFAT/exFAT lock Reader読取り",
+          L"排他lockしたVolumeから要求長を完全に読み取れませんでした"));
+    }
+    return clonecore::Result<std::vector<std::byte>>::success(
+        std::move(bytes));
+  }
+
+ private:
+  mutable clonecore::UniqueHandle handle_;
+  std::uint64_t size_{};
+  std::uint32_t sector_size_{};
+};
+
+class RejectingNtfsUsedRangeProvider final
+    : public clonecore::INtfsUsedRangeProvider {
+ public:
+  [[nodiscard]] clonecore::Result<std::vector<clonecore::ByteRange>>
+  query_used_ranges(
+      const std::uint32_t,
+      const clonecore::NtfsGeometry&) override {
+    return clonecore::Result<std::vector<clonecore::ByteRange>>::failure(
+        direct_error(
+            clonecore::ErrorCode::unsupported_layout,
+            ERROR_NOT_SUPPORTED,
+            L"オンラインFAT/exFAT NTFS Bitmap",
+            L"Snapshotのない経路でNTFS Bitmapが要求されました"));
+  }
+};
 
 class OnlineDirectCompositeReader final
     : public clonecore::ISourceDiskReader {
@@ -422,9 +725,11 @@ class OnlineDirectCompositeReader final
   OnlineDirectCompositeReader(
       const clonecore::ISourceDiskReader* physical,
       std::vector<OnlineDirectSnapshotReader> snapshots,
+      std::vector<OnlineDirectLockedReader> locked,
       std::vector<clonecore::ByteRange> fixed)
       : physical_(physical),
         snapshots_(std::move(snapshots)),
+        locked_(std::move(locked)),
         fixed_(std::move(fixed)) {}
 
   [[nodiscard]] std::uint64_t size_bytes() const noexcept override {
@@ -476,6 +781,33 @@ class OnlineDirectCompositeReader final
                 L"1回の読取りがSnapshot境界をまたいでいます"));
       }
     }
+    for (const auto& locked : locked_) {
+      const std::uint64_t route_end = locked.disk_offset + locked.length;
+      if (offset >= locked.disk_offset && end <= route_end) {
+        auto bytes = locked.reader->read(
+            offset - locked.disk_offset, length);
+        if (!bytes || bytes.value().size() != length) {
+          return bytes
+              ? clonecore::Result<std::vector<std::byte>>::failure(
+                    direct_error(
+                        clonecore::ErrorCode::io_failed,
+                        ERROR_HANDLE_EOF,
+                        L"オンラインVolume lock合成Reader",
+                        L"排他lock Volumeから要求長を完全に読み取れませんでした"))
+              : clonecore::Result<std::vector<std::byte>>::failure(
+                    bytes.error());
+        }
+        return bytes;
+      }
+      if (offset < route_end && locked.disk_offset < end) {
+        return clonecore::Result<std::vector<std::byte>>::failure(
+            direct_error(
+                clonecore::ErrorCode::unsupported_layout,
+                ERROR_NOT_SUPPORTED,
+                L"オンラインVolume lock合成Reader境界",
+                L"1回の読取りがVolume lock境界をまたいでいます"));
+      }
+    }
     for (const auto& fixed : fixed_) {
       const std::uint64_t route_end = fixed.offset + fixed.length;
       if (offset >= fixed.offset && end <= route_end) {
@@ -504,6 +836,7 @@ class OnlineDirectCompositeReader final
  private:
   const clonecore::ISourceDiskReader* physical_{};
   std::vector<OnlineDirectSnapshotReader> snapshots_;
+  std::vector<OnlineDirectLockedReader> locked_;
   std::vector<clonecore::ByteRange> fixed_;
 };
 
@@ -682,6 +1015,229 @@ execute_clone_engine_with_native_core(
 
 }  // namespace
 
+clonecore::Result<std::unique_ptr<clonecore::ISourceDiskReader>>
+open_locked_file_system_volume_with_windows_apis(
+    const OnlineDirectLockedVolumeOpenRequest& request) {
+  std::uint64_t end{};
+  if (!is_canonical_volume_guid_path(request.volume_guid_path) ||
+      request.length == 0U || request.logical_sector_size == 0U ||
+      request.disk_offset % request.logical_sector_size != 0U ||
+      request.length % request.logical_sector_size != 0U ||
+      !checked_add(request.disk_offset, request.length, end)) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        direct_error(
+            clonecore::ErrorCode::invalid_argument,
+            ERROR_INVALID_PARAMETER,
+            L"オンラインFAT/exFAT Volume lock要求",
+            L"canonical Volume GUID、範囲、または論理セクターが不正です"));
+  }
+
+  clonecore::UniqueHandle volume(CreateFileW(
+      trim_volume_root_slash(request.volume_guid_path).c_str(),
+      GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr));
+  if (!volume) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        clonecore::make_win32_error(
+            clonecore::ErrorCode::access_denied,
+            L"オンラインFAT/exFAT Volume読取り専用open",
+            GetLastError()));
+  }
+
+  auto extent = query_exact_volume_extent(volume.get());
+  if (!extent) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        extent.error());
+  }
+  if (extent.value().disk_number != request.physical_disk_number ||
+      extent.value().offset != request.disk_offset ||
+      extent.value().length != request.length) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        direct_error(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DEVICE_REINITIALIZATION_NEEDED,
+            L"オンラインFAT/exFAT Volume extent照合",
+            L"Volumeのdisk、offset、またはlengthが解析済みパーティションと一致しません"));
+  }
+
+  DWORD returned = 0U;
+  if (DeviceIoControl(
+          volume.get(),
+          FSCTL_LOCK_VOLUME,
+          nullptr,
+          0U,
+          nullptr,
+          0U,
+          &returned,
+          nullptr) == FALSE) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        clonecore::make_win32_error(
+            clonecore::ErrorCode::access_denied,
+            L"オンラインFAT/exFAT 排他Volume lock",
+            GetLastError()));
+  }
+
+  extent = query_exact_volume_extent(volume.get());
+  if (!extent || extent.value().disk_number != request.physical_disk_number ||
+      extent.value().offset != request.disk_offset ||
+      extent.value().length != request.length) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        extent
+            ? direct_error(
+                  clonecore::ErrorCode::identity_mismatch,
+                  ERROR_DEVICE_REINITIALIZATION_NEEDED,
+                  L"オンラインFAT/exFAT lock後extent再照合",
+                  L"排他lock後にVolumeの物理範囲が変化しました")
+            : extent.error());
+  }
+
+  DISK_GEOMETRY_EX geometry{};
+  const BOOL geometry_queried = DeviceIoControl(
+          volume.get(),
+          IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+          nullptr,
+          0U,
+          &geometry,
+          static_cast<DWORD>(sizeof(geometry)),
+          &returned,
+          nullptr);
+  const DWORD geometry_error =
+      geometry_queried == FALSE ? GetLastError() : ERROR_SUCCESS;
+  if (geometry_queried == FALSE ||
+      geometry.Geometry.BytesPerSector != request.logical_sector_size) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        direct_error(
+            clonecore::ErrorCode::identity_mismatch,
+            geometry_error == ERROR_SUCCESS
+                ? ERROR_INVALID_DATA
+                : geometry_error,
+            L"オンラインFAT/exFAT 論理セクター再照合",
+            L"排他lock Volumeの論理セクター寸法がコピー計画と一致しません"));
+  }
+
+  std::array<wchar_t, 32U> file_system{};
+  if (GetVolumeInformationByHandleW(
+          volume.get(),
+          nullptr,
+          0U,
+          nullptr,
+          nullptr,
+          nullptr,
+          file_system.data(),
+          static_cast<DWORD>(file_system.size())) == FALSE) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        clonecore::make_win32_error(
+            clonecore::ErrorCode::query_failed,
+            L"オンラインFAT/exFAT ファイルシステム再照合",
+            GetLastError()));
+  }
+  const std::wstring_view expected_name =
+      request.expected_file_system == OnlineDirectLockedFileSystem::fat32
+      ? L"FAT32"
+      : L"exFAT";
+  if (!equals_case_insensitive(file_system.data(), expected_name)) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        direct_error(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DEVICE_REINITIALIZATION_NEEDED,
+            L"オンラインFAT/exFAT ファイルシステム再照合",
+            L"Volume APIが返したファイルシステムが解析済み形式と一致しません"));
+  }
+
+  auto locked_reader = std::make_unique<LockedVolumeReader>(
+      std::move(volume), request.length, request.logical_sector_size);
+  const auto boot = locked_reader->read(0U, request.logical_sector_size);
+  if (!boot) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        boot.error());
+  }
+  const auto identified = clonecore::classify_basic_data_file_system(
+      boot.value(), request.logical_sector_size, request.length);
+  const auto expected_type =
+      request.expected_file_system == OnlineDirectLockedFileSystem::fat32
+      ? clonecore::BasicDataFileSystem::fat32
+      : clonecore::BasicDataFileSystem::exfat;
+  if (!identified || identified.value() != expected_type) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        identified
+            ? direct_error(
+                  clonecore::ErrorCode::identity_mismatch,
+                  ERROR_DEVICE_REINITIALIZATION_NEEDED,
+                  L"オンラインFAT/exFAT boot signature再照合",
+                  L"排他lock handleのboot signatureが解析済み形式と一致しません")
+            : identified.error());
+  }
+
+  std::uint64_t declared_volume_bytes{};
+  if (expected_type == clonecore::BasicDataFileSystem::fat32) {
+    const auto file_system_geometry = clonecore::parse_fat32_geometry(
+        boot.value(), request.logical_sector_size, request.length);
+    if (!file_system_geometry ||
+        !checked_multiply(
+            file_system_geometry.value().total_sectors,
+            file_system_geometry.value().bytes_per_sector,
+            declared_volume_bytes)) {
+      return clonecore::Result<
+          std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+          file_system_geometry
+              ? direct_error(
+                    clonecore::ErrorCode::invalid_data,
+                    ERROR_ARITHMETIC_OVERFLOW,
+                    L"オンラインFAT32 lock後Volume境界",
+                    L"FAT32宣言容量を安全に計算できません")
+              : file_system_geometry.error());
+    }
+  } else {
+    const auto file_system_geometry = clonecore::parse_exfat_geometry(
+        boot.value(), request.logical_sector_size, request.length);
+    if (!file_system_geometry ||
+        !checked_multiply(
+            file_system_geometry.value().total_sectors,
+            file_system_geometry.value().bytes_per_sector,
+            declared_volume_bytes)) {
+      return clonecore::Result<
+          std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+          file_system_geometry
+              ? direct_error(
+                    clonecore::ErrorCode::invalid_data,
+                    ERROR_ARITHMETIC_OVERFLOW,
+                    L"オンラインexFAT lock後Volume境界",
+                    L"exFAT宣言容量を安全に計算できません")
+              : file_system_geometry.error());
+    }
+  }
+  if (declared_volume_bytes != request.length) {
+    return clonecore::Result<
+        std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+        direct_error(
+            clonecore::ErrorCode::identity_mismatch,
+            ERROR_DEVICE_REINITIALIZATION_NEEDED,
+            L"オンラインFAT/exFAT lock後Volume境界",
+            L"排他lock handleのVolume宣言範囲がパーティション全体と一致しません"));
+  }
+
+  std::unique_ptr<clonecore::ISourceDiskReader> result =
+      std::move(locked_reader);
+  return clonecore::Result<
+      std::unique_ptr<clonecore::ISourceDiskReader>>::success(
+      std::move(result));
+}
+
 clonecore::Result<OnlineDirectSourceLayout>
 build_online_direct_source_layout(
     const diskmodel::DiskInfo& observed_source,
@@ -740,11 +1296,11 @@ build_online_direct_source_layout(
             range.error());
       }
       if (partition.type_guid == clonecore::gpt_type_basic_data()) {
-        const auto ntfs = validate_boot_read(
-            read_only_source, range.value(), true);
-        if (!ntfs) {
+        const auto file_system = classify_basic_file_system_read(
+            read_only_source, range.value());
+        if (!file_system) {
           return clonecore::Result<OnlineDirectSourceLayout>::failure(
-              ntfs.error());
+              file_system.error());
         }
         const auto binding = find_binding(
             partition.entry_index, volume_bindings, used);
@@ -753,14 +1309,30 @@ build_online_direct_source_layout(
               binding.error());
         }
         used[binding.value()] = 1;
-        layout.snapshot_partitions.push_back(
-            OnlineDirectSnapshotPartition{
+        if (file_system.value() ==
+            clonecore::BasicDataFileSystem::ntfs) {
+          layout.snapshot_partitions.push_back(
+              OnlineDirectSnapshotPartition{
                 .partition_index = partition.entry_index,
                 .disk_offset = range.value().offset,
                 .length = range.value().length,
                 .volume_guid_path =
                     volume_bindings[binding.value()].volume_device_path,
-            });
+              });
+        } else {
+          layout.locked_partitions.push_back(
+              OnlineDirectLockedPartition{
+                  .partition_index = partition.entry_index,
+                  .disk_offset = range.value().offset,
+                  .length = range.value().length,
+                  .volume_guid_path =
+                      volume_bindings[binding.value()].volume_device_path,
+                  .file_system = file_system.value() ==
+                          clonecore::BasicDataFileSystem::fat32
+                      ? OnlineDirectLockedFileSystem::fat32
+                      : OnlineDirectLockedFileSystem::exfat,
+              });
+        }
       } else if (
           partition.type_guid == clonecore::gpt_type_efi_system()) {
         const auto fat = validate_boot_read(
@@ -813,11 +1385,20 @@ build_online_direct_source_layout(
             range.error());
       }
       if (partition.type == 0x07) {
-        const auto ntfs = validate_boot_read(
-            read_only_source, range.value(), true);
-        if (!ntfs) {
+        const auto file_system = classify_basic_file_system_read(
+            read_only_source, range.value());
+        if (!file_system) {
           return clonecore::Result<OnlineDirectSourceLayout>::failure(
-              ntfs.error());
+              file_system.error());
+        }
+        if (file_system.value() ==
+            clonecore::BasicDataFileSystem::fat32) {
+          return clonecore::Result<OnlineDirectSourceLayout>::failure(
+              direct_error(
+                  clonecore::ErrorCode::unsupported_layout,
+                  ERROR_NOT_SUPPORTED,
+                  L"オンラインMBR 0x07ファイルシステム",
+                  L"MBR 0x07上のFAT32は型と実形式が一致しないため拒否します"));
         }
         const auto binding = find_binding(
             partition.table_index, volume_bindings, used);
@@ -826,14 +1407,27 @@ build_online_direct_source_layout(
               binding.error());
         }
         used[binding.value()] = 1;
-        layout.snapshot_partitions.push_back(
-            OnlineDirectSnapshotPartition{
+        if (file_system.value() ==
+            clonecore::BasicDataFileSystem::ntfs) {
+          layout.snapshot_partitions.push_back(
+              OnlineDirectSnapshotPartition{
                 .partition_index = partition.table_index,
                 .disk_offset = range.value().offset,
                 .length = range.value().length,
                 .volume_guid_path =
                     volume_bindings[binding.value()].volume_device_path,
-            });
+              });
+        } else {
+          layout.locked_partitions.push_back(
+              OnlineDirectLockedPartition{
+                  .partition_index = partition.table_index,
+                  .disk_offset = range.value().offset,
+                  .length = range.value().length,
+                  .volume_guid_path =
+                      volume_bindings[binding.value()].volume_device_path,
+                  .file_system = OnlineDirectLockedFileSystem::exfat,
+              });
+        }
       } else if (partition.type == 0x27 && !partition.active) {
         const auto ntfs = validate_boot_read(
             read_only_source, range.value(), true);
@@ -852,6 +1446,29 @@ build_online_direct_source_layout(
               fat.error());
         }
         layout.static_physical_ranges.push_back(range.value());
+      } else if (partition.type == 0x0B || partition.type == 0x0C) {
+        const auto fat = validate_boot_read(
+            read_only_source, range.value(), false);
+        if (!fat) {
+          return clonecore::Result<OnlineDirectSourceLayout>::failure(
+              fat.error());
+        }
+        const auto binding = find_binding(
+            partition.table_index, volume_bindings, used);
+        if (!binding) {
+          return clonecore::Result<OnlineDirectSourceLayout>::failure(
+              binding.error());
+        }
+        used[binding.value()] = 1;
+        layout.locked_partitions.push_back(
+            OnlineDirectLockedPartition{
+                .partition_index = partition.table_index,
+                .disk_offset = range.value().offset,
+                .length = range.value().length,
+                .volume_guid_path =
+                    volume_bindings[binding.value()].volume_device_path,
+                .file_system = OnlineDirectLockedFileSystem::fat32,
+            });
       } else {
         return clonecore::Result<OnlineDirectSourceLayout>::failure(
             direct_error(
@@ -890,7 +1507,21 @@ make_online_direct_composite_reader(
     const clonecore::ISourceDiskReader* read_only_physical_source,
     std::vector<OnlineDirectSnapshotReader> snapshot_readers,
     std::vector<clonecore::ByteRange> static_physical_ranges) {
-  if (read_only_physical_source == nullptr || snapshot_readers.empty() ||
+  return make_online_direct_composite_reader(
+      read_only_physical_source,
+      std::move(snapshot_readers),
+      {},
+      std::move(static_physical_ranges));
+}
+
+clonecore::Result<std::unique_ptr<clonecore::ISourceDiskReader>>
+make_online_direct_composite_reader(
+    const clonecore::ISourceDiskReader* read_only_physical_source,
+    std::vector<OnlineDirectSnapshotReader> snapshot_readers,
+    std::vector<OnlineDirectLockedReader> locked_readers,
+    std::vector<clonecore::ByteRange> static_physical_ranges) {
+  if (read_only_physical_source == nullptr ||
+      (snapshot_readers.empty() && locked_readers.empty()) ||
       static_physical_ranges.empty()) {
     return clonecore::Result<
         std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
@@ -898,11 +1529,17 @@ make_online_direct_composite_reader(
             clonecore::ErrorCode::invalid_argument,
             ERROR_INVALID_PARAMETER,
             L"オンラインSnapshot合成Reader生成",
-            L"物理Reader、Snapshot Reader、または固定領域がありません"));
+            L"物理Reader、整合性Reader、または固定領域がありません"));
   }
   std::sort(
       snapshot_readers.begin(),
       snapshot_readers.end(),
+      [](const auto& left, const auto& right) {
+        return left.disk_offset < right.disk_offset;
+      });
+  std::sort(
+      locked_readers.begin(),
+      locked_readers.end(),
       [](const auto& left, const auto& right) {
         return left.disk_offset < right.disk_offset;
       });
@@ -928,6 +1565,27 @@ make_online_direct_composite_reader(
               ERROR_INVALID_DATA,
               L"オンラインSnapshot Reader再確認",
               L"Snapshot Readerの範囲、寸法、セクター、または重複が不正です"));
+    }
+    previous_end = end;
+  }
+  previous_end = 0;
+  for (std::size_t index = 0; index < locked_readers.size(); ++index) {
+    const auto& route = locked_readers[index];
+    std::uint64_t end{};
+    if (!route.reader || route.length == 0 ||
+        !checked_add(route.disk_offset, route.length, end) ||
+        end > read_only_physical_source->size_bytes() ||
+        (index != 0 && route.disk_offset < previous_end) ||
+        route.reader->size_bytes() != route.length ||
+        route.reader->logical_sector_size() !=
+            read_only_physical_source->logical_sector_size()) {
+      return clonecore::Result<
+          std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+          direct_error(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_INVALID_DATA,
+              L"オンラインVolume lock Reader再確認",
+              L"Volume lock Readerの範囲、寸法、セクター、または重複が不正です"));
     }
     previous_end = end;
   }
@@ -964,11 +1622,40 @@ make_online_direct_composite_reader(
                 L"Snapshot領域と固定領域が重複しています"));
       }
     }
+    for (const auto& locked : locked_readers) {
+      const std::uint64_t locked_end = locked.disk_offset + locked.length;
+      if (snapshot.disk_offset < locked_end &&
+          locked.disk_offset < snapshot_end) {
+        return clonecore::Result<
+            std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+            direct_error(
+                clonecore::ErrorCode::invalid_data,
+                ERROR_INVALID_DATA,
+                L"オンライン合成Reader経路分離",
+                L"Snapshot領域とVolume lock領域が重複しています"));
+      }
+    }
+  }
+  for (const auto& locked : locked_readers) {
+    const std::uint64_t locked_end = locked.disk_offset + locked.length;
+    for (const auto& fixed : static_physical_ranges) {
+      const std::uint64_t fixed_end = fixed.offset + fixed.length;
+      if (locked.disk_offset < fixed_end && fixed.offset < locked_end) {
+        return clonecore::Result<
+            std::unique_ptr<clonecore::ISourceDiskReader>>::failure(
+            direct_error(
+                clonecore::ErrorCode::invalid_data,
+                ERROR_INVALID_DATA,
+                L"オンライン合成Reader経路分離",
+                L"Volume lock領域と固定領域が重複しています"));
+      }
+    }
   }
   std::unique_ptr<clonecore::ISourceDiskReader> reader =
       std::make_unique<OnlineDirectCompositeReader>(
           read_only_physical_source,
           std::move(snapshot_readers),
+          std::move(locked_readers),
           std::move(static_physical_ranges));
   return clonecore::Result<
       std::unique_ptr<clonecore::ISourceDiskReader>>::success(
@@ -1101,13 +1788,11 @@ execute_online_direct_clone(
       request.expected_source.is_system_disk;
   bool boot_finalization_completed = false;
   std::optional<OnlineDirectCloneEngineReport> engine_report;
-  const auto workflow_report = dependencies.run_snapshot_workflow(
-      workflow,
-      request.async_wait,
-      request.logger,
+  const bool used_vss_snapshot = !layout.value().snapshot_partitions.empty();
+  const auto copy_consistent_source =
       [&](const vssrequester::SnapshotCopyContext& snapshot_context) {
         try {
-        const auto& mappings = snapshot_context.mappings;
+          const auto& mappings = snapshot_context.mappings;
         if (copy_callback_called ||
             snapshot_context.snapshot_set_id.empty() ||
             mappings.size() != layout.value().snapshot_partitions.size()) {
@@ -1159,25 +1844,66 @@ execute_online_direct_clone(
                       mappings[index].snapshot_device_path,
               });
         }
+        std::vector<OnlineDirectLockedReader> locked_readers;
+        locked_readers.reserve(layout.value().locked_partitions.size());
+        for (const auto& partition : layout.value().locked_partitions) {
+          auto reader = dependencies.open_locked_volume(
+              OnlineDirectLockedVolumeOpenRequest{
+                  .physical_disk_number =
+                      source.value().observed.observed.disk_number,
+                  .partition_index = partition.partition_index,
+                  .disk_offset = partition.disk_offset,
+                  .length = partition.length,
+                  .logical_sector_size =
+                      request.expected_source.logical_sector_size,
+                  .volume_guid_path = partition.volume_guid_path,
+                  .expected_file_system = partition.file_system,
+              });
+          if (!reader || !reader.value()) {
+            return clonecore::Status::failure(
+                reader
+                    ? direct_error(
+                          clonecore::ErrorCode::internal_error,
+                          ERROR_INVALID_HANDLE,
+                          L"オンラインFAT/exFAT Volume lock Reader",
+                          L"Volume lock openerが空のReaderを返しました")
+                    : reader.error());
+          }
+          locked_readers.push_back(OnlineDirectLockedReader{
+              .partition_index = partition.partition_index,
+              .disk_offset = partition.disk_offset,
+              .length = partition.length,
+              .file_system = partition.file_system,
+              .reader = reader.take_value(),
+          });
+        }
         auto composite = make_online_direct_composite_reader(
             source.value().reader.get(),
             std::move(snapshot_readers),
+            std::move(locked_readers),
             layout.value().static_physical_ranges);
         if (!composite) {
           return clonecore::Status::failure(composite.error());
         }
-        auto bitmap_provider =
-            dependencies.make_snapshot_bitmap_provider(
-                std::move(bitmap_bindings));
-        if (!bitmap_provider || !bitmap_provider.value()) {
-          return clonecore::Status::failure(
-              bitmap_provider
-                  ? direct_error(
-                        clonecore::ErrorCode::internal_error,
-                        ERROR_INVALID_HANDLE,
-                        L"オンラインSnapshot Bitmap Provider",
-                        L"Bitmap Provider Factoryが空を返しました")
-                  : bitmap_provider.error());
+        std::unique_ptr<clonecore::INtfsUsedRangeProvider> bitmap_provider;
+        if (bitmap_bindings.empty()) {
+          bitmap_provider =
+              std::make_unique<RejectingNtfsUsedRangeProvider>();
+        } else {
+          auto made_provider =
+              dependencies.make_snapshot_bitmap_provider(
+                  std::move(bitmap_bindings));
+          if (!made_provider || !made_provider.value()) {
+            return clonecore::Status::failure(
+                made_provider
+                    ? direct_error(
+                          clonecore::ErrorCode::internal_error,
+                          ERROR_INVALID_HANDLE,
+                          L"オンラインSnapshot Bitmap Provider",
+                          L"Bitmap Provider Factoryが空を返しました")
+                    : made_provider.error());
+          }
+          bitmap_provider = made_provider.take_value();
         }
 
         // This is the final source/target reidentification immediately before
@@ -1203,7 +1929,7 @@ execute_online_direct_clone(
         }
         auto current_layout = build_online_direct_source_layout(
             final_observation.value().source,
-            *source.value().reader,
+            *composite.value(),
             volume_bindings);
         if (!current_layout ||
             !same_source_layout(layout.value(), current_layout.value())) {
@@ -1214,7 +1940,40 @@ execute_online_direct_clone(
                         ERROR_INVALID_DATA,
                         L"オンライン直接クローン レイアウト再検査",
                         L"Snapshot取得後にコピー元レイアウトが変更されました")
-                  : current_layout.error());
+                   : current_layout.error());
+        }
+
+        std::unique_ptr<vssrequester::VssDiffAreaOperationMonitor>
+            diff_area_monitor;
+        OnlineDirectCloneRequest active_request = request;
+        if (used_vss_snapshot && dependencies.make_diff_area_monitor) {
+          if (clonecore::disk_operation_cancellation_requested(
+                  request.callbacks)) {
+            return clonecore::Status::failure(direct_error(
+                clonecore::ErrorCode::cancelled,
+                ERROR_CANCELLED,
+                L"オンライン直接クローン VSS差分領域初回poll",
+                L"初回target変更前に取消要求を確認しました"));
+          }
+          auto made_monitor =
+              dependencies.make_diff_area_monitor(snapshot_context);
+          if (!made_monitor || !made_monitor.value()) {
+            return clonecore::Status::failure(
+                made_monitor
+                    ? direct_error(
+                          clonecore::ErrorCode::internal_error,
+                          ERROR_INVALID_HANDLE,
+                          L"オンライン直接クローン VSS差分領域monitor",
+                          L"製品monitor factoryが空のmonitorを返しました")
+                    : made_monitor.error());
+          }
+          diff_area_monitor = made_monitor.take_value();
+          const auto monitored = diff_area_monitor->initial_poll();
+          if (!monitored) {
+            return monitored;
+          }
+          active_request.callbacks =
+              diff_area_monitor->callbacks(request.callbacks);
         }
 
         const auto offline = dependencies.set_clone_target_offline(
@@ -1279,7 +2038,7 @@ execute_online_direct_clone(
         auto executed = dependencies.execute_clone_engine(
             OnlineDirectCloneEngineContext{
                 .partition_style = layout.value().partition_style,
-                .request = &request,
+                .request = &active_request,
                 .observed_source =
                     &final_observation.value().source_identity,
                 .observed_target =
@@ -1287,7 +2046,7 @@ execute_online_direct_clone(
                 .source = composite.value().get(),
                 .target = target.value().target.get(),
                 .snapshot_bitmap_provider =
-                    bitmap_provider.value().get(),
+                    bitmap_provider.get(),
                 .connected_mbr_signatures =
                     connected_mbr_signatures,
             });
@@ -1369,6 +2128,17 @@ execute_online_direct_clone(
           }
         }
         target_offline_verified = true;
+        if (diff_area_monitor) {
+          auto monitored = diff_area_monitor->completion_poll();
+          if (monitored) {
+            monitored = vssrequester::
+                validate_completed_vss_diff_area_operation_evidence(
+                    diff_area_monitor->evidence());
+          }
+          if (!monitored) {
+            return monitored;
+          }
+        }
         engine_report = executed.take_value();
         return clonecore::success_status();
         } catch (...) {
@@ -1386,7 +2156,34 @@ execute_online_direct_clone(
           return clonecore::Status::failure(append_offline_failure(
               std::move(error), protected_offline));
         }
-      });
+      };
+
+  const auto workflow_report = [&]()
+      -> clonecore::Result<vssrequester::WorkflowReport> {
+    if (used_vss_snapshot) {
+      return dependencies.run_snapshot_workflow(
+          workflow,
+          request.async_wait,
+          request.logger,
+          copy_consistent_source);
+    }
+    const vssrequester::SnapshotCopyContext locked_context{
+        .snapshot_set_id = L"LOCKED-VOLUME-CONSISTENCY",
+    };
+    const auto copied = copy_consistent_source(locked_context);
+    if (!copied) {
+      return clonecore::Result<vssrequester::WorkflowReport>::failure(
+          copied.error());
+    }
+    return clonecore::Result<vssrequester::WorkflowReport>::success(
+        vssrequester::WorkflowReport{
+            .snapshot_set_id = locked_context.snapshot_set_id,
+            .volume_count = layout.value().locked_partitions.size(),
+            .snapshot_data_copied = true,
+            .backup_completed = false,
+            .snapshots_deleted = false,
+        });
+  }();
 
   if (!workflow_report) {
     if (!destructive_phase_started) {
@@ -1404,14 +2201,14 @@ execute_online_direct_clone(
       !target_offline_verified ||
       (boot_finalization_required && !boot_finalization_completed) ||
       !workflow_report.value().snapshot_data_copied ||
-      !workflow_report.value().backup_completed ||
-      !workflow_report.value().snapshots_deleted) {
+      (used_vss_snapshot && !workflow_report.value().backup_completed) ||
+      (used_vss_snapshot && !workflow_report.value().snapshots_deleted)) {
     return clonecore::Result<OnlineDirectCloneReport>::failure(
         direct_error(
             clonecore::ErrorCode::verification_failed,
             ERROR_INVALID_STATE,
-            L"オンライン直接クローン VSS完了状態",
-            L"Clone Engine、BackupComplete、Snapshot削除、またはoffline検証が完了していません"));
+            L"オンライン直接クローン 整合性完了状態",
+            L"Clone Engine、VSS/Volume lock、Snapshot削除、またはoffline検証が完了していません"));
   }
   return clonecore::Result<OnlineDirectCloneReport>::success(
       OnlineDirectCloneReport{
@@ -1430,6 +2227,10 @@ execute_online_direct_clone(
               workflow_report.value().backup_completed,
           .snapshots_deleted =
               workflow_report.value().snapshots_deleted,
+          .used_vss_snapshot = used_vss_snapshot,
+          .locked_volume_count = static_cast<std::uint32_t>(
+              layout.value().locked_partitions.size()),
+          .source_consistency_verified = true,
           .target_left_offline = true,
           .boot_finalization_required = boot_finalization_required,
           .boot_finalization_completed = boot_finalization_completed,
@@ -1496,6 +2297,8 @@ make_online_direct_clone_windows_dependencies() {
                 return vssrequester::
                     open_snapshot_volume_reader_with_windows_apis(open);
               },
+          .open_locked_volume =
+              open_locked_file_system_volume_with_windows_apis,
           .make_snapshot_bitmap_provider =
               [](std::vector<clonecore::SnapshotVolumeBitmapBinding>
                      bindings) {
@@ -1560,8 +2363,66 @@ make_online_direct_clone_windows_dependencies() {
 clonecore::Result<OnlineDirectCloneReport>
 execute_online_direct_clone_with_windows_apis(
     const OnlineDirectCloneRequest& request) {
-  return execute_online_direct_clone(
-      request, make_online_direct_clone_windows_dependencies());
+  auto source_token =
+      vssrequester::encode_vss_diff_area_source_epoch_token(
+          std::span<const std::byte>(request.expected_source_layout_hash));
+  if (!source_token || !request.diff_area_review_callback) {
+    return clonecore::Result<OnlineDirectCloneReport>::failure(
+        source_token
+            ? direct_error(
+                  clonecore::ErrorCode::invalid_argument,
+                  ERROR_INVALID_PARAMETER,
+                  L"オンライン直接クローン VSS差分領域監視",
+                  L"source epochまたは利用者review callbackがありません")
+            : source_token.error());
+  }
+  const std::wstring expected_source_token = source_token.take_value();
+  auto dependencies = make_online_direct_clone_windows_dependencies();
+  dependencies.make_diff_area_monitor =
+      [request, expected_source_token](
+          const vssrequester::SnapshotCopyContext& context) {
+        return vssrequester::make_windows_vss_diff_area_operation_monitor(
+            context,
+            vssrequester::WindowsVssDiffAreaOperationMonitorOptions{
+                .expected_source_identity_token = expected_source_token,
+                .probe_source_identity =
+                    [request, expected_source_token](
+                        const vssrequester::VssDiffAreaSnapshotBinding&) {
+                      auto inventory =
+                          diskmodel::make_windows_disk_inventory_provider();
+                      auto observed =
+                          diskmodel::reidentify_physical_clone(
+                              request.expected_source,
+                              request.expected_target,
+                              request.confirmation,
+                              *inventory);
+                      if (!observed) {
+                        return clonecore::Result<std::wstring>::failure(
+                            observed.error());
+                      }
+                      auto status = clonecore::validate_clone_identities(
+                          request.expected_source,
+                          observed.value().source_identity,
+                          request.expected_target,
+                          observed.value().target_identity,
+                          request.confirmation);
+                      if (status) {
+                        status = validate_reviewed_layouts(
+                            request,
+                            observed.value(),
+                            L"VSS差分領域source epoch再識別");
+                      }
+                      return status
+                          ? clonecore::Result<std::wstring>::success(
+                                expected_source_token)
+                          : clonecore::Result<std::wstring>::failure(
+                                status.error());
+                    },
+                .review_callback = request.diff_area_review_callback,
+                .logger = request.logger,
+            });
+      };
+  return execute_online_direct_clone(request, dependencies);
 }
 
 }  // namespace ytec::windowsapp

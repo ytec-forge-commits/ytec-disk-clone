@@ -56,6 +56,7 @@ struct DirectClonePlanningRequest final {
   bool mbr_to_gpt_eligible{};
   ShrinkSurplusAllocation surplus_allocation{
       ShrinkSurplusAllocation::automatic_proportional};
+  std::optional<std::uint32_t> surplus_target_source_table_index;
   std::vector<DirectCloneSourcePartition> source_partitions;
 };
 
@@ -127,6 +128,10 @@ class DirectClonePlan final {
   [[nodiscard]] ShrinkSurplusAllocation surplus_allocation() const noexcept {
     return surplus_allocation_;
   }
+  [[nodiscard]] std::optional<std::uint32_t>
+  surplus_target_source_table_index() const noexcept {
+    return surplus_target_source_table_index_;
+  }
   [[nodiscard]] std::uint64_t minimum_target_size_bytes() const noexcept {
     return minimum_target_size_bytes_;
   }
@@ -168,6 +173,7 @@ class DirectClonePlan final {
   std::uint32_t target_logical_sector_size_{};
   ShrinkSurplusAllocation surplus_allocation_{
       ShrinkSurplusAllocation::automatic_proportional};
+  std::optional<std::uint32_t> surplus_target_source_table_index_;
   std::uint64_t minimum_target_size_bytes_{};
   std::uint64_t target_size_bytes_{};
   std::uint64_t unallocated_tail_bytes_{};
@@ -181,8 +187,9 @@ class DirectClonePlan final {
 };
 
 // Pure planner: performs no enumeration, handle open, UAC request, disk read,
-// or disk write. A selected unsupported filesystem is rejected until a later
-// executor slice provides and verifies the v2 exact-RAW path.
+// or disk write. A selected unsupported filesystem is retained at its exact
+// source size and marked exact_content; product executors must use their
+// verified read-only RAW path for that partition.
 [[nodiscard]] clonecore::Result<DirectClonePlan> plan_direct_clone(
     const DirectClonePlanningRequest& request);
 

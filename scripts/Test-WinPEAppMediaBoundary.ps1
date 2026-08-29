@@ -716,7 +716,9 @@ if ($preflight.winpeGui.machine -ne 'AMD64' -or
     $preflight.winpeGui.sha256 -notmatch '^[0-9A-F]{64}$') {
     throw 'WinPE GUIのAMD64形式またはSHA-256事前検証が不足しています。'
 }
-foreach ($required in @('COMDLG32.dll', 'GDI32.dll', 'USER32.dll')) {
+foreach ($required in @(
+        'COMCTL32.dll', 'COMDLG32.dll', 'GDI32.dll', 'POWRPROF.dll',
+        'USER32.dll')) {
     if ($preflight.winpeGui.dependentDlls -notcontains $required) {
         throw "WinPE GUIの必須DLLが固定検査に含まれていません: $required"
     }

@@ -1,5 +1,8 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'ProductVersion.ps1')
+$versionPath = Join-Path $repoRoot 'version.json'
+$productVersion = Read-YtecProductVersion -Path $versionPath
 $manifestPath = Join-Path $repoRoot 'third_party\dependencies.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $projectManifestPath = Join-Path $repoRoot 'sbom\project.json'
@@ -24,6 +27,7 @@ $expectedApacheLicenseSha256 =
 foreach ($requiredPath in @(
         $projectLicensePath,
         $projectNoticePath,
+        $versionPath,
         $projectManifestPath,
         $sbomPath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -48,7 +52,9 @@ if (Test-Path -LiteralPath $projectLicensePath -PathType Leaf) {
 if ($project.license -cne 'Apache-2.0' -or
     $project.downloadLocation -cne
         'https://github.com/ytec-forge-commits/ytec-disk-clone' -or
-    $project.copyright -cne 'Copyright 2026 Y-TEC') {
+    $project.copyright -cne 'Copyright 2026 Y-TEC' -or
+    $project.documentNamespaceBase -cne
+        'https://github.com/ytec-forge-commits/ytec-disk-clone/sbom') {
     $failures += '製品SBOM台帳のライセンス、公開元、著作権が不正です。'
 }
 
@@ -63,6 +69,17 @@ if (Test-Path -LiteralPath $projectNoticePath -PathType Leaf) {
 
 if (Test-Path -LiteralPath $sbomPath -PathType Leaf) {
     $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
+    try {
+        Assert-YtecSbomProductVersion `
+            -Path $sbomPath `
+            -Version $productVersion `
+            -ExpectedPackageName 'ytec-disk-clone' `
+            -ExpectedNamespaceBase `
+                'https://github.com/ytec-forge-commits/ytec-disk-clone/sbom' |
+            Out-Null
+    } catch {
+        $failures += $_.Exception.Message
+    }
     $rootPackages = @($sbom.packages | Where-Object {
             $_.SPDXID -ceq 'SPDXRef-Package-ytec-disk-clone'
         })

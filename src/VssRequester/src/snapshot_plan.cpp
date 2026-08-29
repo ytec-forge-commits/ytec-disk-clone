@@ -300,6 +300,43 @@ bool same_mbr(
   return true;
 }
 
+clonecore::Status validate_selected_partition_entries(
+    const std::span<const std::uint32_t> selected,
+    const std::span<const std::uint32_t> known,
+    const std::wstring_view operation) {
+  if (selected.empty()) {
+    return clonecore::success_status();
+  }
+  if (!std::is_sorted(selected.begin(), selected.end()) ||
+      std::adjacent_find(selected.begin(), selected.end()) != selected.end()) {
+    return clonecore::Status::failure(plan_error(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_DATA,
+        std::wstring(operation),
+        L"選択したpartition entry indexがcanonical順序または一意性を満たしません"));
+  }
+  for (const auto entry : selected) {
+    if (std::find(known.begin(), known.end(), entry) == known.end()) {
+      return clonecore::Status::failure(plan_error(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_NOT_FOUND,
+          std::wstring(operation),
+          L"選択したpartition entry indexが再解析レイアウトにありません"));
+    }
+  }
+  return clonecore::success_status();
+}
+
+bool partition_entry_selected(
+    const SnapshotImagePlanOptions& options,
+    const std::uint32_t entry_index) noexcept {
+  return options.selected_partition_entry_indices.empty() ||
+      std::binary_search(
+          options.selected_partition_entry_indices.begin(),
+          options.selected_partition_entry_indices.end(),
+          entry_index);
+}
+
 }  // namespace
 
 clonecore::Result<PreparedSnapshotImagePlan>
@@ -352,6 +389,19 @@ prepare_gpt_snapshot_image_plan(
                   L"GPTとマニフェストのパーティション件数が一致しません")
             : backup_manifest.error());
   }
+  std::vector<std::uint32_t> known_entries;
+  known_entries.reserve(source_gpt.partitions.size());
+  for (const auto& partition : source_gpt.partitions) {
+    known_entries.push_back(partition.entry_index);
+  }
+  const auto selected_entries = validate_selected_partition_entries(
+      options.selected_partition_entry_indices,
+      known_entries,
+      L"VSS GPT partition選択");
+  if (!selected_entries) {
+    return clonecore::Result<PreparedSnapshotImagePlan>::failure(
+        selected_entries.error());
+  }
 
   std::vector<const clonecore::GptPartition*> partitions;
   partitions.reserve(source_gpt.partitions.size());
@@ -368,6 +418,9 @@ prepare_gpt_snapshot_image_plan(
   PreparedSnapshotImagePlan plan = base_plan(read_only_source, options);
   std::vector<std::uint8_t> used(ntfs_bindings.size(), 0);
   for (const auto* partition : partitions) {
+    if (!partition_entry_selected(options, partition->entry_index)) {
+      continue;
+    }
     if (partition->last_lba < partition->first_lba) {
       return clonecore::Result<PreparedSnapshotImagePlan>::failure(plan_error(
           clonecore::ErrorCode::invalid_data,
@@ -593,6 +646,19 @@ prepare_mbr_snapshot_image_plan(
                   L"MBRとマニフェストのパーティション件数が一致しません")
             : backup_manifest.error());
   }
+  std::vector<std::uint32_t> known_entries;
+  known_entries.reserve(source_mbr.partitions.size());
+  for (const auto& partition : source_mbr.partitions) {
+    known_entries.push_back(partition.table_index);
+  }
+  const auto selected_entries = validate_selected_partition_entries(
+      options.selected_partition_entry_indices,
+      known_entries,
+      L"VSS MBR partition選択");
+  if (!selected_entries) {
+    return clonecore::Result<PreparedSnapshotImagePlan>::failure(
+        selected_entries.error());
+  }
 
   std::vector<const clonecore::MbrPartition*> partitions;
   partitions.reserve(source_mbr.partitions.size());
@@ -609,6 +675,9 @@ prepare_mbr_snapshot_image_plan(
   PreparedSnapshotImagePlan plan = base_plan(read_only_source, options);
   std::vector<std::uint8_t> used(ntfs_bindings.size(), 0);
   for (const auto* partition : partitions) {
+    if (!partition_entry_selected(options, partition->table_index)) {
+      continue;
+    }
     const auto range = make_range(
         partition->first_lba,
         partition->sector_count,

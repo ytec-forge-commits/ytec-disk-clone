@@ -136,8 +136,9 @@ ctest --preset msvc-x64 --output-on-failure
 ### OSマトリクス
 
 - Windows 10 22H2 x64
-- Windows 11 24H2 x64
 - Windows 11 25H2 x64
+
+Windows 11 24H2 x64は、今回の公開前候補では未検証として互換性を主張しない。将来のVM回帰対象とする。
 
 Windows 11 26H1はx64向け公式ADK状況により正式対応外とし、誤表示を検査する。
 

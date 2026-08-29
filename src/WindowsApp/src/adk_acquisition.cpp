@@ -566,6 +566,19 @@ clonecore::Status validate_adk_release_manifest(
         L"ADK固定マニフェスト確定確認",
         L"Microsoft一次資料と実取得物によるURL、EULA、版、署名、SHA-256の固定が未完了です"));
   }
+  const auto structure = validate_adk_release_manifest_structure(manifest);
+  if (!structure) {
+    return structure;
+  }
+  if (!manifest.unattended_install_no_unexpected_restart_confirmed) {
+    return invalid_manifest(
+        L"ADK quiet導入が予期しない自動再起動を行わないことを、現在のMicrosoft一次資料または制御VM実挙動で確認できていません");
+  }
+  return clonecore::success_status();
+}
+
+clonecore::Status validate_adk_release_manifest_structure(
+    const AdkReleaseManifest& manifest) {
   if (!is_safe_manifest_id(manifest.manifest_id) ||
       !is_bounded_text(manifest.product_release_version, 64U) ||
       !is_bounded_text(manifest.tested_adk_version, 64U) ||
@@ -577,10 +590,6 @@ clonecore::Status validate_adk_release_manifest(
       !is_structurally_valid_embedded_eula_pin(manifest)) {
     return invalid_manifest(
         L"版、識別子、Microsoft公式案内、またはADK bootstrap内EULAの範囲・member・Hash固定値が不正です");
-  }
-  if (!manifest.unattended_install_no_unexpected_restart_confirmed) {
-    return invalid_manifest(
-        L"ADK quiet導入が予期しない自動再起動を行わないことを、現在のMicrosoft一次資料または制御VM実挙動で確認できていません");
   }
   const auto order = required_payload_order();
   if (manifest.payloads.size() != order.size()) {

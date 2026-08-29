@@ -245,13 +245,23 @@ clonecore::Result<ShrinkSourceAnalysis> analyze_candidates(
   std::vector<diskmodel::VolumePartitionLocation> locations;
   locations.reserve(candidates.size());
   for (const auto& partition : candidates) {
-    locations.push_back(diskmodel::VolumePartitionLocation{
-        .table_index = partition.table_index,
-        .offset_bytes = partition.offset_bytes,
-    });
+    const auto boot = read_partition_boot(reader, partition);
+    if (!boot) {
+      return clonecore::Result<ShrinkSourceAnalysis>::failure(boot.error());
+    }
+    const auto ntfs = clonecore::parse_ntfs_geometry(
+        boot.value(), reader.logical_sector_size(), partition.size_bytes);
+    if (ntfs) {
+      locations.push_back(diskmodel::VolumePartitionLocation{
+          .table_index = partition.table_index,
+          .offset_bytes = partition.offset_bytes,
+      });
+    }
   }
-  const auto bindings = diskmodel::query_windows_volume_bindings_by_offset(
-      disk, locations);
+  auto bindings = locations.empty()
+      ? clonecore::Result<std::vector<clonecore::VolumeBitmapBinding>>::success(
+            {})
+      : diskmodel::query_windows_volume_bindings_by_offset(disk, locations);
   if (!bindings) {
     return clonecore::Result<ShrinkSourceAnalysis>::failure(bindings.error());
   }
@@ -322,6 +332,27 @@ clonecore::Result<ShrinkSourceAnalysis> analyze_candidates(
       .partitions = fixed_partitions,
   };
   for (const auto& candidate : candidates) {
+    const auto boot = read_partition_boot(reader, candidate);
+    if (!boot) {
+      return clonecore::Result<ShrinkSourceAnalysis>::failure(boot.error());
+    }
+    const auto ntfs = clonecore::parse_ntfs_geometry(
+        boot.value(), reader.logical_sector_size(), candidate.size_bytes);
+    if (!ntfs) {
+      analysis.partitions.push_back(AnalyzedShrinkPartition{
+          .source_table_index = candidate.table_index,
+          .role = candidate.role,
+          .file_system = migrationcore::MigrationFileSystem::unsupported,
+          .source_offset_bytes = candidate.offset_bytes,
+          .source_size_bytes = candidate.size_bytes,
+          .used_bytes = candidate.size_bytes,
+          .active = candidate.active,
+          .name = candidate.name,
+          .type_id = candidate.type_id,
+          .unique_id = candidate.unique_id,
+      });
+      continue;
+    }
     const auto binding = std::find_if(
         bindings.value().begin(),
         bindings.value().end(),
@@ -334,15 +365,6 @@ clonecore::Result<ShrinkSourceAnalysis> analyze_candidates(
           ERROR_NOT_FOUND,
           L"縮小移行ボリューム対応",
           L"パーティションに対応するVolume GUIDがありません");
-    }
-    const auto boot = read_partition_boot(reader, candidate);
-    if (!boot) {
-      return clonecore::Result<ShrinkSourceAnalysis>::failure(boot.error());
-    }
-    const auto ntfs = clonecore::parse_ntfs_geometry(
-        boot.value(), reader.logical_sector_size(), candidate.size_bytes);
-    if (!ntfs) {
-      return clonecore::Result<ShrinkSourceAnalysis>::failure(ntfs.error());
     }
     const auto facts =
         query_volume_facts(binding->volume_device_path, candidate.size_bytes);
@@ -503,11 +525,17 @@ analyze_gpt_shrink_source_with_windows_apis(
           .unique_id = guid_bytes(partition.unique_guid),
       });
     } else {
-      return failure<ShrinkSourceAnalysis>(
-          clonecore::ErrorCode::unsupported_layout,
-          ERROR_NOT_SUPPORTED,
-          L"縮小移行GPT種別",
-          L"未対応のGPTパーティション種別があります");
+      fixed.push_back(AnalyzedShrinkPartition{
+          .source_table_index = table_index,
+          .role = migrationcore::MigrationPartitionRole::data,
+          .file_system = migrationcore::MigrationFileSystem::unsupported,
+          .source_offset_bytes = offset.value(),
+          .source_size_bytes = size.value(),
+          .used_bytes = size.value(),
+          .name = widen_gpt_name(partition.name),
+          .type_id = guid_bytes(partition.type_guid),
+          .unique_id = guid_bytes(partition.unique_guid),
+      });
     }
   }
   return analyze_candidates(
@@ -540,12 +568,13 @@ analyze_mbr_shrink_source_with_windows_apis(
   }
   std::vector<PartitionCandidate> candidates;
   for (const auto& partition : layout.partitions) {
-    if (partition.type != 0x07U && partition.type != 0x27U) {
+    if (partition.type == 0U || partition.type == 0x05U ||
+        partition.type == 0x0FU || partition.type == 0x85U) {
       return failure<ShrinkSourceAnalysis>(
           clonecore::ErrorCode::unsupported_layout,
           ERROR_NOT_SUPPORTED,
           L"縮小移行MBR種別",
-          L"基本NTFSまたはWindows回復領域以外のMBR領域があります");
+          L"空種別または拡張partitionを含むMBR layoutは安全に単一基本領域として扱えません");
     }
     const auto offset = checked_bytes(
         partition.first_lba, layout.logical_sector_size, L"縮小移行MBR開始");
@@ -559,7 +588,8 @@ analyze_mbr_shrink_source_with_windows_apis(
         .table_index = static_cast<std::uint32_t>(partition.table_index) + 1U,
         .role = partition.type == 0x27U
             ? migrationcore::MigrationPartitionRole::recovery
-            : partition.active && context.source_identity.is_system_disk
+            : partition.type == 0x07U && partition.active &&
+                    context.source_identity.is_system_disk
                   ? migrationcore::MigrationPartitionRole::bios_system
                   : migrationcore::MigrationPartitionRole::data,
         .offset_bytes = offset.value(),

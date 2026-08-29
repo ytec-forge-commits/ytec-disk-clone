@@ -1052,6 +1052,12 @@ void test_fast_create_reports_selected_verification_without_complete_claim() {
   check(
       !selected_tsumugi_creation_verification_passed(inconsistent),
       "the shared gate must reject a fast report that claims an omitted complete scan");
+  auto strengthened = created.value();
+  strengthened.complete_verification_passed = true;
+  strengthened.stream.final_complete_scan_performed = true;
+  check(
+      selected_tsumugi_creation_verification_passed(strengthened),
+      "the shared gate must accept a fast selection strengthened by persistent final complete verification");
   inconsistent = created.value();
   inconsistent.stream.all_chunks_authenticated_and_hashed = false;
   check(

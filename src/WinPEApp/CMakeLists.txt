@@ -6,8 +6,10 @@ add_library(
     src/automatic_boot_repair_ui.cpp
     src/clone_execution_readiness.cpp
     src/clone_execution_service.cpp
+    src/completion_power_ui.cpp
     src/dashboard.cpp
     src/direct_image_create.cpp
+    src/direct_image_create_resume.cpp
     src/direct_image_restore.cpp
     src/direct_shrink_image_restore.cpp
     src/direct_image_restore_resume.cpp
@@ -16,8 +18,11 @@ add_library(
     src/image_create_ui.cpp
     src/image_restore_ui.cpp
     src/mbr2gpt_direct_execution_service.cpp
+    src/offline_ntfs_direct_shrink_clone.cpp
+    src/offline_ntfs_direct_shrink_product.cpp
     src/product_io_policy.cpp
     src/repair_layout.cpp
+    src/resume_slot_admission.cpp
     src/rescue_clone.cpp
     src/tsumugi_password_ui.cpp
     src/winre_diagnostic_view.cpp
@@ -37,9 +42,11 @@ target_link_libraries(
     ytec::boot_repair
     ytec::cli_tools
     ytec::disk_model
+    ytec::direct_shrink_target
     ytec::image_format
     ytec::operation_core
     ytec::windows_shrink_restore
+    ytec::windows_shrink_analysis
   PRIVATE
     Advapi32
     Ole32
@@ -85,7 +92,9 @@ add_executable(
 target_link_libraries(
   ytec-winpe-gui
   PRIVATE
+    Advapi32
     Comdlg32
+    Comctl32
     ytec::winpe_app_logic
     ytec::ui_support
 )
@@ -114,7 +123,9 @@ add_executable(
 target_link_libraries(
   ytec-winpe-gui-ui-acceptance
   PRIVATE
+    Advapi32
     Comdlg32
+    Comctl32
     ytec::winpe_app_logic
     ytec::ui_support
 )
@@ -129,3 +140,11 @@ target_compile_definitions(
 )
 
 ytec_configure_target(ytec-winpe-gui-ui-acceptance)
+
+if(MSVC AND YTEC_ENABLE_MSVC_ANALYZE)
+  # Windows SDK 10.0.26100 applies a value-incompatible SAL annotation to
+  # RegOpenKeyExW parameter 3. Keep this SDK-only false-positive suppression
+  # scoped to the two GUI translation units which perform the MiniNT gate.
+  target_compile_options(ytec-winpe-gui PRIVATE /wd6553)
+  target_compile_options(ytec-winpe-gui-ui-acceptance PRIVATE /wd6553)
+endif()

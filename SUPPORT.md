@@ -1,9 +1,10 @@
 # Support
 
-Y-TEC Tsumugi Drive is currently the `0.2.0-dev` development preview targeting
-1.0.0. Representative hardware, real USB, real-boot, and final distribution
-acceptance are incomplete. There is no supported stable release and no support
-response-time guarantee.
+Y-TEC Tsumugi Drive is a personally developed open-source project, not
+company-internal software. It is currently the `1.0.0-internal-beta`
+pre-release validation candidate, not a stable 1.0.0 release. Representative hardware, real USB,
+real-boot, and final distribution acceptance are incomplete. There is no
+supported stable release and no support response-time guarantee.
 
 日本語または英語で連絡できます。
 

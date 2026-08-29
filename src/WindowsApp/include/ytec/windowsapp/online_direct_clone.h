@@ -8,6 +8,7 @@
 #include "ytec/imageformat/sha256.h"
 #include "ytec/vssrequester/snapshot_reader.h"
 #include "ytec/vssrequester/windows_backend.h"
+#include "ytec/vssrequester/windows_diff_area_observer.h"
 #include "ytec/vssrequester/workflow.h"
 
 #include <cstddef>
@@ -41,6 +42,7 @@ struct OnlineDirectCloneRequest final {
   std::size_t maximum_chunk_bytes{1024U * 1024U};
   vssrequester::AsyncWaitOptions async_wait;
   clonecore::DiskOperationCallbacks callbacks;
+  vssrequester::VssDiffAreaReviewCallback diff_area_review_callback;
   const clonecore::Logger* logger{};
 };
 
@@ -51,10 +53,28 @@ struct OnlineDirectSnapshotPartition final {
   std::wstring volume_guid_path;
 };
 
+enum class OnlineDirectLockedFileSystem : std::uint8_t {
+  fat32,
+  exfat,
+};
+
+// FAT32/exFAT do not have the VSS consistency contract used for NTFS.  A
+// Windows exact clone may include them only while this exact single-extent
+// Volume GUID is exclusively locked and retained for the complete copy.
+struct OnlineDirectLockedPartition final {
+  std::uint32_t partition_index{};
+  std::uint64_t disk_offset{};
+  std::uint64_t length{};
+  std::wstring volume_guid_path;
+  OnlineDirectLockedFileSystem file_system{
+      OnlineDirectLockedFileSystem::fat32};
+};
+
 struct OnlineDirectSourceLayout final {
   OnlineDirectClonePartitionStyle partition_style{
       OnlineDirectClonePartitionStyle::gpt};
   std::vector<OnlineDirectSnapshotPartition> snapshot_partitions;
+  std::vector<OnlineDirectLockedPartition> locked_partitions;
   std::vector<clonecore::ByteRange> static_physical_ranges;
 };
 
@@ -63,6 +83,26 @@ struct OnlineDirectSnapshotReader final {
   std::uint64_t disk_offset{};
   std::uint64_t length{};
   std::unique_ptr<clonecore::ISourceDiskReader> reader;
+};
+
+struct OnlineDirectLockedReader final {
+  std::uint32_t partition_index{};
+  std::uint64_t disk_offset{};
+  std::uint64_t length{};
+  OnlineDirectLockedFileSystem file_system{
+      OnlineDirectLockedFileSystem::fat32};
+  std::unique_ptr<clonecore::ISourceDiskReader> reader;
+};
+
+struct OnlineDirectLockedVolumeOpenRequest final {
+  std::uint32_t physical_disk_number{};
+  std::uint32_t partition_index{};
+  std::uint64_t disk_offset{};
+  std::uint64_t length{};
+  std::uint32_t logical_sector_size{};
+  std::wstring volume_guid_path;
+  OnlineDirectLockedFileSystem expected_file_system{
+      OnlineDirectLockedFileSystem::fat32};
 };
 
 // Parses and classifies one freshly opened, read-only Windows source. Every
@@ -83,6 +123,25 @@ make_online_direct_composite_reader(
     const clonecore::ISourceDiskReader* read_only_physical_source,
     std::vector<OnlineDirectSnapshotReader> snapshot_readers,
     std::vector<clonecore::ByteRange> static_physical_ranges);
+
+// Extended route used by the product controller.  Every locked reader owns a
+// retained exclusive OS volume-lock lease; destroying the composite releases
+// it.
+[[nodiscard]] clonecore::Result<
+    std::unique_ptr<clonecore::ISourceDiskReader>>
+make_online_direct_composite_reader(
+    const clonecore::ISourceDiskReader* read_only_physical_source,
+    std::vector<OnlineDirectSnapshotReader> snapshot_readers,
+    std::vector<OnlineDirectLockedReader> locked_readers,
+    std::vector<clonecore::ByteRange> static_physical_ranges);
+
+// Opens a canonical Volume GUID read-only, proves one exact physical extent,
+// obtains an exclusive volume lock, and re-identifies FAT32/exFAT through the
+// same retained handle before returning a bounded partition reader.
+[[nodiscard]] clonecore::Result<
+    std::unique_ptr<clonecore::ISourceDiskReader>>
+open_locked_file_system_volume_with_windows_apis(
+    const OnlineDirectLockedVolumeOpenRequest& request);
 
 struct OnlineDirectCloneEngineReport final {
   std::uint64_t copied_data_bytes{};
@@ -116,6 +175,9 @@ struct OnlineDirectCloneReport final {
   bool partition_table_committed{};
   bool snapshot_backup_completed{};
   bool snapshots_deleted{};
+  bool used_vss_snapshot{};
+  std::uint32_t locked_volume_count{};
+  bool source_consistency_verified{};
   bool target_left_offline{};
   // Phase-one backend truth: the native clone engine verifies disk data, but
   // the BCD fresh-rebuild transaction is a separate controller connection.
@@ -161,6 +223,10 @@ using OnlineDirectSnapshotReaderOpener = std::function<clonecore::Result<
     std::unique_ptr<clonecore::ISourceDiskReader>>(
     const vssrequester::SnapshotVolumeOpenRequest&)>;
 
+using OnlineDirectLockedVolumeOpener = std::function<clonecore::Result<
+    std::unique_ptr<clonecore::ISourceDiskReader>>(
+    const OnlineDirectLockedVolumeOpenRequest&)>;
+
 using OnlineDirectBitmapProviderFactory = std::function<clonecore::Result<
     std::unique_ptr<clonecore::INtfsUsedRangeProvider>>(
     std::vector<clonecore::SnapshotVolumeBitmapBinding>)>;
@@ -205,6 +271,7 @@ struct OnlineDirectCloneDependencies final {
   OnlineDirectMbrBindingQuery query_mbr_bindings;
   OnlineDirectSnapshotWorkflowRunner run_snapshot_workflow;
   OnlineDirectSnapshotReaderOpener open_snapshot_reader;
+  OnlineDirectLockedVolumeOpener open_locked_volume;
   OnlineDirectBitmapProviderFactory make_snapshot_bitmap_provider;
   OnlineDirectCloneTargetOfflineSetter set_clone_target_offline;
   OnlineDirectPhysicalTargetOfflineSetter set_physical_target_offline;
@@ -212,6 +279,8 @@ struct OnlineDirectCloneDependencies final {
   OnlineDirectMbrSignatureCollector collect_mbr_signatures;
   OnlineDirectCloneEngine execute_clone_engine;
   OnlineDirectBootFinalizer finalize_target_boot;
+  vssrequester::WindowsVssDiffAreaOperationMonitorFactory
+      make_diff_area_monitor;
 };
 
 // Product dependency adapter shared by the direct controller and the common

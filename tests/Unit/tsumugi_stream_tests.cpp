@@ -1,5 +1,6 @@
 #include "ytec/imageformat/sha256.h"
 #include "ytec/imageformat/tsumugi.h"
+#include "ytec/imageformat/tsumugi_create_resume.h"
 #include "ytec/imageformat/tsumugi_stream.h"
 
 #include <Windows.h>
@@ -12,8 +13,10 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -444,6 +447,162 @@ ytec::imageformat::TsumugiStreamBuildRequest stream_request(
     request.encryption = encryption_settings();
   }
   return request;
+}
+
+ytec::imageformat::TsumugiCreateResumeBindingV1 resume_binding() {
+  ytec::imageformat::TsumugiCreateResumeBindingV1 binding{};
+  for (std::size_t index = 0U; index < binding.operation_id.size(); ++index) {
+    binding.operation_id[index] = static_cast<std::byte>(0x10U + index);
+  }
+  const auto fill_digest = [](auto& digest, const std::uint8_t seed) {
+    for (std::size_t index = 0U; index < digest.size(); ++index) {
+      digest[index] = static_cast<std::byte>(seed + index);
+    }
+  };
+  fill_digest(binding.plan_hash, 0x20U);
+  fill_digest(binding.source_identity_hash, 0x40U);
+  fill_digest(binding.source_state_hash, 0x60U);
+  fill_digest(binding.destination_storage_identity_hash, 0x80U);
+  fill_digest(binding.output_identity_hash, 0xA0U);
+  return binding;
+}
+
+class ResumeCheckpointHarness final {
+ public:
+  [[nodiscard]] ytec::imageformat::TsumugiCreateResumeCheckpointHooksV1
+  hooks() {
+    return {
+        .create_before_first_mutation =
+            [this](
+                const auto& paths,
+                const auto& binding,
+                const auto& progress) {
+              try {
+                const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE |
+                    FILE_SHARE_DELETE;
+                saw_two_empty_create_objects =
+                    read_file(paths.image_partial_path, share).empty() &&
+                    read_file(paths.journal_path, share).empty();
+              } catch (...) {
+                return ytec::clonecore::Status::failure(test_error(
+                    L"合成resume checkpoint create",
+                    L"create callbackからowned objectを確認できません"));
+              }
+              paths_ = paths;
+              binding_ = binding;
+              current = progress;
+              ++create_calls;
+              if (fail_create_after_record) {
+                return ytec::clonecore::Status::failure(test_error(
+                    L"合成resume checkpoint create",
+                    L"永続化後の読戻し失敗を注入しました"));
+              }
+              return ytec::clonecore::success_status();
+            },
+        .prove_existing_before_resume =
+            [this](
+                const auto& paths,
+                const auto& binding,
+                const auto& progress) {
+              ++prove_calls;
+              if (reject_proof || !current.has_value() ||
+                  paths.image_partial_path != paths_.image_partial_path ||
+                  paths.journal_path != paths_.journal_path ||
+                  binding != binding_ || progress != *current) {
+                return ytec::clonecore::Status::failure(test_error(
+                    L"合成resume checkpoint proof",
+                    L"source state、出力objectまたはcheckpoint束縛が一致しません"));
+              }
+              return ytec::clonecore::success_status();
+            },
+        .replace_after_verified_prefix =
+            [this](const auto& before, const auto& after) {
+              ++replace_calls;
+              if (!current.has_value() || before != *current) {
+                return ytec::clonecore::Status::failure(test_error(
+                    L"合成resume checkpoint replace",
+                    L"before revisionが現在値と一致しません"));
+              }
+              if (fail_replace_once ||
+                  (fail_replace_at_verified_chunk.has_value() &&
+                   after.verified_chunk_count ==
+                       *fail_replace_at_verified_chunk)) {
+                fail_replace_once = false;
+                fail_replace_at_verified_chunk.reset();
+                return ytec::clonecore::Status::failure(test_error(
+                    L"合成resume checkpoint replace",
+                    L"crash前のreplace失敗を注入しました"));
+              }
+              current = after;
+              return ytec::clonecore::success_status();
+            },
+    };
+  }
+
+  std::optional<ytec::imageformat::TsumugiCreateResumeProgressV1> current;
+  bool saw_two_empty_create_objects{};
+  bool fail_create_after_record{};
+  bool reject_proof{};
+  bool fail_replace_once{};
+  std::optional<std::uint64_t> fail_replace_at_verified_chunk;
+  std::size_t create_calls{};
+  std::size_t prove_calls{};
+  std::size_t replace_calls{};
+
+ private:
+  ytec::imageformat::TsumugiCreateResumeOwnedPathsV1 paths_;
+  ytec::imageformat::TsumugiCreateResumeBindingV1 binding_;
+};
+
+ytec::imageformat::TsumugiCreateResumeRequestV1 resume_request(
+    ytec::imageformat::TsumugiStreamBuildRequest stream,
+    ResumeCheckpointHarness& checkpoint,
+    const std::optional<
+        ytec::imageformat::TsumugiCreateResumeProgressV1> expected =
+        std::nullopt) {
+  return ytec::imageformat::TsumugiCreateResumeRequestV1{
+      .stream = std::move(stream),
+      .binding = resume_binding(),
+      .expected_progress = expected,
+      .checkpoint = checkpoint.hooks(),
+  };
+}
+
+ytec::imageformat::Sha256Digest resume_test_domain_hash(
+    const std::string_view domain,
+    const std::span<const std::byte> bytes) {
+  std::vector<std::byte> canonical;
+  canonical.reserve(domain.size() + bytes.size());
+  for (const char value : domain) {
+    canonical.push_back(static_cast<std::byte>(value));
+  }
+  canonical.insert(canonical.end(), bytes.begin(), bytes.end());
+  const auto digest = ytec::imageformat::sha256(canonical);
+  check(digest.has_value(), "resume test domain hash should succeed");
+  return digest.value();
+}
+
+void refresh_resume_journal_header_hashes(
+    const std::span<std::byte> journal) {
+  check(journal.size() >= 512U, "resume journal header fixture is too short");
+  auto header = journal.first(512U);
+  std::fill(header.begin() + 400U, header.begin() + 464U, std::byte{0});
+  const auto root = resume_test_domain_hash(
+      "YTEC-TSUMUGI-CREATE-RESUME-ROOT-V1", header);
+  std::copy(root.begin(), root.end(), header.begin() + 400U);
+  std::fill(header.begin() + 432U, header.begin() + 464U, std::byte{0});
+  const auto header_hash = resume_test_domain_hash(
+      "YTEC-TSUMUGI-CREATE-RESUME-HEADER-V1", header);
+  std::copy(header_hash.begin(), header_hash.end(), header.begin() + 432U);
+}
+
+void refresh_resume_journal_frame_chain(
+    const std::span<std::byte> frame) {
+  check(frame.size() == 240U, "resume journal frame fixture size mismatch");
+  std::fill(frame.begin() + 200U, frame.begin() + 232U, std::byte{0});
+  const auto chain = resume_test_domain_hash(
+      "YTEC-TSUMUGI-CREATE-RESUME-FRAME-V1", frame);
+  std::copy(chain.begin(), chain.end(), frame.begin() + 200U);
 }
 
 ytec::imageformat::TsumugiBuildRequest memory_request(
@@ -1201,6 +1360,317 @@ void test_staged_commit_retains_final_path_lock() {
         "delayed commit must release the final-file guard");
 }
 
+void test_resume_exact_reuses_verified_prefix_and_finishes_commit_ready() {
+  TempDirectory temp;
+  MemorySource source(source_bytes());
+  const std::wstring path = temp.file(L"resume-exact.tsumugi");
+  ResumeCheckpointHarness checkpoint;
+  auto first_request = resume_request(
+      stream_request(path, source), checkpoint);
+  const auto interrupted =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          first_request,
+          ytec::clonecore::DiskOperationCallbacks{
+              .safe_boundary = [](const auto& boundary) {
+                if (boundary.kind == ytec::clonecore::
+                        DiskOperationSafeBoundaryKind::verified_chunk &&
+                    boundary.stage ==
+                        ytec::clonecore::DiskOperationStage::copying_data &&
+                    boundary.completed_units == 1U) {
+                  return ytec::clonecore::DiskOperationControlDecision::
+                      cancel_operation;
+                }
+                return ytec::clonecore::DiskOperationControlDecision::
+                    continue_operation;
+              },
+          });
+  check(!interrupted.has_value() &&
+            interrupted.error().code ==
+                ytec::clonecore::ErrorCode::cancelled &&
+            checkpoint.current.has_value() &&
+            checkpoint.current->phase == ytec::imageformat::
+                TsumugiCreateResumePhaseV1::prepared &&
+            checkpoint.current->verified_chunk_count == 1U &&
+            checkpoint.saw_two_empty_create_objects &&
+            checkpoint.create_calls == 1U && source.read_count == 1U,
+        "new resume create must durably bind two empty objects before mutation and stop at one verified chunk");
+  const std::wstring partial = path + L".partial";
+  const std::wstring journal = path + L".resume-journal.partial";
+  check(path_exists(partial) && path_exists(journal) && !path_exists(path),
+        "cancelled persistent create must retain only owned private files");
+
+  const auto journal_before = read_file(journal);
+  const auto inspected_before =
+      ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+          journal_before);
+  check(inspected_before.has_value() &&
+            inspected_before.value().chunks.size() == 1U,
+        "interrupted journal must be independently parseable");
+  const auto partial_before = read_file(partial);
+  const std::size_t payload_begin = static_cast<std::size_t>(
+      inspected_before.value().header.payload_offset);
+  const std::size_t durable_end = static_cast<std::size_t>(
+      checkpoint.current->primary_output_length);
+  check(payload_begin <= durable_end && durable_end <= partial_before.size(),
+        "durable payload prefix must be within the owned partial");
+  const std::vector<std::byte> durable_payload(
+      partial_before.begin() + static_cast<std::ptrdiff_t>(payload_begin),
+      partial_before.begin() + static_cast<std::ptrdiff_t>(durable_end));
+
+  auto continued_request = resume_request(
+      stream_request(path, source), checkpoint, checkpoint.current);
+  const auto completed =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          continued_request);
+  check(completed.has_value() && completed.value().resumed &&
+            completed.value().commit_ready &&
+            completed.value().complete_partial_verified &&
+            completed.value().reused_verified_chunk_count == 1U &&
+            completed.value().appended_chunk_count == 2U &&
+            completed.value().progress.phase == ytec::imageformat::
+                TsumugiCreateResumePhaseV1::commit_ready &&
+            checkpoint.prove_calls == 1U && source.read_count == 2U,
+        "resume must re-read/authenticate the durable prefix and read only source suffix chunks");
+  const auto partial_after = read_file(partial);
+  check(partial_after.size() >= durable_end &&
+            std::equal(
+                durable_payload.begin(),
+                durable_payload.end(),
+                partial_after.begin() +
+                    static_cast<std::ptrdiff_t>(payload_begin)),
+        "resume must not rewrite the previously verified payload prefix");
+  const auto independently_verified = ytec::imageformat::inspect_tsumugi_v1(
+      partial_after);
+  check(independently_verified.has_value() &&
+            independently_verified.value().all_chunks_verified &&
+            independently_verified.value().global_hash_verified &&
+            !path_exists(path),
+        "commit-ready partial must be a complete v1 image while final name remains untouched");
+}
+
+void test_resume_password_and_source_proof_fail_without_mutation() {
+  TempDirectory temp;
+  MemorySource source(source_bytes());
+  const std::wstring path = temp.file(L"resume-encrypted.tsumugi");
+  ResumeCheckpointHarness checkpoint;
+  auto first_request = resume_request(
+      stream_request(path, source, true), checkpoint);
+  const auto interrupted =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          first_request,
+          ytec::clonecore::DiskOperationCallbacks{
+              .safe_boundary = [](const auto& boundary) {
+                return boundary.kind == ytec::clonecore::
+                               DiskOperationSafeBoundaryKind::verified_chunk &&
+                        boundary.stage == ytec::clonecore::
+                                DiskOperationStage::copying_data &&
+                        boundary.completed_units == 1U
+                    ? ytec::clonecore::DiskOperationControlDecision::
+                          cancel_operation
+                    : ytec::clonecore::DiskOperationControlDecision::
+                          continue_operation;
+              },
+          });
+  check(!interrupted.has_value() && checkpoint.current.has_value(),
+        "encrypted resume fixture should stop after one durable chunk");
+  const std::wstring partial = path + L".partial";
+  const std::wstring journal = path + L".resume-journal.partial";
+  const auto partial_before = read_file(partial);
+  const auto journal_before = read_file(journal);
+  const auto checkpoint_before = *checkpoint.current;
+
+  auto wrong_stream = stream_request(path, source, true);
+  wrong_stream.encryption->password = "Definitely wrong 99!";
+  auto wrong_request = resume_request(
+      std::move(wrong_stream), checkpoint, checkpoint.current);
+  const auto wrong = ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+      wrong_request);
+  check(!wrong.has_value() && read_file(partial) == partial_before &&
+            read_file(journal) == journal_before &&
+            *checkpoint.current == checkpoint_before,
+        "wrong re-entered password must reject the authenticated prefix without mutation");
+
+  checkpoint.reject_proof = true;
+  auto changed_source_request = resume_request(
+      stream_request(path, source, true), checkpoint, checkpoint.current);
+  const auto changed_source =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          changed_source_request);
+  check(!changed_source.has_value() && read_file(partial) == partial_before &&
+            read_file(journal) == journal_before &&
+            *checkpoint.current == checkpoint_before,
+        "changed source-state proof must fail before reading/truncating owned objects");
+
+  checkpoint.reject_proof = false;
+  auto correct_request = resume_request(
+      stream_request(path, source, true), checkpoint, checkpoint.current);
+  const auto completed =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(correct_request);
+  check(completed.has_value() && completed.value().commit_ready &&
+            completed.value().stream.final_complete_scan_performed,
+        "correct password re-entry must permit full commit-ready verification");
+}
+
+void test_resume_recovers_only_uncommitted_suffix_after_replace_failure() {
+  TempDirectory temp;
+  MemorySource source(source_bytes());
+  const std::wstring path = temp.file(L"resume-replace-failure.tsumugi");
+  ResumeCheckpointHarness checkpoint;
+  checkpoint.fail_replace_at_verified_chunk = 1U;
+  auto first_request = resume_request(
+      stream_request(path, source), checkpoint);
+  const auto failed = ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+      first_request);
+  check(!failed.has_value() && checkpoint.current.has_value() &&
+            checkpoint.current->verified_chunk_count == 0U &&
+            path_exists(path + L".partial") &&
+            path_exists(path + L".resume-journal.partial") &&
+            read_file(path + L".partial").size() >
+                checkpoint.current->primary_output_length &&
+            read_file(path + L".resume-journal.partial").size() >
+                checkpoint.current->journal_length,
+        "checkpoint replace failure must retain an uncommitted suffix without advancing durable progress");
+
+  auto continued_request = resume_request(
+      stream_request(path, source), checkpoint, checkpoint.current);
+  const auto completed =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          continued_request);
+  check(completed.has_value() && completed.value().commit_ready &&
+            completed.value().reused_verified_chunk_count == 0U &&
+            completed.value().appended_chunk_count == 3U &&
+            source.read_count == 3U,
+        "resume must verify the durable prefix, truncate only the uncommitted suffix, and rebuild it");
+}
+
+void test_resume_ambiguous_initial_checkpoint_failure_retains_objects() {
+  TempDirectory temp;
+  MemorySource source(source_bytes());
+  const std::wstring path = temp.file(L"resume-ambiguous-create.tsumugi");
+  ResumeCheckpointHarness checkpoint;
+  checkpoint.fail_create_after_record = true;
+  auto request = resume_request(stream_request(path, source), checkpoint);
+
+  const auto failed = ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+      request);
+  check(!failed.has_value() && checkpoint.current.has_value() &&
+            checkpoint.current->phase == ytec::imageformat::
+                TsumugiCreateResumePhaseV1::preparing &&
+            checkpoint.saw_two_empty_create_objects &&
+            path_exists(path + L".partial") &&
+            path_exists(path + L".resume-journal.partial") &&
+            read_file(path + L".partial").empty() &&
+            read_file(path + L".resume-journal.partial").empty() &&
+            source.read_count == 0U,
+        "a persistence-ambiguous initial checkpoint failure must retain both exact empty objects without source reads");
+}
+
+void test_resume_journal_parser_rejects_bounded_untrusted_shapes() {
+  TempDirectory temp;
+  MemorySource source(source_bytes());
+  const std::wstring path = temp.file(L"resume-parser.tsumugi");
+  ResumeCheckpointHarness checkpoint;
+  auto request = resume_request(stream_request(path, source), checkpoint);
+  const auto interrupted =
+      ytec::imageformat::prepare_resumable_tsumugi_file_v1(
+          request,
+          ytec::clonecore::DiskOperationCallbacks{
+              .safe_boundary = [](const auto& boundary) {
+                return boundary.kind == ytec::clonecore::
+                               DiskOperationSafeBoundaryKind::verified_chunk &&
+                        boundary.stage == ytec::clonecore::
+                                DiskOperationStage::copying_data &&
+                        boundary.completed_units == 2U
+                    ? ytec::clonecore::DiskOperationControlDecision::
+                          cancel_operation
+                    : ytec::clonecore::DiskOperationControlDecision::
+                          continue_operation;
+              },
+          });
+  check(!interrupted.has_value() && checkpoint.current.has_value() &&
+            checkpoint.current->verified_chunk_count == 2U,
+        "parser test fixture must contain two chained records");
+  const auto valid = read_file(path + L".resume-journal.partial");
+  check(ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(valid)
+            .has_value(),
+        "resume journal fixture must be valid before negative mutations");
+
+  auto truncated = valid;
+  truncated.pop_back();
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             truncated)
+             .has_value(),
+        "truncated frame must fail closed");
+
+  const std::vector<std::byte> oversize(
+      ytec::imageformat::kTsumugiCreateResumeJournalMaximumBytes + 1U,
+      std::byte{0});
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             oversize)
+             .has_value(),
+        "journal above fixed maximum size must reject before parsing");
+
+  auto unknown_version = valid;
+  write_little<std::uint16_t>(unknown_version, 10U, 1U);
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             unknown_version)
+             .has_value(),
+        "unknown journal minor version must fail closed");
+
+  auto count_overflow = valid;
+  write_little<std::uint64_t>(
+      count_overflow,
+      48U,
+      ytec::imageformat::kTsumugiCreateResumeJournalMaximumRecords + 1U);
+  refresh_resume_journal_header_hashes(count_overflow);
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             count_overflow)
+             .has_value(),
+        "record count above fixed allocation bound must fail closed");
+
+  auto duplicate_index = valid;
+  write_little<std::uint64_t>(duplicate_index, 512U + 240U + 16U, 0U);
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             duplicate_index)
+             .has_value(),
+        "duplicate record key/index must fail closed");
+
+  auto chain_mismatch = valid;
+  chain_mismatch[512U + 168U] ^= std::byte{1U};
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             chain_mismatch)
+             .has_value(),
+        "previous-chain mismatch must fail closed");
+
+  auto length_overflow = valid;
+  write_little<std::uint64_t>(
+      length_overflow,
+      512U + 48U,
+      (std::numeric_limits<std::uint64_t>::max)());
+  refresh_resume_journal_frame_chain(
+      std::span<std::byte>(length_overflow).subspan(512U, 240U));
+  check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+             length_overflow)
+             .has_value(),
+        "stored-length overflow must fail closed before range use");
+
+  std::uint64_t state = 0x59544543524A4E4CULL;
+  for (std::size_t sample = 0U; sample < 128U; ++sample) {
+    const std::size_t length = 512U + (sample * 37U) % 721U;
+    std::vector<std::byte> random(length);
+    for (auto& value : random) {
+      state ^= state << 13U;
+      state ^= state >> 7U;
+      state ^= state << 17U;
+      value = static_cast<std::byte>(state & 0xFFU);
+    }
+    check(!ytec::imageformat::inspect_tsumugi_create_resume_journal_v1(
+               random)
+               .has_value(),
+          "deterministic random journal bytes must fail closed");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1243,6 +1713,16 @@ int main() {
        test_staged_abort_preserves_existing_final},
       {"staged_commit_retains_final_path_lock",
        test_staged_commit_retains_final_path_lock},
+      {"resume_exact_reuses_verified_prefix_and_finishes_commit_ready",
+       test_resume_exact_reuses_verified_prefix_and_finishes_commit_ready},
+      {"resume_password_and_source_proof_fail_without_mutation",
+       test_resume_password_and_source_proof_fail_without_mutation},
+      {"resume_recovers_only_uncommitted_suffix_after_replace_failure",
+       test_resume_recovers_only_uncommitted_suffix_after_replace_failure},
+      {"resume_ambiguous_initial_checkpoint_failure_retains_objects",
+       test_resume_ambiguous_initial_checkpoint_failure_retains_objects},
+      {"resume_journal_parser_rejects_bounded_untrusted_shapes",
+       test_resume_journal_parser_rejects_bounded_untrusted_shapes},
   };
 
   int failures = 0;

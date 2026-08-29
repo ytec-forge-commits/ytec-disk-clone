@@ -54,6 +54,12 @@ struct SnapshotImagePlanOptions final {
   std::size_t verification_block_bytes{1024U * 1024U};
   std::vector<std::byte> manifest;
   std::vector<std::byte> partition_table_snapshot;
+  // Empty preserves the legacy whole-disk plan. Otherwise these are the
+  // canonical zero-based GPT entry/MBR table indexes whose contents may be
+  // read. The planner still revalidates the complete partition table, but it
+  // must not probe boot sectors or create VSS/raw readers for unselected
+  // entries.
+  std::vector<std::uint32_t> selected_partition_entry_indices;
 };
 
 struct PreparedSnapshotImagePlan final {

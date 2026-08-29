@@ -1,6 +1,6 @@
 # Y-TEC Tsumugi Drive v2 実装状況
 
-更新日: 2026-08-11
+更新日: 2026-08-28
 
 基準: `DiskClone_Development_Spec.md` v2.0
 
@@ -26,14 +26,27 @@
 | GPT／MBRクローン基盤 | 解析・生成、安定識別、対象無効化、bounded I/O、flush・読戻し、最終commit、取消 | v2直接経路での全モード回帰 | 基盤完了 |
 | Windows直接クローン | VSS Workflow、複数Snapshot、静的領域Reader、通常モードの直接実行基礎、クローン後USBボリューム公開待ちを`ERROR_NOT_FOUND`限定・最大30秒・再識別／状態／配置再検証付きで行う起動確定 | 修正版の実機再試験、2台だけの直接縮小、MBR維持／MBR→GPT、パーティション選択、余剰配分、全異常系 | 接続中 |
 | WinPE直接クローン | PE内でコピー元・コピー先を選ぶ入口、コピー元read-only化、通常モード基礎 | 縮小、変換、選択、媒体候補除外を含む製品VMマトリクス | 接続中 |
-| `.tsumugi` v1 | 512バイト有界ヘッダー、マニフェスト、チャンク、Argon2id、AES-GCM、救出欠損Mapと有限再試行／ゼロ埋め読戻し証跡、所有ローカル一時領域の作成・封印→完全画像検証→破棄→保存先再識別→完成名確定を行うWin32 Adapter、Windows／PEの暗号化UIを含む通常作成・完全検証・ディスク全体復元、既存区画／未割当への個別復元、Windows非systemデータ／PE救出画像UI、現行3 parserの決定論的有界Fuzz、NIC無効VMでの救出画像作成・全ディスク／個別復元 | 縮小移行の実VSS／DISM、Golden corpus／長時間coverage-guided Fuzz、正式OS VM、4Kn／実媒体 | 接続中 |
-| 起動修復 | Microsoft署名検証、BCDBoot `/c`、BCD退避・読戻し・ロールバック、対象ディスク内のWindows／ESP／Active／WinRE読取り専用検出、既存1 Windows＋1 ESPのGPT／UEFIと既存MBR／BIOS直接経路、EFI所有権の開始直前再検査 | 複数Windows／曖昧ESPの選択、ESP／システム領域作成、第三者EFIの保持／削除選択、NVRAM限定修復、WinRE修復、VM／実機受入 | 接続中 |
+| `.tsumugi` v1 | 512バイト有界ヘッダー、マニフェスト、チャンク、Argon2id、AES-GCM、救出欠損Map、通常／縮小／救出の作成・完全検証・全体／個別復元、永続再開境界、Golden corpus、決定論的2,000,176件Fuzz、300秒coverage-guided Fuzz | 正式OS VM、4Kn／実媒体 | リリースゲート |
+| 起動修復 | 対象ディスクだけからWindows／GPT・MBR／ESP・Active／WinRE／第三者EFIを読取り専用診断し、複数Windowsの全件優先順または1件選択、Microsoft署名済みBCDBoot `/c`、BCD退避・読戻し・exact rollback、追加確認付きESP／BIOS system領域作成、第三者EFIの保持または専用immutable-manifest削除、明示したこのPCだけのNVRAM条件付き修復、WinRE再登録または通常起動のみ部分結果までWinPE製品UIへ接続。normal／`/analyze /WX`の合成・source-route試験あり | 実VMでのGPT／MBR起動、複数Windows表示順、第三者EFI共存、NVRAM／WinRE、電断・失敗注入、代表実媒体での起動受入 | リリースゲート |
 | 救出モード | 有限再試行、前方／逆方向／小ブロック、ゼロ埋め、欠損Map、Windows非systemデータ救出、PEシステム／データ救出、安定再識別、保護媒体除外、縮小・変換禁止、`partial_loss`専用表示、所有一時領域Adapter、Windows非systemデータ／PE救出画像UI、合成failure injection、NIC無効VMでの製品作成・完全検証・復元 | PE救出画像の4Kn条件付き経路、実媒体受入 | 接続中 |
 | ADK／WinPE取得 | 導入済み環境の署名・版・更新診断、固定取得物／Hash／署名／版検証、quiet導入、offline layout、削除計画、EULA抽出・同意コントローラーの合成試験 | 完全EULA同意UI、primary pins／無予期再起動ゲート、クリーンVM、製品経路の公式取得・導入・削除 | 接続中 |
 | レスキュー媒体 | ローカルADKからのISO／USB作成、安全なUSB再識別、2011／2023 CA基盤、Portable候補の同梱スクリプト／EXEによるローカルADK preflight | ADK自動取得／導入の製品接続、ADK未導入クリーン環境、実機で失敗した媒体作成のログ付き再試験、4GiB FAT32＋データ領域、検証済みUSB更新、ドライバー選択、最新PE直接メニュー | 接続中 |
 | UI／PortableData | Win32日本語GUI、LINE Seed JP、左ナビ、共通進捗、対象要約、Windows／PEの主要画面、1024×600～1280×720・125～200% DPI、Tab／Enter／Esc／Focusのhost受入、安全境界連動の一時停止／再開ボタン、直接縮小の準備中／非書込み表示、狭幅用の媒体プロファイル表示 | EXE隣`data`の全経路、ログ循環、手動更新、再起動を越える永続再開、実機固有表示 | 接続中 |
 | DeviceHealth | SMART故障予測、NVMe Health Log、温度・閾値の読取り専用取得、異常Target開始禁止、異常Source救出推奨、温度警告のみのUI／再検査、Windows版のバッテリー50%未満確認とAC推奨 | PE版の電源確認、応答parserの追加境界試験、実機対応幅 | 接続中 |
-| リリース | 通常／全target静的解析／ASanの全90 CTest、有界ImageFuzz、安全境界、3依存license、SBOM、媒体preflight境界、host UI、VM製品フロー、0.2.0-dev Portable候補ZIPとHash監査 | Golden／長時間Fuzz、正式OS VM、クリーンADK VM、代表実機、正式版PDF／Web／法務／署名・版監査 | リリースゲート |
+| リリース | 通常／全target静的解析／ASanの全127 CTest、Golden、2種Fuzz、安全境界、3依存license、SBOM、媒体preflight、host UI、Codex Security差分監査、1.0.0-internal-beta Portable候補22ファイルと内外Hash監査 | 正式OS VM、クリーンADK VM、代表実機、Web／法務／署名・公開監査 | リリースゲート |
+
+## 2026-08-28 公開前検証候補監査
+
+- 通常MSVC、`/analyze /WX`、AddressSanitizerの全target buildと各CTest 127/127: PASS
+- `.tsumugi` v1 Golden corpus、決定論的ImageFuzz 2,000,176件、coverage-guided Fuzz
+  3,353,448 runs／301秒: PASS（crash／ASan artifactなし）
+- 安全境界、3依存license、SBOM、製品版、Portable／WinPE媒体境界: PASS
+- Codex Security working-tree差分監査: 108 review items、complete coverage、報告対象0件
+- UI acceptance buildで「移行後の確認」5項目、操作中排他、完了後再有効化、画面遷移後の
+  primary button復元を確認。合成表示であり、実ディスク／実起動の証拠には数えない
+- `1.0.0-internal-beta` Portable候補: 22ファイル、ZIP 16,774,966 bytes、SHA-256
+  `80A49B5BA7EE2443E1044CFC7FD3341B7BC9B14948699BF0B621E4BFF362066B`、Microsoft payload非同梱、未署名、未公開
+- 代表実機、実USB、4Kn、換装後起動、SignPath署名、公開Web監査は未完了
 
 ## 2026-08-10 非実機検証スナップショット
 
@@ -126,9 +139,9 @@ Windows／PE救出画像は実媒体検証が済むまで512バイト論理セ�
 1. 通常／縮小、GPT／MBR、MBR→GPT、Windows／データ専用を正式OS VMの直接経路で再確認する。
 2. ADK取得、PortableData、PE電源確認を製品UIへ接続する。
 3. ADK未導入クリーンVMで取得・同意・導入・媒体・更新・削除を確認する。
-4. Golden corpusを封印し、長時間coverage-guided Fuzzを実行する。
+4. 正式OS VMとADK未導入クリーンVMの残る製品マトリクスを確認する。
 5. 4Kn、物理ディスク、実USB、実機起動と復元後bootを代表実機で受け入れる。
-6. 正式版PDF／Web／利用規約／プライバシー／法務／版番号を監査する。
+6. Web／利用規約／プライバシー／法務／署名／版番号を公開直前に監査する。
 7. ユーザー確認後、意図した差分だけをcommitし、公開GitHub
    `ytec-forge-commits/ytec-disk-clone`へpushする。開発版ソース公開と正式バイナリ公開を区別する。
 

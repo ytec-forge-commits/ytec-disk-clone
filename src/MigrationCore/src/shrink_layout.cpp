@@ -113,7 +113,10 @@ clonecore::Result<std::uint64_t> content_minimum_size(
           L"縮小移行exact RAW最小容量",
           L"exact RAWは認証済み元区画全体と同じ最小容量が必要です");
     }
-    return align_up(source.source_size_bytes, kAlignment);
+    // The next partition start is aligned independently. Rounding the RAW
+    // partition length would change its byte extent and violate exact clone.
+    return clonecore::Result<std::uint64_t>::success(
+        source.source_size_bytes);
   }
   const std::uint64_t percentage_reserve = source.used_bytes / 8U;
   const std::uint64_t fixed_reserve =
@@ -209,13 +212,25 @@ clonecore::Result<ShrinkMigrationPlan> plan_shrink_migration(
       (request.surplus_allocation !=
            ShrinkSurplusAllocation::automatic_proportional &&
        request.surplus_allocation !=
-           ShrinkSurplusAllocation::leave_unallocated) ||
+           ShrinkSurplusAllocation::leave_unallocated &&
+       request.surplus_allocation !=
+           ShrinkSurplusAllocation::selected_data_partition) ||
       !request.bitlocker_fully_decrypted) {
     return failure<ShrinkMigrationPlan>(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"縮小移行の共通条件",
         L"コピー先寸法、論理セクター、BitLocker、またはパーティション数が対応条件外です");
+  }
+  const bool targets_selected_data = request.surplus_allocation ==
+      ShrinkSurplusAllocation::selected_data_partition;
+  if (targets_selected_data !=
+      request.surplus_target_source_table_index.has_value()) {
+    return failure<ShrinkMigrationPlan>(
+        clonecore::ErrorCode::invalid_argument,
+        ERROR_INVALID_PARAMETER,
+        L"縮小移行の余剰容量対象",
+        L"指定データ領域への配分にはコピー元パーティション表番号が1つ必要です");
   }
   if (request.source_style == MigrationPartitionStyle::gpt &&
       request.target_style == MigrationPartitionStyle::mbr) {
@@ -332,10 +347,32 @@ clonecore::Result<ShrinkMigrationPlan> plan_shrink_migration(
         L"Windows起動ディスクまたはデータ専用ディスクの役割を一意に確定できません");
   }
 
+  if (targets_selected_data) {
+    const auto target = std::find_if(
+        content.begin(),
+        content.end(),
+        [&request](const ShrinkSourcePartition* candidate) {
+          return candidate->source_table_index ==
+              *request.surplus_target_source_table_index;
+        });
+    if (target == content.end() ||
+        (*target)->role != MigrationPartitionRole::data ||
+        classify_shrink_file_system((*target)->file_system) !=
+            ShrinkFileSystemDisposition::file_archive) {
+      return failure<ShrinkMigrationPlan>(
+          clonecore::ErrorCode::unsupported_layout,
+          ERROR_NOT_SUPPORTED,
+          L"縮小移行の余剰容量対象",
+          L"余剰容量の指定先は選択済みのNTFS・exFAT・FAT32データ領域に限ります");
+    }
+  }
+
   ShrinkMigrationPlan plan{
       .target_style = request.target_style,
       .alignment_bytes = kAlignment,
       .target_size_bytes = request.target_size_bytes,
+      .surplus_target_source_table_index =
+          request.surplus_target_source_table_index,
       .source_remains_unchanged = true,
       .boot_finalization_required = request.source_is_windows_system,
   };
@@ -524,11 +561,10 @@ clonecore::Result<ShrinkMigrationPlan> plan_shrink_migration(
 
   const std::uint64_t extra =
       request.target_size_bytes - plan.minimum_target_size_bytes;
-  if (request.surplus_allocation ==
-          ShrinkSurplusAllocation::automatic_proportional &&
+  if (request.surplus_allocation !=
+          ShrinkSurplusAllocation::leave_unallocated &&
       extra >= kAlignment) {
     const std::uint64_t distributable = (extra / kAlignment) * kAlignment;
-    std::uint64_t total_weight{};
     std::vector<std::size_t> expandable_indexes;
     for (std::size_t index = 0U;
          index < plan.target_partitions.size();
@@ -538,55 +574,72 @@ clonecore::Result<ShrinkMigrationPlan> plan_shrink_migration(
           partition.action == MigrationPartitionAction::copy_exact_raw) {
         continue;
       }
-      if (!checked_add(
-              total_weight,
-              (std::max)(partition.source_size_bytes, kAlignment),
-              total_weight)) {
-        return failure<ShrinkMigrationPlan>(
-            clonecore::ErrorCode::invalid_data,
-            ERROR_ARITHMETIC_OVERFLOW,
-            L"縮小移行の余剰容量比率",
-            L"元パーティション容量の合計がオーバーフローしました");
-      }
       expandable_indexes.push_back(index);
     }
     std::vector<std::uint64_t> growth(
         plan.target_partitions.size(), 0U);
-    std::uint64_t allocated{};
-    for (const auto index : expandable_indexes) {
-      const auto share = multiply_divide_floor(
-          distributable,
-          (std::max)(
-              plan.target_partitions[index].source_size_bytes,
-              kAlignment),
-          total_weight);
-      if (!share ||
-          !checked_add(allocated, share.value(), allocated)) {
+    if (request.surplus_allocation ==
+        ShrinkSurplusAllocation::selected_data_partition) {
+      const auto target = std::find_if(
+          expandable_indexes.begin(),
+          expandable_indexes.end(),
+          [&plan, &request](const std::size_t index) {
+            return plan.target_partitions[index].source_table_index ==
+                request.surplus_target_source_table_index;
+          });
+      if (target == expandable_indexes.end()) {
         return failure<ShrinkMigrationPlan>(
-            clonecore::ErrorCode::invalid_data,
-            ERROR_ARITHMETIC_OVERFLOW,
-            L"縮小移行の余剰容量配分",
-            L"余剰容量を安全に比例配分できません");
+            clonecore::ErrorCode::internal_error,
+            ERROR_INVALID_DATA,
+            L"縮小移行の余剰容量対象",
+            L"検証済みの指定データ領域を最終配置へ一意に対応付けできません");
       }
-      growth[index] = (share.value() / kAlignment) * kAlignment;
-    }
-    allocated = 0U;
-    for (const auto value : growth) {
-      if (!checked_add(allocated, value, allocated)) {
-        return failure<ShrinkMigrationPlan>(
-            clonecore::ErrorCode::invalid_data,
-            ERROR_ARITHMETIC_OVERFLOW,
-            L"縮小移行の余剰容量配分",
-            L"配分済み容量の合計がオーバーフローしました");
+      growth[*target] = distributable;
+    } else {
+      std::uint64_t total_weight{};
+      for (const auto index : expandable_indexes) {
+        if (!checked_add(
+                total_weight,
+                (std::max)(
+                    plan.target_partitions[index].source_size_bytes,
+                    kAlignment),
+                total_weight)) {
+          return failure<ShrinkMigrationPlan>(
+              clonecore::ErrorCode::invalid_data,
+              ERROR_ARITHMETIC_OVERFLOW,
+              L"縮小移行の余剰容量比率",
+              L"元パーティション容量の合計がオーバーフローしました");
+        }
       }
-    }
-    std::uint64_t remaining = distributable - allocated;
-    for (const auto index : expandable_indexes) {
-      if (remaining < kAlignment) {
-        break;
+      std::uint64_t allocated{};
+      for (const auto index : expandable_indexes) {
+        const auto share = multiply_divide_floor(
+            distributable,
+            (std::max)(
+                plan.target_partitions[index].source_size_bytes,
+                kAlignment),
+            total_weight);
+        if (!share) {
+          return clonecore::Result<ShrinkMigrationPlan>::failure(
+              share.error());
+        }
+        growth[index] = (share.value() / kAlignment) * kAlignment;
+        if (!checked_add(allocated, growth[index], allocated)) {
+          return failure<ShrinkMigrationPlan>(
+              clonecore::ErrorCode::invalid_data,
+              ERROR_ARITHMETIC_OVERFLOW,
+              L"縮小移行の余剰容量配分",
+              L"配分済み容量の合計がオーバーフローしました");
+        }
       }
-      growth[index] += kAlignment;
-      remaining -= kAlignment;
+      std::uint64_t remaining = distributable - allocated;
+      for (const auto index : expandable_indexes) {
+        if (remaining < kAlignment) {
+          break;
+        }
+        growth[index] += kAlignment;
+        remaining -= kAlignment;
+      }
     }
 
     std::uint64_t preceding_growth{};

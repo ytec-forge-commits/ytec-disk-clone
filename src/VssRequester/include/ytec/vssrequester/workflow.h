@@ -32,6 +32,11 @@ struct SnapshotMapping final {
   std::wstring original_volume_guid_path;
   std::wstring snapshot_id;
   std::wstring snapshot_device_path;
+  // Captured from GetSnapshotProperties together with the Snapshot device.
+  // Product safety monitors bind both values immutably so a provider or
+  // same-ID Snapshot generation cannot be substituted between polls.
+  std::wstring provider_id;
+  std::int64_t creation_timestamp{};
 };
 
 struct SnapshotCopyContext final {

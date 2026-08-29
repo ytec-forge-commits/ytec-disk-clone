@@ -32,6 +32,7 @@ function Assert-RegularNonReparseFile {
 
 $root = [IO.Path]::GetFullPath($PackageRoot)
 $zip = [IO.Path]::GetFullPath($ZipPath)
+$zipSha256Path = $zip + '.sha256'
 if (-not (Test-Path -LiteralPath $root -PathType Container)) {
     throw "ポータブル配布フォルダーが見つかりません: $root"
 }
@@ -41,6 +42,15 @@ if (($rootItem.Attributes -band
     throw "配布フォルダーのreparse pointは使用しません: $root"
 }
 Assert-RegularNonReparseFile -Path $zip -Description 'ポータブルZIP'
+Assert-RegularNonReparseFile `
+    -Path $zipSha256Path `
+    -Description 'ポータブルZIP外部SHA-256'
+$rootPrefix = $root.TrimEnd('\') + '\'
+if ($zipSha256Path.StartsWith(
+        $rootPrefix,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'ZIP外部SHA-256は配布フォルダー内に置けません。'
+}
 
 $expectedFiles = @(
     'ytec-tsumugi-drive.exe',
@@ -53,9 +63,11 @@ $expectedFiles = @(
     '安全上の注意と既知の制限.txt',
     'プライバシーと通信.txt',
     'セキュリティ報告.txt',
+    '利用規約.txt',
     'data\README.txt',
     'LICENSE',
     'NOTICE',
+    'TRADEMARKS.md',
     'THIRD-PARTY-NOTICES.txt',
     'SBOM.spdx.json',
     'licenses\README.md',
@@ -97,6 +109,40 @@ function Get-StreamSha256 {
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+. (Join-Path $PSScriptRoot 'ProductVersion.ps1')
+$productVersion = Read-YtecProductVersion `
+    -Path (Join-Path $repoRoot 'version.json')
+$expectedExecutableMetadata = [ordered]@{
+    windowsApp = [ordered]@{
+        path = 'ytec-tsumugi-drive.exe'
+        originalFilename = 'ytec-tsumugi-drive.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive'
+    }
+    environment = [ordered]@{
+        path = 'tools\ytec-winpe-environment.exe'
+        originalFilename = 'ytec-winpe-environment.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE Environment'
+    }
+    winpeCli = [ordered]@{
+        path = 'winpe\ytec-winpe-app.exe'
+        originalFilename = 'ytec-winpe-app.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE CLI'
+    }
+    winpeGui = [ordered]@{
+        path = 'winpe\ytec-winpe-gui.exe'
+        originalFilename = 'ytec-winpe-gui.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE GUI'
+    }
+}
+$executableVersionInfo = [ordered]@{}
+foreach ($name in $expectedExecutableMetadata.Keys) {
+    $metadata = $expectedExecutableMetadata[$name]
+    $executableVersionInfo[$name] = Assert-YtecExecutableVersionInfo `
+        -Path (Join-Path $root $metadata.path) `
+        -Version $productVersion `
+        -OriginalFilename $metadata.originalFilename `
+        -FileDescription $metadata.fileDescription
+}
 $dependencyManifestPath = Join-Path $repoRoot `
     'third_party\dependencies.json'
 Assert-RegularNonReparseFile `
@@ -145,10 +191,20 @@ $licenseReadmeText = Get-Content `
     -Raw
 $sbom = Get-Content -LiteralPath (Join-Path $root 'SBOM.spdx.json') `
     -Raw | ConvertFrom-Json
+$sbomVersionInfo = Assert-YtecSbomProductVersion `
+    -Path (Join-Path $root 'SBOM.spdx.json') `
+    -Version $productVersion `
+    -ExpectedPackageName 'ytec-disk-clone' `
+    -ExpectedNamespaceBase `
+        'https://github.com/ytec-forge-commits/ytec-disk-clone/sbom'
 $packagedProjectLicense = Join-Path $root 'LICENSE'
 $packagedProjectNotice = Join-Path $root 'NOTICE'
+$packagedProjectTrademarks = Join-Path $root 'TRADEMARKS.md'
+$packagedTermsOfUse = Join-Path $root '利用規約.txt'
 $sourceProjectLicense = Join-Path $repoRoot 'LICENSE'
 $sourceProjectNotice = Join-Path $repoRoot 'NOTICE'
+$sourceProjectTrademarks = Join-Path $repoRoot 'TRADEMARKS.md'
+$sourceTermsOfUse = Join-Path $repoRoot 'packaging\terms-of-use.txt'
 foreach ($projectDocument in @(
         [ordered]@{
             packaged = $packagedProjectLicense
@@ -159,6 +215,16 @@ foreach ($projectDocument in @(
             packaged = $packagedProjectNotice
             source = $sourceProjectNotice
             description = '製品NOTICE'
+        },
+        [ordered]@{
+            packaged = $packagedProjectTrademarks
+            source = $sourceProjectTrademarks
+            description = '商標・公式ビルド方針'
+        },
+        [ordered]@{
+            packaged = $packagedTermsOfUse
+            source = $sourceTermsOfUse
+            description = '利用規約'
         })) {
     Assert-RegularNonReparseFile `
         -Path $projectDocument.source `
@@ -169,6 +235,29 @@ foreach ($projectDocument in @(
                 -Algorithm SHA256).Hash) {
         throw "$($projectDocument.description)がリポジトリ正本と一致しません。"
     }
+}
+$termsText = Get-Content -LiteralPath $packagedTermsOfUse -Raw
+foreach ($requiredTermsText in @(
+        'Apache License 2.0',
+        '利用、改変、複製、',
+        '実運用には',
+        'バックアップ',
+        'ライセンス認証',
+        '第三者ビルド',
+        'プライバシーと通信.txt',
+        'AS IS',
+        '人間による最終法務レビュー')) {
+    if (-not $termsText.Contains($requiredTermsText)) {
+        throw "利用規約の必須事項がありません: $requiredTermsText"
+    }
+}
+$securityReportingText = Get-Content `
+    -LiteralPath (Join-Path $root 'セキュリティ報告.txt') `
+    -Raw
+$privateReportingUrl =
+    'https://github.com/ytec-commits/ytec-disk-clone/security/advisories/new'
+if (-not $securityReportingText.Contains($privateReportingUrl)) {
+    throw 'Private Vulnerability Reportingの非公開報告URLが一致しません。'
 }
 $rootSbomPackages = @($sbom.packages | Where-Object {
         $_.SPDXID -ceq 'SPDXRef-Package-ytec-disk-clone'
@@ -278,20 +367,59 @@ if ($hashText -notmatch [regex]::Escape('*はじめに.txt')) {
 }
 $hashLines = @($hashText -split '\r?\n' |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ($hashLines.Count -ne ($expectedFiles.Count - 1)) {
+$expectedHashedFiles = @($expectedFiles | Where-Object {
+        $_ -cne 'SHA256SUMS.txt'
+    })
+if ($hashLines.Count -ne $expectedHashedFiles.Count) {
     throw "SHA256SUMS.txtの行数が不正です: $($hashLines.Count)"
 }
+$hashEntries = [Collections.Generic.Dictionary[string, string]]::new(
+    [StringComparer]::OrdinalIgnoreCase)
 foreach ($line in $hashLines) {
     if ($line -notmatch '^([0-9A-F]{64}) \*(.+)$') {
         throw "SHA256SUMS.txtの行形式が不正です: $line"
     }
+    $recordedHash = $matches[1]
     $relative = $matches[2].Replace('/', '\')
+    $canonical = @($expectedHashedFiles | Where-Object {
+            $_.Equals($relative, [StringComparison]::Ordinal)
+        })
+    if ($canonical.Count -ne 1) {
+        throw "SHA256SUMS.txtに期待集合外のパスがあります: $relative"
+    }
+    if ($hashEntries.ContainsKey($relative)) {
+        throw "SHA256SUMS.txtに重複パスがあります: $relative"
+    }
+    $hashEntries.Add($relative, $recordedHash)
     $filePath = Join-Path $root $relative
     Assert-RegularNonReparseFile -Path $filePath -Description $relative
     $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash
-    if ($actual -ne $matches[1]) {
+    if ($actual -cne $recordedHash) {
         throw "配布ファイルのSHA-256が一致しません: $relative"
     }
+}
+foreach ($relative in $expectedHashedFiles) {
+    if (-not $hashEntries.ContainsKey($relative)) {
+        throw "SHA256SUMS.txtに必須パスがありません: $relative"
+    }
+}
+
+$zipSha256Bytes = [IO.File]::ReadAllBytes($zipSha256Path)
+$zipSha256Text = $utf8.GetString($zipSha256Bytes)
+$zipSha256Lines = @($zipSha256Text -split '\r?\n' |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($zipSha256Lines.Count -ne 1 -or
+    $zipSha256Lines[0] -notmatch '^([0-9A-F]{64}) \*(.+)$') {
+    throw 'ZIP外部SHA-256の行形式が不正です。'
+}
+$recordedZipSha256 = $matches[1]
+$recordedZipName = $matches[2]
+if ($recordedZipName -cne [IO.Path]::GetFileName($zip)) {
+    throw 'ZIP外部SHA-256の対象ファイル名が一致しません。'
+}
+$actualZipSha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+if ($recordedZipSha256 -cne $actualZipSha256) {
+    throw 'ZIP外部SHA-256がポータブルZIPと一致しません。'
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -301,6 +429,13 @@ try {
         Where-Object { -not [string]::IsNullOrEmpty($_.Name) })
     if ($entries.Count -ne $expectedFiles.Count) {
         throw "ZIPのファイル数が不正です: $($entries.Count)"
+    }
+    if (@($entries | Where-Object {
+                $_.FullName.EndsWith(
+                    '.zip.sha256',
+                    [StringComparison]::OrdinalIgnoreCase)
+            }).Count -ne 0) {
+        throw 'ZIP外部SHA-256がZIP内に混入しています。'
     }
     foreach ($relative in $expectedFiles) {
         $entryName = $relative.Replace('\', '/')
@@ -339,12 +474,25 @@ try {
 
 $report = [ordered]@{
     schemaVersion = 1
+    product = 'Y-TEC Tsumugi Drive'
+    version = $productVersion.display
+    fileVersion = $productVersion.file
+    channel = $productVersion.channel
     packageRoot = $root
     zipPath = $zip
     fileCount = $expectedFiles.Count
     hashedFileCount = $hashLines.Count
-    zipSha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+    zipSha256 = $actualZipSha256
+    zipSha256File = [ordered]@{
+        path = $zipSha256Path
+        length = (Get-Item -LiteralPath $zipSha256Path).Length
+        zipSha256 = $recordedZipSha256
+        sha256 = (Get-FileHash -LiteralPath $zipSha256Path `
+            -Algorithm SHA256).Hash
+    }
     repositoryContainsMicrosoftPayload = $false
+    executables = $executableVersionInfo
+    sbom = $sbomVersionInfo
 }
 Write-Output ('TSUMUGI_PORTABLE_ARTIFACT_PASS=' +
-    ($report | ConvertTo-Json -Depth 3 -Compress))
+    ($report | ConvertTo-Json -Depth 5 -Compress))

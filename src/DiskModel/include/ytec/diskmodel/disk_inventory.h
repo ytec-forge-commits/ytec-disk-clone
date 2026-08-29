@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,29 @@ struct InventoryReport final {
   std::vector<DiskInfo> disks;
   std::vector<InventoryIssue> issues;
 };
+
+// Canonical source-to-file image selection. An empty caller selection means
+// the legacy whole-disk path. The normalized result always contains the exact
+// one-based PartitionNumber set, sorted in source order. When a recognizable
+// Windows partition is selected, boot/system/MSR/recovery partitions are
+// forced into the set and reported as required so product UIs cannot present
+// them as optional. No disk I/O is performed here.
+struct ImagePartitionSelection final {
+  bool whole_disk{};
+  bool contains_windows{};
+  std::vector<std::uint32_t> selected_partition_numbers;
+  std::vector<std::uint32_t> required_partition_numbers;
+  std::uint64_t selected_bytes{};
+};
+
+[[nodiscard]] clonecore::Result<ImagePartitionSelection>
+normalize_image_partition_selection(
+    const DiskInfo& reviewed_source,
+    std::span<const std::uint32_t> requested_partition_numbers);
+
+[[nodiscard]] bool image_partition_selection_contains(
+    const ImagePartitionSelection& selection,
+    std::uint32_t partition_number) noexcept;
 
 class IDiskInventoryProvider {
  public:

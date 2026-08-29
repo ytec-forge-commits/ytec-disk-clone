@@ -1,6 +1,8 @@
 #pragma once
 
+#include "ytec/bootrepair/bcdboot.h"
 #include "ytec/clonecore/gpt.h"
+#include "ytec/clonecore/mbr.h"
 #include "ytec/windowsapp/online_direct_shrink_clone.h"
 #include "ytec/windowsapp/windows_shrink_restore_platform.h"
 
@@ -23,10 +25,41 @@ struct WindowsDirectShrinkOwnedWimEvidence final {
 struct WindowsDirectShrinkBootFinalizationEvidence final {
   bool microsoft_signed_bcdboot{};
   bool fresh_bcd_store_read_back_verified{};
+  bool construction_gpt_non_bootable_verified{};
+  bool efi_ownership_safe_before_mount{};
+  bool efi_ownership_revalidated_before_mutation{};
+  bool microsoft_boot_namespace_read_back_verified{};
   bool temporary_mounts_released{};
   bool final_target_reidentified{};
   bool partition_layout_unchanged{};
   bool nvram_unchanged{};
+  bool legacy_bios{};
+  bool exact_target_volume_extents{};
+  bool target_only_reconstruction{};
+};
+
+// Direct-shrink boot reconstruction never discovers its system target by
+// partition type. The GPT construction uses BasicData + NO_DRIVE_LETTER; the
+// MBR construction uses inactive 0x07/0x27 primaries and a zero bootstrap.
+// The caller supplies exact, freshly rebound Volume GUID roots and immutable
+// target extents for Windows and the construction system volume. Production
+// mounts only those volumes, invokes signed BCDBoot with explicit /s and
+// firmware, releases every mount, and leaves source/NVRAM unchanged.
+struct WindowsDirectShrinkBootFinalizationRequest final {
+  clonecore::StableDiskIdentity expected_source;
+  clonecore::StableDiskIdentity expected_target;
+  clonecore::TargetConfirmation confirmation;
+  std::uint32_t expected_target_disk_number{};
+  std::uint32_t expected_windows_partition_number{};
+  std::uint64_t expected_windows_partition_offset{};
+  std::uint64_t expected_windows_partition_size{};
+  std::uint32_t expected_system_partition_number{};
+  std::uint64_t expected_system_partition_offset{};
+  std::uint64_t expected_system_partition_size{};
+  std::uint32_t expected_mbr_disk_signature{};
+  std::wstring windows_volume_root;
+  std::wstring system_volume_root;
+  bootrepair::BcdBootFirmware firmware{bootrepair::BcdBootFirmware::uefi};
 };
 
 struct WindowsDirectShrinkWinReFinalizationRequest final {
@@ -40,6 +73,9 @@ struct WindowsDirectShrinkWinReFinalizationRequest final {
   std::uint32_t expected_recovery_partition_number{};
   std::uint64_t expected_recovery_partition_offset{};
   std::uint64_t expected_recovery_partition_size{};
+  migrationcore::MigrationPartitionStyle expected_partition_style{
+      migrationcore::MigrationPartitionStyle::gpt};
+  std::uint32_t expected_mbr_disk_signature{};
   std::wstring windows_volume_root;
   std::wstring recovery_volume_root;
 };
@@ -101,8 +137,7 @@ using WindowsDirectShrinkPlatformReidentifier = std::function<
 
 using WindowsDirectShrinkBootFinalizer = std::function<clonecore::Result<
     WindowsDirectShrinkBootFinalizationEvidence>(
-    const clonecore::StableDiskIdentity&,
-    std::uint64_t expected_windows_partition_offset)>;
+    const WindowsDirectShrinkBootFinalizationRequest&)>;
 
 using WindowsDirectShrinkWinReFinalizer = std::function<clonecore::Result<
     WindowsDirectShrinkWinReFinalizationEvidence>(
@@ -125,13 +160,19 @@ struct WindowsDirectShrinkClonePlatformDependencies final {
   WindowsDirectShrinkPlatformReidentifier reidentify_confirmed;
   WindowsDirectShrinkBootFinalizer finalize_boot;
   WindowsDirectShrinkWinReFinalizer finalize_winre;
+  WindowsDirectShrinkMbrSafetyObserver observe_mbr_safety;
 };
 
-// Production-safe slice: preserve-style GPT, 512-byte sectors, NTFS content,
-// generated ESP/MSR, optional single recovery, target-owned non-overlapping
-// staging and verified NTFS extension for automatic surplus. MBR, non-NTFS
-// payloads and every unproved role/layout fail during factory construction
-// before the Win32 I/O seam is called.
+// Production-safe slice: preserve-style GPT/MBR or reviewed target-only
+// MBR-to-GPT,
+// 512-byte sectors, NTFS content, generated ESP/MSR, optional single recovery,
+// target-owned non-overlapping staging and verified NTFS extension for
+// automatic or reviewed single-data surplus. Temporary and hidden-final GPTs
+// reuse the final target's
+// freshly generated disk/partition GUIDs but expose all tasks as non-bootable
+// BasicData + NO_DRIVE_LETTER; only final publication changes type/name/attrs.
+// Non-NTFS payloads and every unproved role/layout fail during factory
+// construction before the Win32 I/O seam is called.
 [[nodiscard]] clonecore::Result<std::unique_ptr<
     IWindowsDirectShrinkClonePlatform>>
 make_windows_direct_shrink_clone_platform(

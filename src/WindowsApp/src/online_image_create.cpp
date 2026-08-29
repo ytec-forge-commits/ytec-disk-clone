@@ -221,6 +221,169 @@ bool same_reviewed_layout(
   return true;
 }
 
+clonecore::Result<const diskmodel::PartitionInfo*>
+find_observed_partition_by_range(
+    const diskmodel::DiskInfo& source,
+    const std::uint64_t offset,
+    const std::uint64_t length,
+    const std::wstring_view operation) {
+  const diskmodel::PartitionInfo* found = nullptr;
+  for (const auto& partition : source.partitions) {
+    if (partition.offset_bytes != offset || partition.size_bytes != length) {
+      continue;
+    }
+    if (found != nullptr) {
+      return failure<const diskmodel::PartitionInfo*>(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_INVALID_DATA,
+          std::wstring(operation),
+          L"同じ範囲へ複数のPartitionNumberが対応しています");
+    }
+    found = &partition;
+  }
+  if (found == nullptr) {
+    return failure<const diskmodel::PartitionInfo*>(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_NOT_FOUND,
+        std::wstring(operation),
+        L"現在のレイアウトに対応するPartitionNumberがありません");
+  }
+  return clonecore::Result<const diskmodel::PartitionInfo*>::success(found);
+}
+
+bool partition_required(
+    const diskmodel::ImagePartitionSelection& selection,
+    const std::uint32_t partition_number) noexcept {
+  return std::find(
+             selection.required_partition_numbers.begin(),
+             selection.required_partition_numbers.end(),
+             partition_number) != selection.required_partition_numbers.end();
+}
+
+bool same_image_partition_selection(
+    const diskmodel::ImagePartitionSelection& left,
+    const diskmodel::ImagePartitionSelection& right) noexcept {
+  return left.whole_disk == right.whole_disk &&
+      left.contains_windows == right.contains_windows &&
+      left.selected_bytes == right.selected_bytes &&
+      left.selected_partition_numbers == right.selected_partition_numbers &&
+      left.required_partition_numbers == right.required_partition_numbers;
+}
+
+bool manifest_partition_selected(
+    const imageformat::TsumugiManifestPartition& partition) noexcept {
+  return (static_cast<std::uint32_t>(partition.flags) &
+          static_cast<std::uint32_t>(
+              imageformat::TsumugiManifestPartitionFlags::selected)) != 0U;
+}
+
+clonecore::Result<std::vector<std::uint32_t>>
+selected_manifest_entry_indices(
+    const imageformat::TsumugiManifest& manifest) {
+  std::vector<std::uint32_t> result;
+  result.reserve(manifest.partitions.size());
+  for (const auto& partition : manifest.partitions) {
+    if (!manifest_partition_selected(partition)) {
+      continue;
+    }
+    if (partition.source_table_index == 0U) {
+      return failure<std::vector<std::uint32_t>>(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"オンラインTsumugi partition選択index",
+          L"選択されたmanifestに0のtable indexがあります");
+    }
+    result.push_back(partition.source_table_index - 1U);
+  }
+  std::sort(result.begin(), result.end());
+  if (result.empty() ||
+      std::adjacent_find(result.begin(), result.end()) != result.end()) {
+    return failure<std::vector<std::uint32_t>>(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"オンラインTsumugi partition選択index",
+        L"選択されたtable indexが空または重複しています");
+  }
+  return clonecore::Result<std::vector<std::uint32_t>>::success(
+      std::move(result));
+}
+
+clonecore::Result<std::vector<clonecore::VolumeBitmapBinding>>
+query_selected_gpt_volume_bindings(
+    const diskmodel::DiskInfo& disk,
+    const clonecore::GptDisk& layout,
+    const std::span<const std::uint32_t> selected_entries) {
+  std::vector<diskmodel::VolumePartitionLocation> locations;
+  for (const auto& partition : layout.partitions) {
+    if (partition.type_guid != clonecore::gpt_type_basic_data() ||
+        !std::binary_search(
+            selected_entries.begin(),
+            selected_entries.end(),
+            partition.entry_index)) {
+      continue;
+    }
+    std::uint64_t offset{};
+    if (!checked_multiply(
+            partition.first_lba, layout.logical_sector_size, offset)) {
+      return failure<std::vector<clonecore::VolumeBitmapBinding>>(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_ARITHMETIC_OVERFLOW,
+          L"オンラインTsumugi GPT選択Volume範囲",
+          L"選択したGPT Basic Dataの開始位置が64bit上限を超えます");
+    }
+    locations.push_back({
+        .table_index = partition.entry_index,
+        .offset_bytes = offset,
+    });
+  }
+  if (locations.empty()) {
+    return failure<std::vector<clonecore::VolumeBitmapBinding>>(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"オンラインTsumugi選択Volume",
+        L"Windows版では少なくとも1つのNTFS Basic Data領域を選択してください。静的領域だけの作成はWinPE版を使用してください");
+  }
+  return diskmodel::query_windows_volume_bindings_by_offset(disk, locations);
+}
+
+clonecore::Result<std::vector<clonecore::VolumeBitmapBinding>>
+query_selected_mbr_volume_bindings(
+    const diskmodel::DiskInfo& disk,
+    const clonecore::MbrDisk& layout,
+    const std::span<const std::uint32_t> selected_entries) {
+  std::vector<diskmodel::VolumePartitionLocation> locations;
+  for (const auto& partition : layout.partitions) {
+    if (partition.type != 0x07U ||
+        !std::binary_search(
+            selected_entries.begin(),
+            selected_entries.end(),
+            static_cast<std::uint32_t>(partition.table_index))) {
+      continue;
+    }
+    std::uint64_t offset{};
+    if (!checked_multiply(
+            partition.first_lba, layout.logical_sector_size, offset)) {
+      return failure<std::vector<clonecore::VolumeBitmapBinding>>(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_ARITHMETIC_OVERFLOW,
+          L"オンラインTsumugi MBR選択Volume範囲",
+          L"選択したMBR 0x07領域の開始位置が64bit上限を超えます");
+    }
+    locations.push_back({
+        .table_index = static_cast<std::uint32_t>(partition.table_index),
+        .offset_bytes = offset,
+    });
+  }
+  if (locations.empty()) {
+    return failure<std::vector<clonecore::VolumeBitmapBinding>>(
+        clonecore::ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"オンラインTsumugi選択Volume",
+        L"Windows版では少なくとも1つのNTFS 0x07領域を選択してください。静的領域だけの作成はWinPE版を使用してください");
+  }
+  return diskmodel::query_windows_volume_bindings_by_offset(disk, locations);
+}
+
 clonecore::Status validate_request(
     const OnlineImageCreateRequest& request,
     const OnlineImageCreateDependencies& dependencies) {
@@ -241,6 +404,12 @@ clonecore::Status validate_request(
         ERROR_INVALID_PARAMETER,
         L"オンラインTsumugi 作成要求",
         L"保存先は絶対.tsumugiパスとし、作成日時、アプリ版、Windows情報を指定してください"));
+  }
+  const auto selection = diskmodel::normalize_image_partition_selection(
+      request.selected_source,
+      request.selected_partition_numbers);
+  if (!selection) {
+    return clonecore::Status::failure(selection.error());
   }
   if (!dependencies.open_read_only_disk ||
       !dependencies.query_gpt_bindings ||
@@ -275,6 +444,7 @@ clonecore::Status validate_data_rescue_request(
       request.app_version.empty() || request.windows_architecture.empty() ||
       !imageformat::is_supported_tsumugi_create_verification_mode(
           request.verification_mode) ||
+      !request.selected_partition_numbers.empty() ||
       source.is_system_disk || source.size_bytes == 0U ||
       source.logical_sector_size != 512U ||
       !imageformat::is_supported_sector_size_pair(
@@ -291,7 +461,7 @@ clonecore::Status validate_data_rescue_request(
         L"Windowsデータ救出Tsumugi 作成要求",
         source.is_system_disk
             ? L"稼働中Windowsのシステムディスク救出はPE版を使用してください"
-            : L"既にread-onlyまたはofflineの非removable 512バイトGPT/MBRデータディスク、絶対.tsumugiパス、作成日時、アプリ版、Windows情報が必要です"));
+            : L"既にread-onlyまたはofflineの非removable 512バイトGPT/MBRデータディスク、ディスク全体、絶対.tsumugiパス、作成日時、アプリ版、Windows情報が必要です"));
   }
   if (!dependencies.open_read_only_disk ||
       !dependencies.query_destination_file_system ||
@@ -325,7 +495,8 @@ vssrequester::SnapshotImagePlanOptions plan_options(
     const OnlineImageCreateRequest& request,
     const diskmodel::ReadOnlyPhysicalDiskHandle& source,
     std::vector<std::byte> legacy_manifest,
-    std::vector<std::byte> partition_snapshot) {
+    std::vector<std::byte> partition_snapshot,
+    std::vector<std::uint32_t> selected_partition_entry_indices) {
   return vssrequester::SnapshotImagePlanOptions{
       .administrator = request.administrator,
       .physical_sector_size = source.observed.observed.physical_sector_size,
@@ -334,6 +505,8 @@ vssrequester::SnapshotImagePlanOptions plan_options(
       .verification_block_bytes = 4U * 1024U * 1024U,
       .manifest = std::move(legacy_manifest),
       .partition_table_snapshot = std::move(partition_snapshot),
+      .selected_partition_entry_indices =
+          std::move(selected_partition_entry_indices),
   };
 }
 
@@ -371,12 +544,19 @@ imageformat::TsumugiManifestFileSystem convert_file_system(
 }
 
 clonecore::Status reject_mutable_raw_data(
-    const imageformat::BackupImageManifest& legacy) {
+    const imageformat::TsumugiManifest& manifest) {
   const auto mutable_partition = std::find_if(
-      legacy.partitions.begin(), legacy.partitions.end(), [](const auto& item) {
-        return item.role == imageformat::BackupPartitionRole::fat32_data;
+      manifest.partitions.begin(),
+      manifest.partitions.end(),
+      [](const auto& item) {
+        return manifest_partition_selected(item) &&
+            item.role == imageformat::TsumugiManifestPartitionRole::data &&
+            (item.file_system ==
+                 imageformat::TsumugiManifestFileSystem::fat32 ||
+             item.file_system ==
+                 imageformat::TsumugiManifestFileSystem::exfat);
       });
-  if (mutable_partition != legacy.partitions.end()) {
+  if (mutable_partition != manifest.partitions.end()) {
     return clonecore::Status::failure(image_error(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
@@ -390,6 +570,7 @@ clonecore::Result<imageformat::TsumugiManifest> base_manifest(
     const OnlineImageCreateRequest& request,
     const diskmodel::ReadOnlyPhysicalDiskHandle& source,
     const imageformat::BackupImageManifest& legacy,
+    const diskmodel::ImagePartitionSelection& selection,
     const std::span<const std::byte> partition_snapshot,
     const TsumugiSourceIdentityHashes& hashes) {
   imageformat::TsumugiManifest result{
@@ -398,9 +579,13 @@ clonecore::Result<imageformat::TsumugiManifest> base_manifest(
           legacy.partition_style == imageformat::BackupPartitionStyle::gpt
           ? imageformat::TsumugiManifestPartitionStyle::gpt
           : imageformat::TsumugiManifestPartitionStyle::mbr,
-      .flags = source.observed.identity.is_system_disk
-          ? imageformat::TsumugiManifestFlags::source_contains_windows
-          : imageformat::TsumugiManifestFlags::none,
+      .flags =
+          (selection.contains_windows
+               ? imageformat::TsumugiManifestFlags::source_contains_windows
+               : imageformat::TsumugiManifestFlags::none) |
+          (!selection.whole_disk
+               ? imageformat::TsumugiManifestFlags::partition_selection
+               : imageformat::TsumugiManifestFlags::none),
       .source_disk_size = source.reader->size_bytes(),
       .logical_sector_size = source.reader->logical_sector_size(),
       .physical_sector_size = source.observed.observed.physical_sector_size,
@@ -422,10 +607,11 @@ clonecore::Result<imageformat::TsumugiManifest> convert_gpt_manifest(
     const diskmodel::ReadOnlyPhysicalDiskHandle& source,
     const imageformat::BackupImageManifest& legacy,
     const clonecore::GptDisk& layout,
+    const diskmodel::ImagePartitionSelection& selection,
     const std::span<const std::byte> partition_snapshot,
     const TsumugiSourceIdentityHashes& hashes) {
   auto converted = base_manifest(
-      request, source, legacy, partition_snapshot, hashes);
+      request, source, legacy, selection, partition_snapshot, hashes);
   if (!converted) {
     return converted;
   }
@@ -452,30 +638,51 @@ clonecore::Result<imageformat::TsumugiManifest> convert_gpt_manifest(
       return clonecore::Result<imageformat::TsumugiManifest>::failure(
           name.error());
     }
-    auto flags = imageformat::TsumugiManifestPartitionFlags::selected;
-    if (source.observed.identity.is_system_disk) {
+    auto observed_partition = find_observed_partition_by_range(
+        source.observed.observed,
+        record.offset_bytes,
+        record.length_bytes,
+        L"オンラインTsumugi GPT PartitionNumber対応");
+    if (!observed_partition) {
+      return clonecore::Result<imageformat::TsumugiManifest>::failure(
+          observed_partition.error());
+    }
+    const auto partition_number = observed_partition.value()->number;
+    const bool selected = diskmodel::image_partition_selection_contains(
+        selection, partition_number);
+    const bool required = selected &&
+        partition_required(selection, partition_number);
+    auto flags = selected
+        ? imageformat::TsumugiManifestPartitionFlags::selected
+        : imageformat::TsumugiManifestPartitionFlags::none;
+    if (required) {
       flags = flags | imageformat::TsumugiManifestPartitionFlags::required;
     }
-    if (record.role == imageformat::BackupPartitionRole::windows_ntfs) {
+    const bool contains_windows = selected && required &&
+        layout_partition->type_guid == clonecore::gpt_type_basic_data();
+    if (contains_windows) {
       flags = flags |
           imageformat::TsumugiManifestPartitionFlags::contains_windows;
     }
     imageformat::TsumugiManifestPartition partition{
         .source_table_index = record.table_index + 1U,
-        .source_partition_number = record.table_index + 1U,
-        .role = convert_role(record.role),
+        .source_partition_number = partition_number,
+        .role = contains_windows
+            ? imageformat::TsumugiManifestPartitionRole::windows
+            : convert_role(record.role),
         .file_system = convert_file_system(record.file_system),
         .flags = flags,
         .source_offset = record.offset_bytes,
         .source_size = record.length_bytes,
-        .used_bytes =
-            record.role == imageformat::BackupPartitionRole::microsoft_reserved
-            ? 0U
-            : record.length_bytes,
-        .minimum_target_bytes = record.length_bytes,
-        .planned_target_bytes = record.length_bytes,
-        .payload_logical_offset = record.offset_bytes,
-        .payload_logical_length = record.length_bytes,
+        .used_bytes = selected &&
+                record.role !=
+                    imageformat::BackupPartitionRole::microsoft_reserved
+            ? record.length_bytes
+            : 0U,
+        .minimum_target_bytes = selected ? record.length_bytes : 0U,
+        .planned_target_bytes = selected ? record.length_bytes : 0U,
+        .payload_logical_offset = selected ? record.offset_bytes : 0U,
+        .payload_logical_length = selected ? record.length_bytes : 0U,
         .type_id = layout_partition->type_guid.bytes,
         .unique_id = layout_partition->unique_guid.bytes,
         .name_utf8 = name.take_value(),
@@ -490,10 +697,11 @@ clonecore::Result<imageformat::TsumugiManifest> convert_mbr_manifest(
     const diskmodel::ReadOnlyPhysicalDiskHandle& source,
     const imageformat::BackupImageManifest& legacy,
     const clonecore::MbrDisk& layout,
+    const diskmodel::ImagePartitionSelection& selection,
     const std::span<const std::byte> partition_snapshot,
     const TsumugiSourceIdentityHashes& hashes) {
   auto converted = base_manifest(
-      request, source, legacy, partition_snapshot, hashes);
+      request, source, legacy, selection, partition_snapshot, hashes);
   if (!converted) {
     return converted;
   }
@@ -523,30 +731,50 @@ clonecore::Result<imageformat::TsumugiManifest> convert_mbr_manifest(
       return clonecore::Result<imageformat::TsumugiManifest>::failure(
           name.error());
     }
-    auto flags = imageformat::TsumugiManifestPartitionFlags::selected;
-    if (source.observed.identity.is_system_disk) {
+    auto observed_partition = find_observed_partition_by_range(
+        source.observed.observed,
+        record.offset_bytes,
+        record.length_bytes,
+        L"オンラインTsumugi MBR PartitionNumber対応");
+    if (!observed_partition) {
+      return clonecore::Result<imageformat::TsumugiManifest>::failure(
+          observed_partition.error());
+    }
+    const auto partition_number = observed_partition.value()->number;
+    const bool selected = diskmodel::image_partition_selection_contains(
+        selection, partition_number);
+    const bool required = selected &&
+        partition_required(selection, partition_number);
+    auto flags = selected
+        ? imageformat::TsumugiManifestPartitionFlags::selected
+        : imageformat::TsumugiManifestPartitionFlags::none;
+    if (required) {
       flags = flags | imageformat::TsumugiManifestPartitionFlags::required;
     }
     if (layout_partition->active) {
       flags = flags | imageformat::TsumugiManifestPartitionFlags::active;
     }
-    if (record.role == imageformat::BackupPartitionRole::windows_ntfs) {
+    const bool contains_windows = selected && required &&
+        layout_partition->type == 0x07U;
+    if (contains_windows) {
       flags = flags |
           imageformat::TsumugiManifestPartitionFlags::contains_windows;
     }
     imageformat::TsumugiManifestPartition partition{
         .source_table_index = record.table_index + 1U,
-        .source_partition_number = record.table_index + 1U,
-        .role = convert_role(record.role),
+        .source_partition_number = partition_number,
+        .role = contains_windows
+            ? imageformat::TsumugiManifestPartitionRole::windows
+            : convert_role(record.role),
         .file_system = convert_file_system(record.file_system),
         .flags = flags,
         .source_offset = record.offset_bytes,
         .source_size = record.length_bytes,
-        .used_bytes = record.length_bytes,
-        .minimum_target_bytes = record.length_bytes,
-        .planned_target_bytes = record.length_bytes,
-        .payload_logical_offset = record.offset_bytes,
-        .payload_logical_length = record.length_bytes,
+        .used_bytes = selected ? record.length_bytes : 0U,
+        .minimum_target_bytes = selected ? record.length_bytes : 0U,
+        .planned_target_bytes = selected ? record.length_bytes : 0U,
+        .payload_logical_offset = selected ? record.offset_bytes : 0U,
+        .payload_logical_length = selected ? record.length_bytes : 0U,
         .name_utf8 = name.take_value(),
     };
     partition.type_id[0] = static_cast<std::byte>(layout_partition->type);
@@ -602,6 +830,23 @@ convert_snapshot_plan(
           L"オンラインTsumugi Volume番号",
           L"パーティション番号を正規化できません");
     }
+    const auto manifest_partition = std::find_if(
+        result.image.manifest.partitions.begin(),
+        result.image.manifest.partitions.end(),
+        [&](const auto& item) {
+          return item.source_table_index ==
+                  volume.partition_entry_index + 1U &&
+              item.source_offset == volume.disk_offset &&
+              item.source_size == volume.partition_length;
+        });
+    if (manifest_partition == result.image.manifest.partitions.end() ||
+        !manifest_partition_selected(*manifest_partition)) {
+      return failure<vssrequester::TsumugiSnapshotImageRequest>(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_INVALID_DATA,
+          L"オンラインTsumugi Volume選択binding",
+          L"VSS Volume計画が選択済みmanifest領域と一致しません");
+    }
     result.volumes.push_back(vssrequester::TsumugiSnapshotVolumePlan{
         .partition_entry_index = volume.partition_entry_index + 1U,
         .disk_offset = volume.disk_offset,
@@ -621,6 +866,7 @@ convert_snapshot_plan(
               item.source_size == raw.length;
         });
     if (partition == result.image.manifest.partitions.end() ||
+        !manifest_partition_selected(*partition) ||
         (partition->role !=
              imageformat::TsumugiManifestPartitionRole::efi_system &&
          partition->role !=
@@ -983,6 +1229,14 @@ execute_online_image_create(
     return clonecore::Result<
         vssrequester::OnlineTsumugiBackupReport>::failure(valid.error());
   }
+  auto reviewed_selection = diskmodel::normalize_image_partition_selection(
+      request.selected_source,
+      request.selected_partition_numbers);
+  if (!reviewed_selection) {
+    return clonecore::Result<
+        vssrequester::OnlineTsumugiBackupReport>::failure(
+        reviewed_selection.error());
+  }
   auto expected = diskmodel::make_stable_disk_identity(
       request.selected_source, request.selected_source.is_system_disk);
   if (!expected) {
@@ -1025,12 +1279,31 @@ execute_online_image_create(
     return clonecore::Result<
         vssrequester::OnlineTsumugiBackupReport>::failure(source.error());
   }
-  if (!source.value().reader) {
+  if (!source.value().reader ||
+      !same_reviewed_layout(
+          request.selected_source,
+          source.value().observed.observed)) {
     return failure<vssrequester::OnlineTsumugiBackupReport>(
-        clonecore::ErrorCode::internal_error,
-        ERROR_INVALID_HANDLE,
-        L"オンラインTsumugi 読取り専用Source",
-        L"検証済み読取り専用Readerがありません");
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_DEVICE_REINITIALIZATION_NEEDED,
+        L"オンラインTsumugi 読取り専用Source再識別",
+        L"検証済み読取り専用Readerまたはレビュー済みレイアウトが一致しません");
+  }
+  auto observed_selection = diskmodel::normalize_image_partition_selection(
+      source.value().observed.observed,
+      request.selected_partition_numbers);
+  if (!observed_selection ||
+      !same_image_partition_selection(
+          reviewed_selection.value(), observed_selection.value())) {
+    return observed_selection
+        ? failure<vssrequester::OnlineTsumugiBackupReport>(
+              clonecore::ErrorCode::identity_mismatch,
+              ERROR_DEVICE_REINITIALIZATION_NEEDED,
+              L"オンラインTsumugi partition選択再証明",
+              L"レビュー後に選択領域または必須Windows領域のbindingが変化しました")
+        : clonecore::Result<
+              vssrequester::OnlineTsumugiBackupReport>::failure(
+              observed_selection.error());
   }
   const auto source_identity = clonecore::validate_stable_identity(
       expected.value(),
@@ -1041,7 +1314,6 @@ execute_online_image_create(
         vssrequester::OnlineTsumugiBackupReport>::failure(
         source_identity.error());
   }
-
   clonecore::Result<vssrequester::PreparedSnapshotImagePlan> legacy_plan =
       failure<vssrequester::PreparedSnapshotImagePlan>(
           clonecore::ErrorCode::unsupported_layout,
@@ -1071,12 +1343,6 @@ execute_online_image_create(
           vssrequester::OnlineTsumugiBackupReport>::failure(
           legacy_manifest.error());
     }
-    const auto raw_safety = reject_mutable_raw_data(legacy_manifest.value());
-    if (!raw_safety) {
-      return clonecore::Result<
-          vssrequester::OnlineTsumugiBackupReport>::failure(
-          raw_safety.error());
-    }
     auto hashes = make_tsumugi_source_identity_hashes(
         source.value().observed.identity,
         source.value().observed.observed.physical_sector_size,
@@ -1090,14 +1356,24 @@ execute_online_image_create(
         source.value(),
         legacy_manifest.value(),
         metadata_value.layout,
+        observed_selection.value(),
         metadata_value.partition_table_snapshot,
         hashes.value());
     if (!manifest) {
       return clonecore::Result<
           vssrequester::OnlineTsumugiBackupReport>::failure(manifest.error());
     }
+    const auto raw_safety = reject_mutable_raw_data(manifest.value());
+    auto selected_entries = selected_manifest_entry_indices(manifest.value());
+    if (!raw_safety || !selected_entries) {
+      return clonecore::Result<
+          vssrequester::OnlineTsumugiBackupReport>::failure(
+          raw_safety ? selected_entries.error() : raw_safety.error());
+    }
     auto bindings = dependencies.query_gpt_bindings(
-        source.value().observed.observed, metadata_value.layout);
+        source.value().observed.observed,
+        metadata_value.layout,
+        selected_entries.value());
     if (!bindings) {
       return clonecore::Result<
           vssrequester::OnlineTsumugiBackupReport>::failure(bindings.error());
@@ -1110,7 +1386,8 @@ execute_online_image_create(
             request,
             source.value(),
             std::move(metadata_value.backup_manifest),
-            std::move(metadata_value.partition_table_snapshot)));
+            std::move(metadata_value.partition_table_snapshot),
+            selected_entries.take_value()));
   } else if (source.value().observed.observed.partition_style ==
              diskmodel::PartitionStyle::mbr) {
     auto metadata = vssrequester::build_mbr_snapshot_metadata(
@@ -1127,12 +1404,6 @@ execute_online_image_create(
           vssrequester::OnlineTsumugiBackupReport>::failure(
           legacy_manifest.error());
     }
-    const auto raw_safety = reject_mutable_raw_data(legacy_manifest.value());
-    if (!raw_safety) {
-      return clonecore::Result<
-          vssrequester::OnlineTsumugiBackupReport>::failure(
-          raw_safety.error());
-    }
     auto hashes = make_tsumugi_source_identity_hashes(
         source.value().observed.identity,
         source.value().observed.observed.physical_sector_size,
@@ -1146,14 +1417,24 @@ execute_online_image_create(
         source.value(),
         legacy_manifest.value(),
         metadata_value.layout,
+        observed_selection.value(),
         metadata_value.partition_table_snapshot,
         hashes.value());
     if (!manifest) {
       return clonecore::Result<
           vssrequester::OnlineTsumugiBackupReport>::failure(manifest.error());
     }
+    const auto raw_safety = reject_mutable_raw_data(manifest.value());
+    auto selected_entries = selected_manifest_entry_indices(manifest.value());
+    if (!raw_safety || !selected_entries) {
+      return clonecore::Result<
+          vssrequester::OnlineTsumugiBackupReport>::failure(
+          raw_safety ? selected_entries.error() : raw_safety.error());
+    }
     auto bindings = dependencies.query_mbr_bindings(
-        source.value().observed.observed, metadata_value.layout);
+        source.value().observed.observed,
+        metadata_value.layout,
+        selected_entries.value());
     if (!bindings) {
       return clonecore::Result<
           vssrequester::OnlineTsumugiBackupReport>::failure(bindings.error());
@@ -1166,7 +1447,8 @@ execute_online_image_create(
             request,
             source.value(),
             std::move(metadata_value.backup_manifest),
-            std::move(metadata_value.partition_table_snapshot)));
+            std::move(metadata_value.partition_table_snapshot),
+            selected_entries.take_value()));
   }
   if (!legacy_plan) {
     return clonecore::Result<
@@ -1242,6 +1524,7 @@ execute_online_image_create(
           .prepared = std::move(prepared),
           .async_wait = request.async_wait,
           .callbacks = request.callbacks,
+          .diff_area_review_callback = request.diff_area_review_callback,
           .logger = request.logger,
       });
 }
@@ -1260,15 +1543,17 @@ execute_online_image_create_with_windows_apis(
               },
           .query_gpt_bindings =
               [](const diskmodel::DiskInfo& disk,
-                 const clonecore::GptDisk& layout) {
-                return diskmodel::query_windows_volume_bitmap_bindings(
-                    disk, layout);
+                 const clonecore::GptDisk& layout,
+                 const std::span<const std::uint32_t> selected_entries) {
+                return query_selected_gpt_volume_bindings(
+                    disk, layout, selected_entries);
               },
           .query_mbr_bindings =
               [](const diskmodel::DiskInfo& disk,
-                 const clonecore::MbrDisk& layout) {
-                return diskmodel::query_windows_volume_bitmap_bindings(
-                    disk, layout);
+                 const clonecore::MbrDisk& layout,
+                 const std::span<const std::uint32_t> selected_entries) {
+                return query_selected_mbr_volume_bindings(
+                    disk, layout, selected_entries);
               },
           .query_destination_file_system =
               query_destination_file_system_with_windows_apis,
@@ -1364,6 +1649,13 @@ execute_windows_data_rescue_image_create(
     return clonecore::Result<WindowsDataRescueImageCreateReport>::failure(
         source_identity.error());
   }
+  auto whole_selection = diskmodel::normalize_image_partition_selection(
+      observed,
+      std::span<const std::uint32_t>{});
+  if (!whole_selection) {
+    return clonecore::Result<WindowsDataRescueImageCreateReport>::failure(
+        whole_selection.error());
+  }
 
   clonecore::Result<imageformat::TsumugiManifest> manifest =
       failure<imageformat::TsumugiManifest>(
@@ -1405,6 +1697,7 @@ execute_windows_data_rescue_image_create(
         source.value(),
         legacy_manifest.value(),
         metadata_value.layout,
+        whole_selection.value(),
         metadata_value.partition_table_snapshot,
         hashes.value());
   } else {
@@ -1434,6 +1727,7 @@ execute_windows_data_rescue_image_create(
         source.value(),
         legacy_manifest.value(),
         metadata_value.layout,
+        whole_selection.value(),
         metadata_value.partition_table_snapshot,
         hashes.value());
   }

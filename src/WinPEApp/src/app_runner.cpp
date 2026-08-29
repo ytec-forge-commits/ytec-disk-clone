@@ -37,9 +37,6 @@ struct DirectArguments final {
   std::uint32_t source_disk_number{};
   std::uint32_t target_disk_number{};
   OutputFormat format{OutputFormat::text};
-  bool execute{};
-  bool target_erasure_acknowledged{};
-  std::wstring confirmation;
 };
 
 clonecore::Error app_error(
@@ -81,17 +78,14 @@ std::optional<DirectArguments> parse_direct_arguments(
   if (arguments.empty()) {
     return std::nullopt;
   }
-  const bool execute = arguments.front() == L"--clone-execute";
-  if (!execute && arguments.front() != L"--clone-preflight") {
+  if (arguments.front() != L"--clone-preflight") {
     return std::nullopt;
   }
 
   std::optional<std::uint32_t> source;
   std::optional<std::uint32_t> target;
-  std::optional<std::wstring> confirmation;
   OutputFormat format = OutputFormat::text;
   bool format_selected = false;
-  bool acknowledged = false;
 
   for (std::size_t index = 1; index < arguments.size(); ++index) {
     const auto& argument = arguments[index];
@@ -121,60 +115,30 @@ std::optional<DirectArguments> parse_direct_arguments(
       format_selected = true;
       continue;
     }
-    if (execute && argument == L"--acknowledge-target-erasure") {
-      if (acknowledged) {
-        return std::nullopt;
-      }
-      acknowledged = true;
-      continue;
-    }
-    if (execute && argument == L"--confirmation") {
-      if (index + 1U >= arguments.size()) {
-        return std::nullopt;
-      }
-      if (confirmation.has_value() || arguments[index + 1U].empty()) {
-        return std::nullopt;
-      }
-      confirmation = arguments[++index];
-      continue;
-    }
     return std::nullopt;
   }
 
-  if (!source.has_value() || !target.has_value() || source == target ||
-      (execute && (!acknowledged || !confirmation.has_value()))) {
+  if (!source.has_value() || !target.has_value() || source == target) {
     return std::nullopt;
   }
   return DirectArguments{
       .source_disk_number = source.value(),
       .target_disk_number = target.value(),
       .format = format,
-      .execute = execute,
-      .target_erasure_acknowledged = acknowledged,
-      .confirmation = confirmation.value_or(L""),
   };
 }
 
-void write_usage(
-    std::ostream& stream,
-    const bool execution_available) {
+void write_usage(std::ostream& stream) {
   stream
-      << "Y-TEC Tsumugi Drive WinPE ディスク操作\n"
+      << "Y-TEC Tsumugi Drive WinPE 読取り専用診断\n"
          "使い方:\n"
          "  ytec-winpe-app [--text | --json]\n"
          "  ytec-winpe-app --clone-preflight --source N --target N "
-         "[--text | --json]\n";
-  if (execution_available) {
-    stream
-        << "  ytec-winpe-app --clone-execute --source N --target N\n"
-           "      --acknowledge-target-erasure --confirmation OK "
-           "[--text | --json]\n";
-  }
-  stream
-      << "  ytec-winpe-app --help\n\n"
-         "クローンは、このPEセッションでコピー元とコピー先を直接選択し、\n"
-         "実行直前の再識別と大文字 OK の確認後に開始します。\n"
-         "コピー先の既存パーティションは確認後に消去されます。\n"
+         "[--text | --json]\n"
+         "  ytec-winpe-app --help\n\n"
+         "このCLIは列挙とクローン事前確認だけを行い、ディスクへ書き込みません。\n"
+         "破壊的な操作は、製品GUIで対象要約を確認し、大文字 OK を手入力した\n"
+         "同じセッション内からだけ開始できます。\n"
          "予約ファイルの検索、読込み、変換、実行、削除は行いません。\n";
 }
 
@@ -514,27 +478,6 @@ std::string format_plan_json(const DirectCloneOperationPlan& plan) {
          << ",\"sourcePartitionCount\":" << plan.source_partition_count
          << ",\"targetPartitionCount\":" << plan.target_partition_count
          << ",\"confirmation\":\"OK\",\"executionEnabled\":false}\n";
-  return stream.str();
-}
-
-std::string format_execution_text(const CloneExecutionReport& report) {
-  std::ostringstream stream;
-  stream << "Y-TEC Tsumugi Drive PE直接クローン\n"
-         << "結果: PASS\n"
-         << "コピー済みデータ: " << report.copied_data_bytes << " bytes\n"
-         << "コピー区画数: " << report.copied_partition_count << '\n'
-         << "読戻し検証: 成功\n"
-         << "コピー先: offline（検証完了・換装待ち）\n";
-  return stream.str();
-}
-
-std::string format_execution_json(const CloneExecutionReport& report) {
-  std::ostringstream stream;
-  stream << "{\"schemaVersion\":2,\"mode\":\"direct-clone-execution\","
-            "\"result\":\"PASS\",\"copiedDataBytes\":"
-         << report.copied_data_bytes << ",\"copiedPartitionCount\":"
-         << report.copied_partition_count
-         << ",\"readBackVerified\":true,\"targetLeftOffline\":true}\n";
   return stream.str();
 }
 
@@ -915,10 +858,9 @@ int run_winpe_app(
     const std::vector<std::wstring>& arguments,
     diskmodel::IDiskInventoryProvider& provider,
     std::ostream& output,
-    std::ostream& error_output,
-    ICloneExecutionService* const execution_service) {
+    std::ostream& error_output) {
   if (arguments.size() == 1U && is_help_argument(arguments.front())) {
-    write_usage(output, execution_service != nullptr);
+    write_usage(output);
     return static_cast<int>(clitools::CliExitCode::success);
   }
   if (arguments.empty() ||
@@ -931,7 +873,7 @@ int run_winpe_app(
   const auto direct = parse_direct_arguments(arguments);
   if (!direct.has_value()) {
     error_output << "引数が不正です。\n";
-    write_usage(error_output, execution_service != nullptr);
+    write_usage(error_output);
     return static_cast<int>(clitools::CliExitCode::invalid_arguments);
   }
 
@@ -941,30 +883,9 @@ int run_winpe_app(
     write_failure(error_output, plan.error());
     return static_cast<int>(clitools::CliExitCode::failure);
   }
-  if (!direct->execute) {
-    output << (direct->format == OutputFormat::json
-                   ? format_plan_json(plan.value())
-                   : format_plan_text(plan.value()));
-    return static_cast<int>(clitools::CliExitCode::success);
-  }
-  if (execution_service == nullptr) {
-    error_output << "この実行ファイルではクローン実行機能を利用できません。\n";
-    return static_cast<int>(clitools::CliExitCode::failure);
-  }
-
-  auto execution = execute_direct_clone_operation(
-      plan.value(),
-      direct->target_erasure_acknowledged,
-      direct->confirmation,
-      L"",
-      *execution_service);
-  if (!execution) {
-    write_failure(error_output, execution.error());
-    return static_cast<int>(clitools::CliExitCode::failure);
-  }
   output << (direct->format == OutputFormat::json
-                 ? format_execution_json(execution.value())
-                 : format_execution_text(execution.value()));
+                 ? format_plan_json(plan.value())
+                 : format_plan_text(plan.value()));
   return static_cast<int>(clitools::CliExitCode::success);
 }
 

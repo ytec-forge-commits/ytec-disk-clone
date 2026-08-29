@@ -3,39 +3,25 @@ Set-StrictMode -Version Latest
 
 $repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $scriptPath = Join-Path $PSScriptRoot 'New-PortablePackage.ps1'
+$versionHelperPath = Join-Path $PSScriptRoot 'ProductVersion.ps1'
+. $versionHelperPath
+$productVersion = Read-YtecProductVersion `
+    -Path (Join-Path $repoRoot 'version.json')
 
-$tokens = $null
-$parseErrors = $null
-[Management.Automation.Language.Parser]::ParseFile(
-    $scriptPath,
-    [ref]$tokens,
-    [ref]$parseErrors) | Out-Null
-if ($parseErrors.Count -ne 0) {
-    throw "Portable package script parse failed: $($parseErrors[0].Message)"
-}
-
-function Assert-AsciiTokenInFile {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-        [Parameter(Mandatory)]
-        [string]$Token,
-        [Parameter(Mandatory)]
-        [string]$Label
-    )
-
-    $tokenBytes = [Text.Encoding]::ASCII.GetBytes($Token)
-    if (-not [Text.Encoding]::ASCII.GetString($tokenBytes).Equals(
-            $Token,
-            [StringComparison]::Ordinal)) {
-        throw "ASCII以外の版番号は検証できません: $Label"
-    }
-    $contents = [Text.Encoding]::ASCII.GetString(
-        [IO.File]::ReadAllBytes($Path))
-    if ($contents.IndexOf(
-            $Token,
-            [StringComparison]::Ordinal) -lt 0) {
-        throw "製品バイナリの版番号が配布メタデータと一致しません: $Label"
+foreach ($parsePath in @(
+        $versionHelperPath,
+        (Join-Path $PSScriptRoot 'Test-ProductVersion.ps1'),
+        $scriptPath,
+        (Join-Path $PSScriptRoot 'Test-PortablePackageArtifact.ps1'),
+        $PSCommandPath)) {
+    $tokens = $null
+    $parseErrors = $null
+    [Management.Automation.Language.Parser]::ParseFile(
+        $parsePath,
+        [ref]$tokens,
+        [ref]$parseErrors) | Out-Null
+    if ($parseErrors.Count -ne 0) {
+        throw "Portable package script parse failed ($parsePath): $($parseErrors[0].Message)"
     }
 }
 
@@ -71,6 +57,7 @@ $preflightOutput = Join-Path $env:TEMP `
     ('Y-TEC-Tsumugi-Drive-portable-preflight-' +
         [guid]::NewGuid().ToString('N'))
 $preflightZip = $preflightOutput + '.zip'
+$preflightZipSha256 = $preflightZip + '.sha256'
 $result = & $scriptPath -OutputRoot $preflightOutput
 if ($result -notlike 'TSUMUGI_PORTABLE_PREFLIGHT_PASS=*') {
     throw "事前検証の成功マーカーがありません: $result"
@@ -80,14 +67,18 @@ $preflight = $result.Substring(
 
 if ($preflight.schemaVersion -ne 1 -or
     $preflight.product -ne 'Y-TEC Tsumugi Drive' -or
-    $preflight.version -ne '0.2.0-dev' -or
+    $preflight.version -cne $productVersion.display -or
+    $preflight.fileVersion -cne $productVersion.file -or
+    $preflight.channel -cne $productVersion.channel -or
     $preflight.buildRequested -ne $false -or
     $preflight.repositoryContainsMicrosoftPayload -ne $false) {
     throw 'ポータブル配布物の事前検証メタデータが不正です。'
 }
 if ($preflight.outputRoot -ne [IO.Path]::GetFullPath($preflightOutput) -or
-    $preflight.zipPath -ne [IO.Path]::GetFullPath($preflightZip)) {
-    throw 'フォルダーとZIPの非上書き出力先が分離されていません。'
+    $preflight.zipPath -ne [IO.Path]::GetFullPath($preflightZip) -or
+    $preflight.zipSha256Path -ne
+        [IO.Path]::GetFullPath($preflightZipSha256)) {
+    throw 'フォルダー、ZIP、ZIP外部SHA-256の非上書き出力先が分離されていません。'
 }
 
 $requiredFiles = @(
@@ -101,9 +92,11 @@ $requiredFiles = @(
     'safetyAndLimitations',
     'privacyAndNetwork',
     'securityReporting',
+    'termsOfUse',
     'dataReadme',
     'projectLicense',
     'projectNotice',
+    'projectTrademarks',
     'notices',
     'sbom',
     'licenseReadme',
@@ -120,14 +113,49 @@ foreach ($name in $requiredFiles) {
     }
 }
 
-Assert-AsciiTokenInFile `
-    -Path ([string]$preflight.files.windowsApp.path) `
-    -Token ([string]$preflight.version) `
-    -Label 'Windows GUI'
-Assert-AsciiTokenInFile `
-    -Path ([string]$preflight.files.winpeGui.path) `
-    -Token ([string]$preflight.version) `
-    -Label 'WinPE GUI'
+$expectedExecutableMetadata = [ordered]@{
+    windowsApp = [ordered]@{
+        originalFilename = 'ytec-tsumugi-drive.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive'
+    }
+    environment = [ordered]@{
+        originalFilename = 'ytec-winpe-environment.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE Environment'
+    }
+    winpeCli = [ordered]@{
+        originalFilename = 'ytec-winpe-app.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE CLI'
+    }
+    winpeGui = [ordered]@{
+        originalFilename = 'ytec-winpe-gui.exe'
+        fileDescription = 'Y-TEC Tsumugi Drive WinPE GUI'
+    }
+}
+foreach ($name in $expectedExecutableMetadata.Keys) {
+    $metadata = $expectedExecutableMetadata[$name]
+    $actualVersionInfo = Assert-YtecExecutableVersionInfo `
+        -Path ([string]$preflight.files.$name.path) `
+        -Version $productVersion `
+        -OriginalFilename $metadata.originalFilename `
+        -FileDescription $metadata.fileDescription
+    $reportedVersionInfo = $preflight.executables.$name
+    if ($reportedVersionInfo.fileVersion -cne
+            $actualVersionInfo.fileVersion -or
+        $reportedVersionInfo.productVersion -cne
+            $actualVersionInfo.productVersion -or
+        $reportedVersionInfo.originalFilename -cne
+            $actualVersionInfo.originalFilename -or
+        $reportedVersionInfo.fileDescription -cne
+            $actualVersionInfo.fileDescription) {
+        throw "事前検証のVERSIONINFO報告が実行ファイルと一致しません: $name"
+    }
+}
+if ($preflight.sbom.packageVersion -cne $productVersion.display -or
+    $preflight.sbom.documentNamespace -cne
+        ('https://github.com/ytec-commits/ytec-disk-clone/sbom/' +
+            $productVersion.display)) {
+    throw '事前検証のSBOM版報告が製品版正本と一致しません。'
+}
 
 $forbiddenExtensions = @(
     '.wim', '.iso', '.cab', '.msi', '.msix', '.vhd', '.vhdx')
@@ -139,7 +167,10 @@ foreach ($name in $requiredFiles) {
     }
 }
 
-foreach ($path in @($preflightOutput, $preflightZip)) {
+foreach ($path in @(
+        $preflightOutput,
+        $preflightZip,
+        $preflightZipSha256)) {
     if (Test-Path -LiteralPath $path) {
         throw "事前検証だけで出力が作成されました: $path"
     }
@@ -159,7 +190,7 @@ function Remove-ExactPortableTestArtifact {
             $temporaryRoot,
             [StringComparison]::OrdinalIgnoreCase) -or
         $leaf -notmatch
-            '^Y-TEC-Tsumugi-Drive-package-ci-[0-9a-f]{32}(?:\.zip)?$') {
+            '^Y-TEC-Tsumugi-Drive-package-ci-[0-9a-f]{32}(?:\.zip(?:\.sha256)?)?$') {
         throw "一時配布物の削除対象が固定境界外です: $candidate"
     }
     if (-not (Test-Path -LiteralPath $candidate)) {
@@ -188,10 +219,44 @@ function Remove-ExactPortableTestArtifact {
     }
 }
 
+$collisionRoot = Join-Path $env:TEMP `
+    ('Y-TEC-Tsumugi-Drive-package-ci-' +
+        [guid]::NewGuid().ToString('N'))
+$collisionZip = $collisionRoot + '.zip'
+$collisionZipSha256 = $collisionZip + '.sha256'
+$collisionBytes = [Text.Encoding]::ASCII.GetBytes(
+    'existing checksum must remain unchanged')
+$collisionStream = [IO.File]::Open(
+    $collisionZipSha256,
+    [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write,
+    [IO.FileShare]::None)
+try {
+    $collisionStream.Write($collisionBytes, 0, $collisionBytes.Length)
+    $collisionStream.Flush($true)
+} finally {
+    $collisionStream.Dispose()
+}
+try {
+    Assert-Rejected `
+        -OutputRoot $collisionRoot `
+        -ExpectedMessage '既存の出力先'
+    if (-not [Linq.Enumerable]::SequenceEqual(
+            [byte[]]$collisionBytes,
+            [byte[]][IO.File]::ReadAllBytes($collisionZipSha256)) -or
+        (Test-Path -LiteralPath $collisionRoot) -or
+        (Test-Path -LiteralPath $collisionZip)) {
+        throw '既存のZIP外部SHA-256または共存出力が変更されました。'
+    }
+} finally {
+    Remove-ExactPortableTestArtifact -Path $collisionZipSha256
+}
+
 $artifactRoot = Join-Path $env:TEMP `
     ('Y-TEC-Tsumugi-Drive-package-ci-' +
         [guid]::NewGuid().ToString('N'))
 $artifactZip = $artifactRoot + '.zip'
+$artifactZipSha256 = $artifactZip + '.sha256'
 try {
     $packageResult = & $scriptPath `
         -OutputRoot $artifactRoot `
@@ -207,7 +272,16 @@ try {
     $package = $packageMarker[0].Substring(
         'TSUMUGI_PORTABLE_PACKAGE_PASS='.Length) | ConvertFrom-Json
     if ($package.outputRoot -ne [IO.Path]::GetFullPath($artifactRoot) -or
+        $package.version -cne $productVersion.display -or
+        $package.fileVersion -cne $productVersion.file -or
+        $package.channel -cne $productVersion.channel -or
         $package.zip.path -ne [IO.Path]::GetFullPath($artifactZip) -or
+        $package.zipSha256File.path -ne
+            [IO.Path]::GetFullPath($artifactZipSha256) -or
+        $package.zipSha256File.zipSha256 -cne $package.zip.sha256 -or
+        $package.zipSha256File.sha256 -cne
+            (Get-FileHash -LiteralPath $artifactZipSha256 `
+                -Algorithm SHA256).Hash -or
         $package.repositoryContainsMicrosoftPayload -ne $false) {
         throw '実配布ZIPの完成報告が要求した出力と一致しません。'
     }
@@ -474,11 +548,49 @@ try {
         'Test-PortablePackageArtifact.ps1') `
         -PackageRoot $artifactRoot `
         -ZipPath $artifactZip
-    if ($artifactResult -notlike
-        'TSUMUGI_PORTABLE_ARTIFACT_PASS=*') {
+    if ($artifactResult -notlike 'TSUMUGI_PORTABLE_ARTIFACT_PASS=*') {
         throw "実配布ZIPの監査成功マーカーがありません: $artifactResult"
     }
+    $artifactReport = $artifactResult.Substring(
+        'TSUMUGI_PORTABLE_ARTIFACT_PASS='.Length) | ConvertFrom-Json
+    if ($artifactReport.zipSha256 -cne $package.zip.sha256 -or
+        $artifactReport.version -cne $productVersion.display -or
+        $artifactReport.fileVersion -cne $productVersion.file -or
+        $artifactReport.channel -cne $productVersion.channel -or
+        $artifactReport.zipSha256File.path -cne
+            [IO.Path]::GetFullPath($artifactZipSha256) -or
+        $artifactReport.zipSha256File.zipSha256 -cne
+            $package.zip.sha256 -or
+        $artifactReport.zipSha256File.sha256 -cne
+            $package.zipSha256File.sha256) {
+        throw 'ZIP外部SHA-256の生成報告と実体監査が一致しません。'
+    }
+
+    $hashListPath = Join-Path $artifactRoot 'SHA256SUMS.txt'
+    $hashListLines = @([IO.File]::ReadAllLines(
+            $hashListPath,
+            [Text.UTF8Encoding]::new($false, $true)))
+    if ($hashListLines.Count -lt 2) {
+        throw 'SHA256SUMS.txt重複検査の前提行が不足しています。'
+    }
+    $hashListLines[$hashListLines.Count - 1] = $hashListLines[0]
+    [IO.File]::WriteAllLines(
+        $hashListPath,
+        $hashListLines,
+        [Text.UTF8Encoding]::new($false))
+    try {
+        & (Join-Path $PSScriptRoot `
+            'Test-PortablePackageArtifact.ps1') `
+            -PackageRoot $artifactRoot `
+            -ZipPath $artifactZip | Out-Null
+        throw 'SHA256SUMS.txtの重複パスが許可されました。'
+    } catch {
+        if ($_.Exception.Message -notlike '*重複パス*') {
+            throw "SHA256SUMS.txt重複時の拒否理由が想定外です: $($_.Exception.Message)"
+        }
+    }
 } finally {
+    Remove-ExactPortableTestArtifact -Path $artifactZipSha256
     Remove-ExactPortableTestArtifact -Path $artifactZip
     Remove-ExactPortableTestArtifact -Path $artifactRoot
 }

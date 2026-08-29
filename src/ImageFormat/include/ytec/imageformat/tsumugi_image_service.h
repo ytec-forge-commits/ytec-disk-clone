@@ -120,8 +120,9 @@ struct TsumugiImageCreateReport final {
 };
 
 // Central evidence gate shared by Windows, WinPE, VSS and completion actions.
-// It accepts fast mode only when every write-time/hash/metadata gate passed,
-// and accepts complete mode only when the additional full scan also passed.
+// It accepts fast mode when every write-time/hash/metadata gate passed; a
+// persistent-resume coordinator may safely strengthen that selection with a
+// full scan. Complete mode always requires the additional full scan.
 [[nodiscard]] bool selected_tsumugi_creation_verification_passed(
     const TsumugiImageCreateReport& report) noexcept;
 

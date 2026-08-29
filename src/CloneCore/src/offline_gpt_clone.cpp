@@ -348,6 +348,168 @@ Result<Fat32Geometry> parse_fat32_geometry(
   return Result<Fat32Geometry>::success(geometry);
 }
 
+Result<ExFatGeometry> parse_exfat_geometry(
+    const std::span<const std::byte> boot_sector,
+    const std::uint32_t expected_sector_size,
+    const std::uint64_t partition_size_bytes) {
+  constexpr char kExFatSignature[] = "EXFAT   ";
+  if (boot_sector.size() < 512 ||
+      std::memcmp(boot_sector.data() + 3, kExFatSignature, 8) != 0 ||
+      boot_sector[510] != std::byte{0x55} ||
+      boot_sector[511] != std::byte{0xAA} ||
+      !std::all_of(
+          boot_sector.begin() + 11,
+          boot_sector.begin() + 64,
+          [](const std::byte value) { return value == std::byte{0}; }) ||
+      !std::all_of(
+          boot_sector.begin() + 113,
+          boot_sector.begin() + 120,
+          [](const std::byte value) { return value == std::byte{0}; })) {
+    return Result<ExFatGeometry>::failure(clone_error(
+        ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"exFATブートセクター",
+        L"exFATとして安全に識別できません"));
+  }
+
+  const std::uint8_t sector_shift =
+      std::to_integer<std::uint8_t>(boot_sector[108]);
+  const std::uint8_t cluster_shift =
+      std::to_integer<std::uint8_t>(boot_sector[109]);
+  const std::uint8_t fat_count =
+      std::to_integer<std::uint8_t>(boot_sector[110]);
+  const std::uint8_t percent_in_use =
+      std::to_integer<std::uint8_t>(boot_sector[112]);
+  const std::uint16_t revision =
+      read_little<std::uint16_t>(boot_sector, 104);
+  const std::uint16_t volume_flags =
+      read_little<std::uint16_t>(boot_sector, 106);
+  if (sector_shift >= 32U || cluster_shift >= 32U ||
+      sector_shift + cluster_shift > 25U) {
+    return Result<ExFatGeometry>::failure(clone_error(
+        ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"exFATセクター・クラスタ検証",
+        L"exFATのセクターまたはクラスタ指数が対応範囲外です"));
+  }
+
+  ExFatGeometry geometry;
+  geometry.bytes_per_sector = std::uint32_t{1} << sector_shift;
+  geometry.sectors_per_cluster = std::uint32_t{1} << cluster_shift;
+  geometry.total_sectors = read_little<std::uint64_t>(boot_sector, 72);
+  geometry.fat_offset_sectors =
+      read_little<std::uint32_t>(boot_sector, 80);
+  geometry.fat_length_sectors =
+      read_little<std::uint32_t>(boot_sector, 84);
+  geometry.cluster_heap_offset_sectors =
+      read_little<std::uint32_t>(boot_sector, 88);
+  geometry.cluster_count =
+      read_little<std::uint32_t>(boot_sector, 92);
+  geometry.root_directory_cluster =
+      read_little<std::uint32_t>(boot_sector, 96);
+
+  std::uint64_t volume_bytes{};
+  std::uint64_t all_fats_length{};
+  std::uint64_t fat_end{};
+  std::uint64_t heap_length{};
+  std::uint64_t heap_end{};
+  std::uint64_t fat_bytes{};
+  std::uint64_t required_fat_bytes{};
+  if (geometry.bytes_per_sector != expected_sector_size ||
+      expected_sector_size == 0U || geometry.total_sectors == 0U ||
+      !checked_multiply(
+          geometry.total_sectors, geometry.bytes_per_sector, volume_bytes) ||
+      volume_bytes > partition_size_bytes ||
+      geometry.fat_offset_sectors < 24U ||
+      geometry.fat_length_sectors == 0U ||
+      (fat_count != 1U && fat_count != 2U) ||
+      !checked_multiply(
+          geometry.fat_length_sectors, fat_count, all_fats_length) ||
+      !checked_add(
+          geometry.fat_offset_sectors, all_fats_length, fat_end) ||
+      geometry.cluster_heap_offset_sectors < fat_end ||
+      geometry.cluster_count == 0U ||
+      geometry.cluster_count > 0xFFFFFFF5U ||
+      geometry.root_directory_cluster < 2U ||
+      geometry.root_directory_cluster > geometry.cluster_count + 1ULL ||
+      !checked_multiply(
+          geometry.fat_length_sectors,
+          geometry.bytes_per_sector,
+          fat_bytes) ||
+      !checked_multiply(
+          static_cast<std::uint64_t>(geometry.cluster_count) + 2U,
+          sizeof(std::uint32_t),
+          required_fat_bytes) ||
+      fat_bytes < required_fat_bytes ||
+      !checked_multiply(
+          geometry.cluster_count,
+          geometry.sectors_per_cluster,
+          heap_length) ||
+      !checked_add(
+          geometry.cluster_heap_offset_sectors, heap_length, heap_end) ||
+      heap_end > geometry.total_sectors || (revision >> 8U) != 1U ||
+      (volume_flags & 0xFFF0U) != 0U ||
+      (fat_count == 1U && (volume_flags & 0x0001U) != 0U) ||
+      (percent_in_use > 100U && percent_in_use != 0xFFU)) {
+    return Result<ExFatGeometry>::failure(clone_error(
+        ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"exFATジオメトリ検証",
+        L"exFATの容量、FAT、クラスタヒープ、または版情報が不正です"));
+  }
+  return Result<ExFatGeometry>::success(geometry);
+}
+
+Result<BasicDataFileSystem> classify_basic_data_file_system(
+    const std::span<const std::byte> boot_sector,
+    const std::uint32_t expected_sector_size,
+    const std::uint64_t partition_size_bytes) {
+  constexpr char kBitLockerSignature[] = "-FVE-FS-";
+  constexpr char kNtfsSignature[] = "NTFS    ";
+  constexpr char kExFatSignature[] = "EXFAT   ";
+  constexpr char kFat32Signature[] = "FAT32   ";
+  if (boot_sector.size() < 512U) {
+    return Result<BasicDataFileSystem>::failure(clone_error(
+        ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"基本データ領域ブートセクター",
+        L"ファイルシステム識別に必要な先頭512バイトがありません"));
+  }
+  if (std::memcmp(boot_sector.data() + 3, kBitLockerSignature, 8) == 0) {
+    return Result<BasicDataFileSystem>::failure(clone_error(
+        ErrorCode::unsupported_layout,
+        ERROR_NOT_SUPPORTED,
+        L"BitLocker完全復号の確認",
+        L"BitLocker形式を検出しました。保護の中断ではなく完全復号が必要です"));
+  }
+  if (std::memcmp(boot_sector.data() + 3, kNtfsSignature, 8) == 0) {
+    const auto geometry = parse_ntfs_geometry(
+        boot_sector, expected_sector_size, partition_size_bytes);
+    return geometry
+        ? Result<BasicDataFileSystem>::success(BasicDataFileSystem::ntfs)
+        : Result<BasicDataFileSystem>::failure(geometry.error());
+  }
+  if (std::memcmp(boot_sector.data() + 3, kExFatSignature, 8) == 0) {
+    const auto geometry = parse_exfat_geometry(
+        boot_sector, expected_sector_size, partition_size_bytes);
+    return geometry
+        ? Result<BasicDataFileSystem>::success(BasicDataFileSystem::exfat)
+        : Result<BasicDataFileSystem>::failure(geometry.error());
+  }
+  if (std::memcmp(boot_sector.data() + 82, kFat32Signature, 8) == 0) {
+    const auto geometry = parse_fat32_geometry(
+        boot_sector, expected_sector_size, partition_size_bytes);
+    return geometry
+        ? Result<BasicDataFileSystem>::success(BasicDataFileSystem::fat32)
+        : Result<BasicDataFileSystem>::failure(geometry.error());
+  }
+  return Result<BasicDataFileSystem>::failure(clone_error(
+      ErrorCode::unsupported_layout,
+      ERROR_NOT_SUPPORTED,
+      L"基本データ領域ファイルシステム",
+      L"NTFS、FAT32、exFATのいずれとしても安全に識別できません"));
+}
+
 Status validate_fat32_boot_sector(
     const std::span<const std::byte> boot_sector,
     const std::uint32_t expected_sector_size,
@@ -423,26 +585,42 @@ Result<OfflineGptClonePlan> build_offline_gpt_clone_plan(
       copy.mode = PartitionCopyMode::recovery_ntfs_raw;
       copy.source_ranges.push_back(partition_range);
     } else if (partition.type_guid == gpt_type_basic_data()) {
-      const auto ntfs_result = parse_ntfs_geometry(
+      const auto file_system = classify_basic_data_file_system(
           boot_result.value(),
           source.logical_sector_size(),
           partition_range.length);
-      if (!ntfs_result) {
-        return Result<OfflineGptClonePlan>::failure(ntfs_result.error());
+      if (!file_system) {
+        return Result<OfflineGptClonePlan>::failure(file_system.error());
       }
-      auto ranges_result = used_range_provider.query_used_ranges(
-          partition.entry_index, ntfs_result.value());
-      if (!ranges_result) {
-        return Result<OfflineGptClonePlan>::failure(ranges_result.error());
+      if (file_system.value() == BasicDataFileSystem::ntfs) {
+        const auto ntfs_result = parse_ntfs_geometry(
+            boot_result.value(),
+            source.logical_sector_size(),
+            partition_range.length);
+        if (!ntfs_result) {
+          return Result<OfflineGptClonePlan>::failure(ntfs_result.error());
+        }
+        auto ranges_result = used_range_provider.query_used_ranges(
+            partition.entry_index, ntfs_result.value());
+        if (!ranges_result) {
+          return Result<OfflineGptClonePlan>::failure(ranges_result.error());
+        }
+        std::vector<ByteRange> ranges = ranges_result.value();
+        const Status ranges_status = validate_used_ranges(
+            ranges, partition_range, ntfs_result.value());
+        if (!ranges_status) {
+          return Result<OfflineGptClonePlan>::failure(ranges_status.error());
+        }
+        copy.mode = PartitionCopyMode::ntfs_used_clusters;
+        copy.source_ranges = std::move(ranges);
+      } else {
+        copy.mode = file_system.value() == BasicDataFileSystem::fat32
+            ? PartitionCopyMode::basic_fat32_raw
+            : PartitionCopyMode::basic_exfat_raw;
+        // Exact clone preserves the complete filesystem container.  Sparse
+        // inference is intentionally limited to NTFS bitmap-backed routes.
+        copy.source_ranges.push_back(partition_range);
       }
-      std::vector<ByteRange> ranges = ranges_result.value();
-      const Status ranges_status =
-          validate_used_ranges(ranges, partition_range, ntfs_result.value());
-      if (!ranges_status) {
-        return Result<OfflineGptClonePlan>::failure(ranges_status.error());
-      }
-      copy.mode = PartitionCopyMode::ntfs_used_clusters;
-      copy.source_ranges = std::move(ranges);
     } else {
       return Result<OfflineGptClonePlan>::failure(clone_error(
           ErrorCode::unsupported_layout,

@@ -4,18 +4,50 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$project = Get-Content -LiteralPath (Join-Path $repoRoot 'sbom\project.json') -Raw |
-    ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'ProductVersion.ps1')
+$productVersion = Read-YtecProductVersion `
+    -Path (Join-Path $repoRoot 'version.json')
+$projectText = Get-Content `
+    -LiteralPath (Join-Path $repoRoot 'sbom\project.json') `
+    -Raw
+$project = $projectText | ConvertFrom-Json
 $dependencyManifest = Get-Content -LiteralPath `
     (Join-Path $repoRoot 'third_party\dependencies.json') -Raw |
     ConvertFrom-Json
 
 $rootPackageId = 'SPDXRef-Package-ytec-disk-clone'
+$projectMembers = @(
+    'name',
+    'downloadLocation',
+    'license',
+    'copyright',
+    'documentNamespaceBase',
+    'createdUtc')
+$actualProjectMembers = @($project.PSObject.Properties.Name)
+if ($actualProjectMembers.Count -ne $projectMembers.Count) {
+    throw 'sbom/project.json は版以外の必須6項目だけを含める必要があります。'
+}
+foreach ($projectMember in $projectMembers) {
+    if ($actualProjectMembers -cnotcontains $projectMember -or
+        ($projectMember -cne 'createdUtc' -and
+            $project.$projectMember -isnot [string]) -or
+        [string]::IsNullOrWhiteSpace([string]$project.$projectMember)) {
+        throw "sbom/project.json の必須文字列項目が不正です: $projectMember"
+    }
+}
+if ($projectText -cnotmatch
+    '"createdUtc"\s*:\s*"(?<created>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)"') {
+    throw 'sbom/project.json createdUtc は秒精度のUTC文字列である必要があります。'
+}
+$createdUtc = [string]$matches['created']
+$documentNamespace =
+    $project.documentNamespaceBase.TrimEnd('/') + '/' +
+    $productVersion.display
 $packages = @(
     [ordered]@{
         name                  = $project.name
         SPDXID                = $rootPackageId
-        versionInfo           = $project.version
+        versionInfo           = $productVersion.display
         downloadLocation      = $project.downloadLocation
         filesAnalyzed         = $false
         licenseConcluded      = $project.license
@@ -70,10 +102,10 @@ $document = [ordered]@{
     spdxVersion       = 'SPDX-2.3'
     dataLicense       = 'CC0-1.0'
     SPDXID            = 'SPDXRef-DOCUMENT'
-    name              = "$($project.name)-$($project.version)"
-    documentNamespace = $project.documentNamespace
+    name              = "$($project.name)-$($productVersion.display)"
+    documentNamespace = $documentNamespace
     creationInfo      = [ordered]@{
-        created  = $project.createdUtc
+        created  = $createdUtc
         creators = @(
             'Organization: Y-TEC'
             'Tool: scripts/generate-sbom.ps1'

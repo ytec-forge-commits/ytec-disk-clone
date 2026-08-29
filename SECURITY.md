@@ -6,9 +6,10 @@ disk that contains data, or another person's system.
 
 ## Supported versions
 
-There is currently no supported stable release. The public repository contains
-the `0.2.0-dev` development line targeting 1.0.0. Security fixes are applied to
-the current `main` branch. Historical development snapshots and unofficial
+There is currently no supported stable release. This personally developed
+open-source project publishes the `1.0.0-internal-beta` pre-release validation
+line. It is not company-internal software. Security fixes are applied to the
+current `main` branch. Historical development snapshots and unofficial
 third-party builds are not supported.
 
 ## Private reporting

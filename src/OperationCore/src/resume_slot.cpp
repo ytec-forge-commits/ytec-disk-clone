@@ -76,6 +76,58 @@ bool optional_partial_equal(
   return !left || partial_equal(*left, *right);
 }
 
+bool owned_object_role_known(const ResumeOwnedObjectRole role) noexcept {
+  switch (role) {
+    case ResumeOwnedObjectRole::image_partial:
+    case ResumeOwnedObjectRole::image_resume_journal:
+    case ResumeOwnedObjectRole::rescue_stage:
+      return true;
+  }
+  return false;
+}
+
+bool owned_object_equal(
+    const ResumeOwnedObjectBinding& left,
+    const ResumeOwnedObjectBinding& right) noexcept {
+  return left.role == right.role &&
+         operation_id_equal(left.operation_id, right.operation_id) &&
+         identities_equal(left.identities, right.identities) &&
+         detail::digest_equal(
+             left.file_object_identity_hash,
+             right.file_object_identity_hash);
+}
+
+bool owned_objects_equal(
+    const std::vector<ResumeOwnedObjectBinding>& left,
+    const std::vector<ResumeOwnedObjectBinding>& right) noexcept {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < left.size(); ++index) {
+    if (!owned_object_equal(left[index], right[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool owned_object_review_bindings_equal(
+    const std::vector<ResumeOwnedObjectReviewBinding>& left,
+    const std::vector<ResumeOwnedObjectReviewBinding>& right) noexcept {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < left.size(); ++index) {
+    if (left[index].role != right[index].role ||
+        !detail::digest_equal(
+            left[index].file_object_identity_hash,
+            right[index].file_object_identity_hash)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool binding_equal(
     const ResumeSlotBinding& left,
     const ResumeSlotBinding& right) noexcept {
@@ -85,7 +137,10 @@ bool binding_equal(
       !detail::digest_equal(
           left.checkpoint_record_hash, right.checkpoint_record_hash) ||
       left.partial_file_object_identity_hash.has_value() !=
-          right.partial_file_object_identity_hash.has_value()) {
+          right.partial_file_object_identity_hash.has_value() ||
+      !owned_object_review_bindings_equal(
+          left.owned_object_file_bindings,
+          right.owned_object_file_bindings)) {
     return false;
   }
   return !left.partial_file_object_identity_hash ||
@@ -105,7 +160,8 @@ bool records_equal(
          detail::digest_equal(
              left.checkpoint.record_hash,
              right.checkpoint.record_hash) &&
-         optional_partial_equal(left.owned_partial, right.owned_partial);
+         optional_partial_equal(left.owned_partial, right.owned_partial) &&
+         owned_objects_equal(left.owned_objects, right.owned_objects);
 }
 
 bool is_fixed_checkpoint_path(const std::wstring& path) {
@@ -160,8 +216,26 @@ clonecore::Status validate_storage_shape(
   if (!checkpoint) {
     return checkpoint;
   }
-  return validate_existing_file_proof(
+  const auto partial = validate_existing_file_proof(
       storage.owned_partial_file, L"Resume Slot owned partial");
+  if (!partial) {
+    return partial;
+  }
+  if (storage.owned_object_files.size() > kMaximumResumeOwnedObjects) {
+    return resume_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"Resume Slot owned object配置証明",
+        L"owned object数が安全上限を超えています");
+  }
+  for (const auto& object : storage.owned_object_files) {
+    const auto valid = validate_existing_file_proof(
+        object, L"Resume Slot owned object");
+    if (!valid) {
+      return valid;
+    }
+  }
+  return clonecore::success_status();
 }
 
 clonecore::Status validate_observation_relationship(
@@ -183,8 +257,28 @@ clonecore::Status validate_observation_relationship(
         L"単一Resume Slot partial観測",
         L"partial存在状態と検証済み所有情報が一致しません");
   }
+  if (observation.storage.owned_object_files.size() !=
+      observation.observed_owned_objects.size()) {
+    return resume_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_FILE_INVALID,
+        L"Resume Slot owned object観測",
+        L"owned objectの配置証明と所有情報の件数が一致しません");
+  }
+  for (std::size_t index = 0U;
+       index < observation.storage.owned_object_files.size(); ++index) {
+    if (!observation.storage.owned_object_files[index].exists) {
+      return resume_failure(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_FILE_INVALID,
+          L"Resume Slot owned object観測",
+          L"観測されたowned objectの存在証明が不正です");
+    }
+  }
   if (!observation.slot) {
-    if (observation.observed_owned_partial && !allow_unattached_partial) {
+    if ((observation.observed_owned_partial ||
+         !observation.observed_owned_objects.empty()) &&
+        !allow_unattached_partial) {
       return resume_failure(
           clonecore::ErrorCode::access_denied,
           ERROR_FILE_EXISTS,
@@ -207,6 +301,15 @@ clonecore::Status validate_observation_relationship(
         L"単一Resume Slot partial所有照合",
         L"checkpointが宣言したpartialと開いたファイルの所有情報が一致しません");
   }
+  if (!owned_objects_equal(
+          observation.slot->owned_objects,
+          observation.observed_owned_objects)) {
+    return resume_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_FILE_INVALID,
+        L"Resume Slot owned object所有照合",
+        L"checkpointが宣言したowned objectと開いたファイルの所有情報が一致しません");
+  }
   return clonecore::success_status();
 }
 
@@ -225,10 +328,32 @@ clonecore::Error callback_exception(const std::wstring_view operation) {
 
 }  // namespace
 
+clonecore::Result<PersistentPeExactImageCreateObservation>
+IResumeSlotPlatform::inspect_persistent_pe_exact_image_create() {
+  return clonecore::Result<
+      PersistentPeExactImageCreateObservation>::failure(resume_error(
+      clonecore::ErrorCode::unsupported_platform,
+      ERROR_NOT_SUPPORTED,
+      L"Resume Slot WinPE image-create inspect",
+      L"このplatformはWinPE通常イメージ作成の永続回復を実装していません"));
+}
+
+clonecore::Result<PersistentPeExactImageCreateCommitReport>
+IResumeSlotPlatform::commit_persistent_pe_exact_image_create(
+    const PersistentPeExactImageCreateCommitRequest&) {
+  return clonecore::Result<
+      PersistentPeExactImageCreateCommitReport>::failure(resume_error(
+      clonecore::ErrorCode::unsupported_platform,
+      ERROR_NOT_SUPPORTED,
+      L"Resume Slot WinPE image-create commit",
+      L"このplatformはWinPE通常イメージ作成の永続確定を実装していません"));
+}
+
 ResumeLifetime resume_lifetime(const ResumeCapability capability) noexcept {
   switch (capability) {
     case ResumeCapability::persistent_exact_restore:
     case ResumeCapability::persistent_rescue_restore:
+    case ResumeCapability::persistent_pe_exact_image_create:
       return ResumeLifetime::persistent;
     case ResumeCapability::same_process_only_vss_image_create:
     case ResumeCapability::same_process_only_vss_clone:
@@ -251,6 +376,10 @@ clonecore::Status validate_resume_capability(
     case ResumeCapability::persistent_exact_restore:
     case ResumeCapability::persistent_rescue_restore:
       shape_matches = kind == OperationKind::image_restore;
+      break;
+    case ResumeCapability::persistent_pe_exact_image_create:
+      shape_matches = kind == OperationKind::image_create &&
+                      environment == OperationEnvironment::winpe;
       break;
     case ResumeCapability::same_process_only_vss_image_create:
       shape_matches = kind == OperationKind::image_create &&
@@ -295,7 +424,7 @@ clonecore::Status validate_resume_slot_record(
         clonecore::ErrorCode::unsupported_layout,
         ERROR_NOT_SUPPORTED,
         L"永続Resume Slot",
-        L"永続再開に対応するexact/rescue restoreだけを保存できます");
+        L"永続再開対応のrestoreまたはWinPE exact image-createだけを保存できます");
   }
   const auto capability = validate_resume_capability(
       record.capability,
@@ -348,6 +477,80 @@ clonecore::Status validate_resume_slot_record(
           L"operation ID、identity Hash、またはfile-object Hashが一致しません");
     }
   }
+  if (record.owned_partial && !record.owned_objects.empty()) {
+    return resume_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"Resume Slot owned object形式",
+        L"旧partial束縛とschema v3の複数object束縛は併用できません");
+  }
+  if (record.owned_objects.size() > kMaximumResumeOwnedObjects) {
+    return resume_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_INVALID_DATA,
+        L"Resume Slot owned object件数",
+        L"owned object数が安全上限を超えています");
+  }
+  for (std::size_t index = 0U; index < record.owned_objects.size(); ++index) {
+    const auto& object = record.owned_objects[index];
+    if (!owned_object_role_known(object.role) ||
+        !operation_id_equal(
+            record.checkpoint.checkpoint.operation_id,
+            object.operation_id) ||
+        !identities_equal(record.identities, object.identities) ||
+        detail::digest_is_zero(object.file_object_identity_hash)) {
+      return resume_failure(
+          clonecore::ErrorCode::identity_mismatch,
+          ERROR_FILE_INVALID,
+          L"Resume Slot owned object",
+          L"role、operation ID、identity Hash、またはfile-object Hashが不正です");
+    }
+    for (std::size_t prior = 0U; prior < index; ++prior) {
+      if (record.owned_objects[prior].role == object.role) {
+        return resume_failure(
+            clonecore::ErrorCode::invalid_data,
+            ERROR_DUP_NAME,
+            L"Resume Slot owned object role",
+            L"同じowned object roleを複数束縛できません");
+      }
+    }
+    if (index != 0U &&
+        static_cast<std::uint8_t>(record.owned_objects[index - 1U].role) >=
+            static_cast<std::uint8_t>(object.role)) {
+      return resume_failure(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"Resume Slot owned object role順",
+          L"owned objectはroleの昇順でcanonicalに保存する必要があります");
+    }
+  }
+  if (record.capability ==
+      ResumeCapability::persistent_pe_exact_image_create) {
+    bool has_partial = false;
+    bool has_journal = false;
+    for (const auto& object : record.owned_objects) {
+      has_partial = has_partial ||
+          object.role == ResumeOwnedObjectRole::image_partial;
+      has_journal = has_journal ||
+          object.role == ResumeOwnedObjectRole::image_resume_journal;
+    }
+    if (record.checkpoint.checkpoint.schema_version !=
+            kCheckpointSchemaVersionV3 ||
+        record.owned_objects.size() != 2U || !has_partial || !has_journal ||
+        record.owned_partial) {
+      return resume_failure(
+          clonecore::ErrorCode::invalid_data,
+          ERROR_INVALID_DATA,
+          L"WinPE image-create Resume Slot",
+          L"schema v3とimage partial/journalの2オブジェク完全束縛が必要です");
+    }
+  } else if (!record.owned_objects.empty()) {
+    return resume_failure(
+        clonecore::ErrorCode::invalid_data,
+        ERROR_NOT_SUPPORTED,
+        L"Resume Slot owned object capability",
+        L"複数owned object束縛はWinPE exact image-create専用です");
+  }
   return clonecore::success_status();
 }
 
@@ -366,6 +569,18 @@ clonecore::Result<ResumeSlotBinding> make_resume_slot_binding(
           ? std::optional<Sha256Digest>(
                 record.owned_partial->file_object_identity_hash)
           : std::nullopt,
+      .owned_object_file_bindings = [&record]() {
+        std::vector<ResumeOwnedObjectReviewBinding> bindings;
+        bindings.reserve(record.owned_objects.size());
+        for (const auto& object : record.owned_objects) {
+          bindings.push_back(ResumeOwnedObjectReviewBinding{
+              .role = object.role,
+              .file_object_identity_hash =
+                  object.file_object_identity_hash,
+          });
+        }
+        return bindings;
+      }(),
   });
 }
 
@@ -416,6 +631,28 @@ SingleResumeSlot::inspect() {
   }
   return clonecore::Result<std::optional<ResumeSlotRecord>>::success(
       std::move(observed.value().slot));
+}
+
+clonecore::Status SingleResumeSlot::guard_new_operation_start(
+    const OperationPlan& plan) {
+  const auto valid_plan = validate_operation_plan(plan);
+  if (!valid_plan) {
+    return valid_plan;
+  }
+
+  auto active = inspect();
+  if (!active) {
+    return clonecore::Status::failure(active.error());
+  }
+  if (active.value()) {
+    return resume_failure(
+        clonecore::ErrorCode::access_denied,
+        ERROR_BUSY,
+        L"新規操作開始の単一Resume Slot gate",
+        L"前回中断した処理が残っているため新規OperationPlanを開始できません。"
+        L"同じslotを完全拘束したresumeまたはowned discardだけを選択してください");
+  }
+  return clonecore::success_status();
 }
 
 clonecore::Result<ResumeSlotRecord> SingleResumeSlot::open_bound(
@@ -473,6 +710,15 @@ clonecore::Status SingleResumeSlot::create(
         ERROR_FILE_INVALID,
         L"Resume Slot新規partial拘束",
         L"宣言したowned partialをfile-object identityで確認できません");
+  }
+  if (!owned_objects_equal(
+          record.owned_objects,
+          before.value().observed_owned_objects)) {
+    return resume_failure(
+        clonecore::ErrorCode::identity_mismatch,
+        ERROR_FILE_INVALID,
+        L"Resume Slot新規owned object拘束",
+        L"宣言したowned objectをroleとfile-object identityで確認できません");
   }
 
   clonecore::Status created = [&]() {
@@ -565,7 +811,8 @@ clonecore::Status SingleResumeSlot::discard(
   const auto relationship =
       validate_observation_relationship(after.value(), false);
   if (!relationship || after.value().slot ||
-      after.value().observed_owned_partial) {
+      after.value().observed_owned_partial ||
+      !after.value().observed_owned_objects.empty()) {
     return resume_failure(
         clonecore::ErrorCode::verification_failed,
         ERROR_FILE_INVALID,

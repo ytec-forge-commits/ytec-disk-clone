@@ -260,12 +260,17 @@ Result<OfflineMbrClonePlan> build_offline_mbr_clone_plan(
   if (!source_mbr) {
     return Result<OfflineMbrClonePlan>::failure(source_mbr.error());
   }
+  const bool bios_boot_layout = std::any_of(
+      source_mbr.value().partitions.begin(),
+      source_mbr.value().partitions.end(),
+      [](const MbrPartition& partition) { return partition.active; });
   const auto target_mbr = make_mbr_write_plan(
       source_mbr.value(),
       target.size_bytes(),
       target.logical_sector_size(),
       signature_generator,
-      disallowed_signatures);
+      disallowed_signatures,
+      bios_boot_layout);
   if (!target_mbr) {
     return Result<OfflineMbrClonePlan>::failure(target_mbr.error());
   }
@@ -287,26 +292,44 @@ Result<OfflineMbrClonePlan> build_offline_mbr_clone_plan(
     PlannedMbrPartitionCopy copy;
     copy.table_index = partition.table_index;
     if (partition.type == 0x07) {
-      const auto geometry = parse_ntfs_geometry(
+      const auto file_system = classify_basic_data_file_system(
           boot_sector.value(),
           source.logical_sector_size(),
           partition_range.value().length);
-      if (!geometry) {
-        return Result<OfflineMbrClonePlan>::failure(geometry.error());
+      if (!file_system) {
+        return Result<OfflineMbrClonePlan>::failure(file_system.error());
       }
-      auto ranges = used_range_provider.query_used_ranges(
-          partition.table_index, geometry.value());
-      if (!ranges) {
-        return Result<OfflineMbrClonePlan>::failure(ranges.error());
+      if (file_system.value() == BasicDataFileSystem::ntfs) {
+        const auto geometry = parse_ntfs_geometry(
+            boot_sector.value(),
+            source.logical_sector_size(),
+            partition_range.value().length);
+        if (!geometry) {
+          return Result<OfflineMbrClonePlan>::failure(geometry.error());
+        }
+        auto ranges = used_range_provider.query_used_ranges(
+            partition.table_index, geometry.value());
+        if (!ranges) {
+          return Result<OfflineMbrClonePlan>::failure(ranges.error());
+        }
+        std::vector<ByteRange> used = ranges.value();
+        const Status valid = validate_used_ranges(
+            used, partition_range.value(), geometry.value());
+        if (!valid) {
+          return Result<OfflineMbrClonePlan>::failure(valid.error());
+        }
+        copy.mode = MbrPartitionCopyMode::ntfs_used_clusters;
+        copy.source_ranges = std::move(used);
+      } else if (file_system.value() == BasicDataFileSystem::exfat) {
+        copy.mode = MbrPartitionCopyMode::exfat_raw;
+        copy.source_ranges.push_back(partition_range.value());
+      } else {
+        return Result<OfflineMbrClonePlan>::failure(clone_error(
+            ErrorCode::unsupported_layout,
+            ERROR_NOT_SUPPORTED,
+            L"MBR 0x07ファイルシステム",
+            L"MBR 0x07上のFAT32は対応せず、型と実形式が一致する構成だけを扱います"));
       }
-      std::vector<ByteRange> used = ranges.value();
-      const Status valid =
-          validate_used_ranges(used, partition_range.value(), geometry.value());
-      if (!valid) {
-        return Result<OfflineMbrClonePlan>::failure(valid.error());
-      }
-      copy.mode = MbrPartitionCopyMode::ntfs_used_clusters;
-      copy.source_ranges = std::move(used);
     } else if (partition.type == 0x27) {
       const auto geometry = parse_ntfs_geometry(
           boot_sector.value(),
