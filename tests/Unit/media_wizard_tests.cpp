@@ -674,27 +674,27 @@ void test_iso_creation_rechecks_and_executes_exact_request() {
 
 void test_media_builder_identity_is_compile_time_pinned() {
   constexpr std::string_view kAuditedSha256 =
-      "A5CFB1DD5184F0147D20691004B40241"
-      "0899EDEF0299F71B308C734762E2424C";
+      "0827588ABA847847453E4311D7A3F12C"
+      "AAF0FA91223DD5DD9784C35E0E47AFA2";
   check(
       ytec::windowsapp::matches_embedded_media_builder_identity(
-          110'061U, kAuditedSha256),
+          110'127U, kAuditedSha256),
       "The current audited MediaBuilder identity must match");
   check(
       ytec::windowsapp::matches_embedded_media_builder_identity(
-          110'061U,
-          "a5cfb1dd5184f0147d20691004b40241"
-          "0899edef0299f71b308c734762e2424c"),
+          110'127U,
+          "0827588aba847847453e4311d7a3f12c"
+          "aaf0fa91223dd5dd9784c35e0e47afa2"),
       "SHA-256 comparison may accept lowercase hexadecimal");
   check(
       !ytec::windowsapp::matches_embedded_media_builder_identity(
-          110'062U, kAuditedSha256),
+          110'128U, kAuditedSha256),
       "A changed MediaBuilder length must fail closed");
   check(
       !ytec::windowsapp::matches_embedded_media_builder_identity(
-          110'061U,
-          "B5CFB1DD5184F0147D20691004B40241"
-          "0899EDEF0299F71B308C734762E2424C"),
+          110'127U,
+          "1827588ABA847847453E4311D7A3F12C"
+          "AAF0FA91223DD5DD9784C35E0E47AFA2"),
       "A changed MediaBuilder digest must fail closed");
 }
 

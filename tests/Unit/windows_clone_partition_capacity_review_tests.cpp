@@ -402,9 +402,12 @@ void test_product_ui_wires_scroll_keyboard_focus_and_item_data() {
       YTEC_WINDOWS_APP_MAIN_SOURCE_PATH,
       std::ios::binary);
   check(input.good(), "Product main source must be readable for UI wiring evidence");
-  const std::string source{
+  std::string source{
       std::istreambuf_iterator<char>(input),
       std::istreambuf_iterator<char>()};
+  source.erase(
+      std::remove(source.begin(), source.end(), '\r'),
+      source.end());
   const auto require_pattern = [&](const std::string_view pattern,
                                    const char* message) {
     check(source.find(pattern) != std::string::npos, message);
