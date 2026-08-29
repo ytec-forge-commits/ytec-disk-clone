@@ -11,7 +11,7 @@ $sbomReport = Assert-YtecSbomProductVersion `
     -Version $version `
     -ExpectedPackageName 'ytec-disk-clone' `
     -ExpectedNamespaceBase `
-        'https://github.com/ytec-commits/ytec-disk-clone/sbom'
+        'https://github.com/ytec-forge-commits/ytec-disk-clone/sbom'
 
 function Write-ExactTemporaryVersionManifest {
     param(

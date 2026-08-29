@@ -152,7 +152,7 @@ foreach ($name in $expectedExecutableMetadata.Keys) {
 }
 if ($preflight.sbom.packageVersion -cne $productVersion.display -or
     $preflight.sbom.documentNamespace -cne
-        ('https://github.com/ytec-commits/ytec-disk-clone/sbom/' +
+        ('https://github.com/ytec-forge-commits/ytec-disk-clone/sbom/' +
             $productVersion.display)) {
     throw '事前検証のSBOM版報告が製品版正本と一致しません。'
 }
