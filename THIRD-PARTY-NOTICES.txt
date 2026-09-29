@@ -1,0 +1,74 @@
+Y-TEC Tsumugi Drive - Third-Party Notices
+===========================================
+
+The Y-TEC product payload bundles the LINE Seed JP font data and statically
+links Zstandard and Argon2 as described below. The Portable ZIP does not
+redistribute third-party executables or DLLs, Microsoft WIM/ISO/CAB files, or
+Windows ADK / Windows PE content. Rescue media are created locally from the
+user's installed and verified Microsoft ADK / Windows PE components.
+
+Zstandard
+---------
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Version: 1.5.7
+Source: https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+Source archive SHA-256:
+EB33E51F49A15E023950CD7825CA74A4A2B43DB8354825AC24FC1B7EE09E6FA3
+License selected by this product: BSD 3-Clause
+License text: licenses/Zstandard-BSD-3-Clause.txt
+
+Only the audited static compression/decompression profile is linked into the
+official product binaries. The Zstandard CLI, DLL, dictionary builder,
+deprecated API, legacy decoders, tests, and contrib components are not built or
+included in official binary packages. The public source checkout may retain
+unlinked upstream support files for provenance and license review.
+
+Argon2
+------
+
+Copyright 2015 Daniel Dinu, Dmitry Khovratovich, Jean-Philippe Aumasson, and Samuel Neves
+
+Version: 20190702
+Source: https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz
+Source archive SHA-256:
+DAF972A89577F8772602BF2EB38B6A3DD3D922BF5724D45E7F9589B5E830442C
+License selected by this product: Apache License 2.0
+License text: licenses/Argon2-Apache-2.0.txt
+
+Only the portable reference sources required for Argon2id are built. The CLI,
+benchmarks, test programs, optimized architecture-specific implementation, and
+threaded backend are not built or distributed. Tsumugi images use parallelism 1.
+The vendored reference source files are unmodified; Y-TEC supplies only the
+separate CMake build integration and product-side adapter.
+No separate upstream NOTICE file is present in the vendored source set.
+
+LINE Seed JP
+------------
+
+Copyright 2020-2022 LY Corporation
+
+Version: LINESeedJP_20241105
+Source: https://seed.line.me/src/images/fonts/LINE_Seed_JP.zip
+Source archive SHA-256:
+75C0144CB1076EA1FE5C9BF081396333D40B6D4B66C5F812604EAC2C087F4F48
+License: SIL Open Font License, Version 1.1 (OFL-1.1)
+License text: licenses/LINE-Seed-JP-OFL-1.1.txt
+
+The unmodified App TTF Regular and Bold font files are embedded in the Windows
+and Windows PE graphical executables. They are loaded privately into the
+application process and are not installed into Windows.
+
+The project uses Windows public APIs and the locally installed Microsoft build
+toolchain at build time. Those Microsoft components are not copied into this
+repository by the project.
+
+Boot repair code may call the Microsoft-signed bcdboot.exe from the running
+Windows or Windows PE System32 directory after trust verification. The file is
+referenced in place and is not copied or redistributed by this project.
+
+The portable package contains only Y-TEC-built executables, Y-TEC scripts and
+documentation, the embedded LINE Seed JP font data, statically linked
+Zstandard and Argon2 code, this notice, the SPDX SBOM, and the license directory. It does
+not contain Microsoft ADK / Windows PE payloads.

@@ -1,0 +1,20 @@
+#pragma code_page(65001)
+
+#include <windows.h>
+
+#include "resource.h"
+
+IDD_TSUMUGI_PASSWORD DIALOGEX 0, 0, 380, 202
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Tsumugiイメージのパスワード"
+FONT 9, "LINE Seed JP App_TTF Regular"
+BEGIN
+    LTEXT           "", IDC_PASSWORD_PROMPT, 18, 12, 344, 30, SS_LEFT
+    LTEXT           "パスワード", -1, 18, 49, 100, 12
+    EDITTEXT        IDC_PASSWORD_EDIT, 18, 63, 344, 20, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "確認のため再入力", IDC_PASSWORD_CONFIRM_LABEL, 18, 91, 120, 12
+    EDITTEXT        IDC_PASSWORD_CONFIRM_EDIT, 18, 105, 344, 20, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "8文字以上のASCII印字文字。回復キーはなく、紛失時は復元できません。", IDC_PASSWORD_NOTE, 18, 133, 344, 28, SS_LEFT
+    DEFPUSHBUTTON   "続行", IDOK, 218, 170, 70, 22
+    PUSHBUTTON      "キャンセル", IDCANCEL, 292, 170, 70, 22
+END

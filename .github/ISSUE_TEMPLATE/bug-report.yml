@@ -1,0 +1,104 @@
+name: Bug report
+description: Report a reproducible problem using synthetic, non-sensitive data.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. This Issue is public.
+
+        Do not attach a real disk or partition image, complete disk serial,
+        recovery key, password, credential, product key, private key, token,
+        personal data, customer data, or unredacted support archive. For a
+        possible vulnerability, stop here and follow SECURITY.md.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Use the displayed app version or a Git commit ID.
+      placeholder: 1.0.0-internal-beta or commit ID
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Windows application
+        - Windows PE application
+        - Build or nonphysical test
+        - Documentation or packaging
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      description: Do not include a device name, user name, or organization name.
+      placeholder: Windows 11 24H2 x64
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the observed result and the affected feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Safe reproduction
+      description: Use synthetic input, an in-memory mock, or a disposable isolated VM only.
+      placeholder: Numbered steps using non-sensitive synthetic data
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation_scope
+    attributes:
+      label: Validation scope
+      description: >-
+        State whether this is synthetic/nonphysical or VM-only. Do not perform
+        new physical-device testing for the report.
+      placeholder: Synthetic unit test only; no physical disk or USB was used
+    validations:
+      required: true
+
+  - type: textarea
+    id: redacted_diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: >-
+        Optional. Include only the smallest redacted error text or code. Do not
+        attach a full log or support ZIP.
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: >-
+            I did not include real disk data, secrets, recovery keys, full
+            serials, credentials, personal data, or an unredacted diagnostic
+            archive.
+          required: true
+        - label: >-
+            I did not reproduce this report against a production system,
+            physical disk containing data, or real USB media.
+          required: true
+        - label: This is not a vulnerability report containing non-public security details.
+          required: true

@@ -1,0 +1,5 @@
+# Keep the audited rescue-media builder byte-identical on every checkout.
+scripts/New-WinPEAppValidationMedia.ps1 text eol=lf
+
+# The license gate verifies the canonical Apache-2.0 text byte-for-byte.
+LICENSE text eol=lf

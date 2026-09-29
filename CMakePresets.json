@@ -1,0 +1,110 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "msvc-x64",
+      "displayName": "MSVC x64 RelWithDebInfo",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/msvc-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "msvc-x64-analysis",
+      "displayName": "MSVC x64 static analysis",
+      "inherits": "msvc-x64",
+      "binaryDir": "${sourceDir}/out/build/msvc-x64-analysis",
+      "cacheVariables": {
+        "YTEC_ENABLE_MSVC_ANALYZE": "ON"
+      }
+    },
+    {
+      "name": "msvc-x64-asan",
+      "displayName": "MSVC x64 AddressSanitizer",
+      "inherits": "msvc-x64",
+      "binaryDir": "${sourceDir}/out/build/msvc-x64-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "YTEC_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "msvc-x64-vm",
+      "displayName": "MSVC x64 VM smoke tests with static runtime",
+      "inherits": "msvc-x64",
+      "binaryDir": "${sourceDir}/out/build/msvc-x64-vm",
+      "cacheVariables": {
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded"
+      }
+    },
+    {
+      "name": "msvc-x64-vm-destructive",
+      "displayName": "MSVC x64 VM-only destructive integration harness",
+      "inherits": "msvc-x64-vm",
+      "binaryDir": "${sourceDir}/out/build/msvc-x64-vm-destructive",
+      "cacheVariables": {
+        "YTEC_BUILD_DESTRUCTIVE_VM_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msvc-x64",
+      "configurePreset": "msvc-x64"
+    },
+    {
+      "name": "msvc-x64-analysis",
+      "configurePreset": "msvc-x64-analysis"
+    },
+    {
+      "name": "msvc-x64-asan",
+      "configurePreset": "msvc-x64-asan"
+    },
+    {
+      "name": "msvc-x64-vm",
+      "configurePreset": "msvc-x64-vm"
+    },
+    {
+      "name": "msvc-x64-vm-destructive",
+      "configurePreset": "msvc-x64-vm-destructive"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "msvc-x64",
+      "configurePreset": "msvc-x64",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "msvc-x64-asan",
+      "configurePreset": "msvc-x64-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "msvc-x64-vm",
+      "configurePreset": "msvc-x64-vm",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "msvc-x64-vm-destructive",
+      "configurePreset": "msvc-x64-vm-destructive",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

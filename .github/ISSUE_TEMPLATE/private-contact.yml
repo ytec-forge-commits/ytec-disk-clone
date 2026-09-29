@@ -1,0 +1,29 @@
+name: Private contact request
+description: Ask a maintainer to arrange a private channel without posting incident details.
+title: "[Private contact requested]"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This Issue is public. Do not include incident details, names, logs,
+        screenshots, personal information, credentials, or vulnerability
+        information. For a security vulnerability, close this form and use
+        Private Vulnerability Reporting from the Security tab instead.
+
+  - type: dropdown
+    id: reason
+    attributes:
+      label: Contact category
+      options:
+        - Code of Conduct or community matter
+        - Other non-security private contact
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Public placeholder confirmation
+      options:
+        - label: I have not included any incident details or sensitive information in this public Issue.
+          required: true

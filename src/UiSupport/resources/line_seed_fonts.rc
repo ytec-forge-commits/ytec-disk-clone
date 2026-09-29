@@ -1,0 +1,4 @@
+#include "../include/ytec/uisupport/font_resource_ids.h"
+
+IDR_LINE_SEED_JP_APP_REGULAR RCDATA "../../../third_party/line-seed-jp/fonts/LINESeedJP_A_TTF_Rg.ttf"
+IDR_LINE_SEED_JP_APP_BOLD RCDATA "../../../third_party/line-seed-jp/fonts/LINESeedJP_A_TTF_Bd.ttf"

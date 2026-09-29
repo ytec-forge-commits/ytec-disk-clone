@@ -1,0 +1,49 @@
+name: Design or safety proposal
+description: Propose a large feature, format, dependency, or destructive-I/O boundary change.
+title: "[Proposal]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use synthetic, non-sensitive examples only. Do not attach disk images,
+        support archives, credentials, recovery keys, or personal data.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and intended outcome
+      description: Describe the user problem and a bounded completion criterion.
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: Proposed approach and alternatives
+      description: Explain the design, alternatives, compatibility impact, and rollback plan.
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and trust-boundary impact
+      description: Identify disk I/O, identity, parser, cryptography, command, network, or dependency boundaries.
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Nonphysical validation plan
+      description: List synthetic tests, failure injection, static analysis, and any separately controlled VM acceptance.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This proposal contains no secrets, personal data, real disk images, or instructions to test against a physical disk.
+          required: true

@@ -1,0 +1,97 @@
+name: Nonphysical CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-msvc-nonphysical:
+    name: Windows MSVC nonphysical gates
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+
+      - name: Check patch whitespace
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if ($env:EVENT_NAME -eq 'pull_request') {
+            $base = $env:PR_BASE_SHA
+          } elseif (
+            $env:EVENT_NAME -eq 'push' -and
+            $env:PUSH_BEFORE_SHA -and
+            $env:PUSH_BEFORE_SHA -notmatch '^0+$'
+          ) {
+            $base = $env:PUSH_BEFORE_SHA
+          } else {
+            $parent = git rev-parse --verify HEAD^ 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              # Preserve historical final blank lines and verbatim upstream notices.
+              git -c core.whitespace=blank-at-eol,space-before-tab,-blank-at-eof show --format= --check HEAD -- . ':!third_party/**' ':!licenses/LINE-Seed-JP-OFL-1.1.txt'
+              if ($LASTEXITCODE -ne 0) {
+                throw "The root snapshot contains whitespace errors."
+              }
+              exit 0
+            }
+            $base = $parent.Trim()
+          }
+
+          if ($base -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "The whitespace-check base is not a valid Git commit SHA."
+          }
+
+          git cat-file -e "$base^{commit}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            # A force-push can make github.event.before unreachable from the
+            # checked-out branch even with fetch-depth: 0. Request that exact
+            # commit so the pushed range is not weakened; if origin no longer
+            # retains it, the fetch below fails closed.
+            git fetch --no-tags --no-recurse-submodules origin $base
+            if ($LASTEXITCODE -ne 0) {
+              throw "The whitespace-check base commit could not be fetched."
+            }
+
+            git cat-file -e "$base^{commit}" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              throw "The fetched whitespace-check base is not a commit."
+            }
+          }
+
+          git diff --check "$base..HEAD"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The pushed changes contain whitespace errors."
+          }
+
+      # scripts/ci.ps1 uses the normal, static-runtime, analysis, and ASan
+      # presets. It does not enable the msvc-x64-vm-destructive preset and must
+      # never be extended to access a hosted runner's physical disks or USB.
+      - name: Build and run all nonphysical project gates
+        shell: pwsh
+        run: ./scripts/ci.ps1

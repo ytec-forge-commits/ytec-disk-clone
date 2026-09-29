@@ -1,0 +1,4 @@
+#pragma once
+
+#define IDR_LINE_SEED_JP_APP_REGULAR 4101
+#define IDR_LINE_SEED_JP_APP_BOLD 4102

@@ -1,0 +1,41 @@
+===============================================================================
+履歴資料 / HISTORICAL RECORD
+現行の仕様・作業指示ではありません / NOT CURRENT INSTRUCTIONS
+===============================================================================
+
+このファイルはPhase 0開始時のプロンプトです。以下の本文は開発履歴と来歴確認の
+ため原文のまま保存しています。命令形の記述を現在の作業指示として使用しないで
+ください。現行の最上位仕様は DiskClone_Development_Spec.md v2.0 です。
+概要と現在地は README.md / README.en.md を参照してください。
+
+This file preserves the original Phase 0 kickoff prompt as historical provenance.
+It is not a current specification, scope, or instruction. Do not act on the
+imperative text below. The authoritative specification is
+DiskClone_Development_Spec.md v2.0; see README.md / README.en.md for current status.
+
+-------------------------------------------------------------------------------
+
+このリポジトリでは、添付の「Windowsディスククローン・イメージバックアップツール 開発仕様書」を最上位要件として扱ってください。
+
+最初からクローン機能を実装せず、Phase 0のみを実施してください。
+
+Phase 0の作業内容:
+1. C++20 / CMake / MSVC x64のリポジトリ構成を作成する。
+2. WindowsApp、WinPEApp、CloneCore、DiskModel、ImageFormat、VssRequester、BootRepair、MediaBuilder、CliTools、tests、docsの空プロジェクトまたはライブラリを作成する。
+3. 物理ディスクとパーティションを読み取り専用で列挙するCLIを実装する。
+4. ディスク番号、モデル、容量、論理/物理セクターサイズ、BusType、シリアル末尾、GPT/MBR、パーティション一覧をJSONと人間向けテキストで出力する。
+5. コピー元・コピー先への書き込み処理は一切実装しない。
+6. エラー型、ログ基盤、RAIIハンドルラッパーを実装する。
+7. 単体テストと、実ディスクを使わないモックテストを追加する。
+8. THIRD-PARTY-NOTICES.txt、licenses/、SBOM生成用の基盤を作成する。
+9. GPL、AGPL、SSPL、LGPL、MPL、ライセンス不明の依存を追加しない。
+10. 新しい外部依存を追加する前に理由、ライセンス、代替案を提示し、実装を止める。
+11. ビルド、テスト、静的解析結果を報告する。
+
+重要:
+- Microsoft製EXE、DLL、WIM、ISO、ADKファイルをリポジトリへコピーしないでください。
+- Acronis、HD革命、Macrium等の実装やUIを模倣しないでください。
+- 管理者権限がない場合の読み取り専用診断も、可能な範囲で安全に失敗させてください。
+- 不明点があっても仕様を拡大解釈せず、安全側に実装してください。
+
+作業完了後、変更ファイル、設計判断、未検証事項、次のPhase 1に入る前の確認事項をまとめてください。
